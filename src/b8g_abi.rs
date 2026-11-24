@@ -39,9 +39,9 @@ impl B8gArenaHeaderV1 {
             generation: 1,
             write_index: 0,
             read_index: 0,
-            surface_table_offset: core::mem::size_of::<Self>() as u64,
+            surface_table_offset: std::mem::size_of::<Self>() as u64,
             surface_capacity,
-            surface_stride: core::mem::size_of::<LibsectiumDisplaySurfaceV1>() as u32,
+            surface_stride: std::mem::size_of::<LibsectiumDisplaySurfaceV1>() as u32,
         }
     }
 
@@ -96,7 +96,7 @@ impl LibsectiumDisplaySurfaceV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::mem::{align_of, size_of};
+    use std::mem::{align_of, size_of};
 
     #[test]
     fn b8g_abi_magic_and_alignment() {
