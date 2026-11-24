@@ -1,0 +1,1900 @@
+//! Reading the user's *live* Hyprland configuration, so that
+//! configuring an Omarchy machine keeps working when chonkstep is the
+//! window manager.
+//!
+//! # Why this exists
+//!
+//! An Omarchy user configures their desktop through `~/.config/hypr/`
+//! and `~/.config/omarchy/` — and, crucially, so does Omarchy's own
+//! menu. Changing a keybinding, adding a startup app, or picking a
+//! monitor layout from their UI *edits Hyprland config*. Chonkstep's
+//! answer up to now was [`crate::preset`]: Omarchy's bindings read
+//! once, by hand, at development time, and frozen into a table.
+//!
+//! That table is good work and it is still the fallback, but it has
+//! two failures built into it. A user who changes anything through
+//! Omarchy's menu sees no effect under us — the menu writes the file,
+//! the file is never read, and the machine appears broken. And the
+//! table rots: every Omarchy release that moves a chord leaves it
+//! silently wrong, with nothing to notice.
+//!
+//! Reading the configuration live fixes both, and it is what makes the
+//! swap invisible: the user's existing setup transfers wholesale, and
+//! Omarchy's menu keeps being how you configure your machine.
+//!
+//! # What is actually on a machine
+//!
+//! Omarchy 4 ("quattro") configures Hyprland in **Lua**. The shipped
+//! defaults are `/usr/share/omarchy/default/hypr/**.lua` — real Lua
+//! with loops, conditionals and helper functions — and the user's own
+//! files are `~/.config/hypr/*.lua`. Omarchy 3 and everything the
+//! upstream Hyprland wiki documents use the classic
+//! `keyword = value` **conf** syntax instead.
+//!
+//! Both are read ([`lua`], [`conf`]), because both are in front of real
+//! users, and because a machine mid-upgrade has both trees on disk at
+//! once. The development machine for this work was exactly that: the
+//! shipped defaults were Lua, the user's personal bindings were still
+//! in a `.conf` whose `.lua` replacement the migration had generated
+//! empty, and a `~/.local/share/omarchy` symlink pointed at a
+//! compatibility shim that a post-boot hook was scheduled to delete. A
+//! reader that had assumed either syntax would have been wrong about
+//! that machine.
+//!
+//! Which one is *live* is decided the way Hyprland decides it: the Lua
+//! entry point wins where it exists, and the conf entry point is the
+//! fallback (see [`Roots::entry`]).
+//!
+//! # Precedence
+//!
+//! Three layers, outermost last:
+//!
+//! 1. **Omarchy's shipped defaults**, `$OMARCHY_PATH/default/hypr/**`.
+//! 2. **The user's own Hyprland files**, `~/.config/hypr/**`, which is
+//!    where Omarchy's menu writes and where the user's overrides live.
+//!    Read after the defaults, in the order the entry file includes
+//!    them, so an `unbind` followed by a `bind` does what it says.
+//! 3. **Chonkstep's own `config.toml`**, which wins over everything
+//!    above it.
+//!
+//! Layer 3 is not a new rule — it is the rule this format already has.
+//! [`crate::preset::base`] applies presets to the defaults *before*
+//! the file's own keys are walked, so every value a preset sets is
+//! overridden by writing that key out. This read slots into exactly
+//! that position: applied over the baked
+//! [`crate::preset::OMARCHY_BINDINGS`] table and under everything the
+//! user's `config.toml` says. `[keybindings]` in `config.toml` still
+//! has the last word on any chord, and `"none"` still unbinds one.
+//!
+//! # Never a broken session
+//!
+//! This reads somebody else's file, at session startup, on a machine
+//! whose owner may never have heard of chonkstep. The rule is
+//! absolute: **a malformed file, an unknown directive or a wild value
+//! is a logged warning and a skipped line — never a panic, and never a
+//! refusal to start.** Everything here is total. There is no `unwrap`
+//! on parsed content, recursion is depth-bounded, loops are
+//! iteration-bounded, a Lua file's whole walk is step-bounded because
+//! loops multiply, the file graph is cycle-checked and
+//! budget-limited, and patterns are compiled with a size cap. The
+//! hostile-input tests exist to keep that true.
+//!
+//! And nothing here ever *runs* anything out of a config file. The Lua
+//! reader parses and evaluates a closed subset of expressions; the two
+//! conditions Omarchy branches on are answered by asking the file
+//! system, not by executing a command. A configuration file must not
+//! be a code-execution path into the window manager.
+//!
+//! # What is deliberately not read
+//!
+//! - **Gaps, borders, rounding, blur, shadows, animation curves, speeds
+//!   and styles.** These are Hyprland's look, and this desktop has its
+//!   own — a theme, a titlebar, a decoration policy, one spring.
+//!   Following them would mean drawing a NeXTSTEP frame with Hyprland's
+//!   border colour on it. Two exceptions. The *layout name*:
+//!   `general.layout` and the per-workspace `workspace` rules decide
+//!   whether windows tile at all, not how they look, and `dwindle` and
+//!   `scrolling` are names this desktop's own Mosaic and Flow already
+//!   answer to. They are read as [`Reading::default_layout`] and
+//!   [`Reading::workspace_layouts`]; every other layout setting
+//!   (`dwindle { … }`, `master { … }`, `scrolling { … }`) stays
+//!   Hyprland's. And the animation *switches*: turning motion off is a
+//!   comfort and accessibility preference, not a look, so
+//!   `animations.enabled` and the `global`, `windows` and `windowsMove`
+//!   leaves are read into [`crate::Config::motion`]. Every other leaf is
+//!   named and skipped.
+//! - **Layer rules.** They configure Hyprland's layer-shell
+//!   implementation; this compositor has its own.
+//! - **Unsupported input settings.** Keyboard xkb/repeat values are
+//!   carried. Whole-desktop behavior such as `follow_mouse`, touchpad
+//!   policy, and gestures belongs to chonkstep and is named and skipped.
+//! - **Unsupported `monitor =` lines.** Preferred and explicit modes,
+//!   position, scale, 0/90/180/270-degree transforms and `disable`
+//!   (Lua `disabled = true`) are applied once outputs exist, at
+//!   startup, at hotplug and on an explicit reload. Mirror and other
+//!   extras refuse their whole line.
+//! - **Hyprland requests chonkstep does not serve.** `hyprctl` and any
+//!   `omarchy-hyprland-*` script outside
+//!   [`dispatch::SERVED_OMARCHY_SCRIPTS`] stay unbound, with a reason
+//!   naming what a known script needs. The listed scripts send only
+//!   requests this desktop's Hyprland IPC applies, which a conformance
+//!   test proves, and run like any other command.
+//!   `chonk_shell::omarchy_menu` applies the same predicate to menu rows.
+//!
+//! Every one of these is logged when it is met, not silently dropped.
+
+pub mod conf;
+pub mod directive;
+pub mod dispatch;
+pub(crate) mod expr;
+pub mod keys;
+pub mod lua;
+pub mod rules;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use directive::{Directive, Include};
+use wm_core::KeyCombo;
+
+use crate::Action;
+
+/// The most files one read will open. Omarchy's own tree is about
+/// forty; a graph asking for a thousand is a loop this reader failed
+/// to notice, or a machine it should not be reading anyway.
+const MAX_FILES: usize = 256;
+
+/// The most bytes one file may contribute. Omarchy's largest is 8 KiB.
+const MAX_FILE_BYTES: u64 = 1 << 20;
+
+/// The most bytes a whole read may consume.
+const MAX_TOTAL_BYTES: u64 = 8 << 20;
+
+/// How deep the include graph may go.
+const MAX_INCLUDE_DEPTH: u32 = 16;
+
+/// Where a read looks, and what it knows about the machine.
+///
+/// A struct rather than a set of environment lookups scattered through
+/// the module, for the reason `chonk_shell::startup` gives about its
+/// own resolvers: the policy stays unit-testable without touching the
+/// process environment, which parallel tests cannot do safely. Every
+/// test in this module points a `Roots` at a scratch tree.
+#[derive(Clone, Debug)]
+pub struct Roots {
+    /// `~/.config/hypr`.
+    pub user: PathBuf,
+    /// `$OMARCHY_PATH/default/hypr`, or wherever Omarchy's defaults are.
+    pub defaults: PathBuf,
+    /// The roots Lua module names resolve against, in search order —
+    /// Omarchy's `bootstrap.lua` sets `~/.local/state`, `~/.config`,
+    /// then `$OMARCHY_PATH`.
+    pub module_path: Vec<PathBuf>,
+    /// What the branch conditions in Omarchy's Lua are answered from.
+    pub facts: lua::Facts,
+    /// The system's keyboard configuration, `/etc/vconsole.conf`, which
+    /// fills any xkb setting a read leaves unset. See [`read`].
+    pub vconsole: PathBuf,
+}
+
+impl Roots {
+    /// The roots of this machine, or `None` when there is no `$HOME`
+    /// to find a config under.
+    pub fn of_this_machine() -> Option<Self> {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty() && Path::new(v).is_absolute())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .filter(|v| !v.is_empty() && Path::new(v).is_absolute())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/state"));
+        let omarchy = std::env::var_os("OMARCHY_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/share/omarchy"));
+        Some(Self {
+            user: config.join("hypr"),
+            defaults: omarchy.join("default/hypr"),
+            module_path: vec![state, config, omarchy],
+            facts: lua::Facts::of_this_machine(),
+            vconsole: PathBuf::from("/etc/vconsole.conf"),
+        })
+    }
+
+    /// Every root under one directory, for a test or a nested session
+    /// pointed at a scratch copy of a config tree.
+    ///
+    /// `root` *is* the home directory, so the layout is a real
+    /// machine's exactly: `<root>/.config/hypr` is the user's,
+    /// `<root>/omarchy` stands in for `$OMARCHY_PATH`, and the module
+    /// search path is the three directories `bootstrap.lua` puts on it.
+    ///
+    /// Modelling a home rather than inventing a tidier layout is what
+    /// lets a fixture hold a user's `hyprland.conf` **verbatim** — its
+    /// `source = ~/.config/hypr/bindings.conf` lines resolve, and so
+    /// does the `~/.local/share/omarchy` symlink an upgrade leaves
+    /// behind. A fixture that had to be edited to be readable would no
+    /// longer be evidence about the real file.
+    pub fn under(root: &Path) -> Self {
+        Self {
+            user: root.join(".config/hypr"),
+            defaults: root.join("omarchy/default/hypr"),
+            module_path: vec![
+                root.join(".local/state"),
+                root.join(".config"),
+                root.join("omarchy"),
+            ],
+            facts: lua::Facts {
+                path: Vec::new(),
+                home: Some(root.to_path_buf()),
+                state_home: Some(root.join(".local/state")),
+            },
+            vconsole: root.join("etc/vconsole.conf"),
+        }
+    }
+
+    /// The entry file, and which syntax it is in.
+    ///
+    /// Hyprland's own rule, and the one that matters on a machine
+    /// mid-upgrade: the Lua entry point wins where it exists. On this
+    /// development machine both `hyprland.lua` and `hyprland.conf`
+    /// were present and only the first was live — the second was a
+    /// migration leftover pointing at a compatibility shim, and a
+    /// reader that preferred it would have read a configuration
+    /// Hyprland itself no longer used.
+    pub fn entry(&self) -> Option<(PathBuf, Syntax)> {
+        let lua = self.user.join("hyprland.lua");
+        if lua.is_file() {
+            return Some((lua, Syntax::Lua));
+        }
+        let conf = self.user.join("hyprland.conf");
+        if conf.is_file() {
+            return Some((conf, Syntax::Conf));
+        }
+        None
+    }
+}
+
+/// Which of Hyprland's two configuration syntaxes a file is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Syntax {
+    Lua,
+    Conf,
+}
+
+impl Syntax {
+    fn of(path: &Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("lua") => Self::Lua,
+            _ => Self::Conf,
+        }
+    }
+}
+
+/// Everything one read produced.
+#[derive(Debug, Default)]
+pub struct Reading {
+    /// Chords that mapped onto a chonkstep action, in file order with
+    /// later entries winning — Hyprland's own rule for a chord bound
+    /// twice.
+    pub keybindings: Vec<(KeyCombo, Action)>,
+    /// Explicit bind/unbind choices suppress native capture defaults, even when
+    /// a dispatcher is not supported. Never reclaim a user's chosen chord.
+    pub explicit_keys: Vec<KeyCombo>,
+    /// Every accepted binding including release/locked/repeat behavior
+    /// and its human description.
+    pub bindings: Vec<crate::Binding>,
+    pub layer_bindings: BTreeMap<String, Vec<crate::Binding>>,
+    /// `switch:on:Lid Switch` and its kin, later bindings on the same
+    /// device and edge replacing earlier ones.
+    pub switch_bindings: Vec<crate::SwitchBinding>,
+    /// The argv every [`Action::Run`] above names, keyed by the name
+    /// [`dispatch::command_name`] derived from the argv.
+    pub commands: BTreeMap<String, Vec<String>>,
+    /// `env` lines, in order, later winning.
+    pub env: Vec<(String, String)>,
+    /// `exec-once` lines that survived the filter, as argv.
+    pub autostart: Vec<Vec<String>>,
+    /// The float rules, ready to install.
+    pub float_rules: rules::FloatRules,
+    /// `monitor =` lines, parsed and reported. See [`Monitors`].
+    pub monitors: Monitors,
+    pub input: crate::InputConfig,
+    /// `general.layout`, when it names a style this desktop has:
+    /// `dwindle` is Mosaic, `scrolling` is Flow. The style every
+    /// workspace starts in.
+    pub default_layout: Option<wm_core::LayoutMode>,
+    /// Per-workspace styles from workspace rules, keyed by 0-based
+    /// index — Hyprland's workspace N is index N−1, as the IPC path
+    /// resolves it — with a later rule for the same workspace winning.
+    pub workspace_layouts: BTreeMap<usize, wm_core::LayoutMode>,
+    /// `binds:hide_special_on_workspace_change`, when the configuration
+    /// says either way.
+    pub hide_special_on_workspace_change: Option<bool>,
+    /// `binds:disable_keybind_grabbing`, when the configuration says
+    /// either way: Hyprland's name for refusing every
+    /// `zwp_keyboard_shortcuts_inhibit_v1` request, which is
+    /// `allow_shortcut_inhibit = false` here.
+    pub disable_keybind_grabbing: Option<bool>,
+    /// `misc:focus_on_activate`, when the configuration says either
+    /// way: whether an application's own `xdg_activation_v1` request
+    /// may take the keyboard without the user's input behind it.
+    pub focus_on_activate: Option<bool>,
+    /// `misc:disable_autoreload`, when the configuration says either
+    /// way: whether the session's one-second re-read of these very
+    /// files is off until an explicit `reload`.
+    pub disable_autoreload: Option<bool>,
+    /// `decoration:dim_inactive` at `decoration:dim_strength`: how much
+    /// to darken every unfocused window, or `None` to leave them alone.
+    pub dim_inactive: Option<f32>,
+    /// Every file actually read, in order. The [`Watch`]'s signature is
+    /// taken over exactly this list.
+    pub files: Vec<PathBuf>,
+    /// What was skipped, and why. Logged by [`Reading::report`] and
+    /// carried so the docs and the tests can name a specific skip.
+    pub skipped: Vec<Skipped>,
+    /// The animation switches, later winning. Only the switches: the
+    /// speed stays at its default for the `[motion]` table to set.
+    pub motion: wm_core::MotionPolicy,
+}
+
+/// One thing this read declined to act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skipped {
+    /// A short category: `bind`, `window-rule`, `env`, `lua`, `syntax`.
+    pub kind: String,
+    /// What was skipped, in the file's own words where possible.
+    pub what: String,
+    /// Why.
+    pub why: String,
+}
+
+/// The `monitor =` lines a configuration carries.
+///
+/// This parser deliberately keeps the requests unevaluated: preferred
+/// mode, automatic DPI scale, and automatic placement can only be
+/// resolved after real outputs exist. `wm-wayland` consumes the list at
+/// output bootstrap, gives exact-name rules precedence over catch-all
+/// rules, and applies preferred mode, position, and scale as one
+/// transaction. Explicit modes and 0/90/180/270-degree transforms are
+/// supported; a line containing disable, mirror, or another extra field
+/// is refused whole and logged.
+#[derive(Clone, Debug, Default)]
+pub struct Monitors {
+    pub lines: Vec<directive::Monitor>,
+}
+
+impl Reading {
+    /// Whether anything usable came out of the read. A configuration
+    /// that produced nothing at all is treated as "nothing to read" by
+    /// the caller, which keeps the baked preset rather than replacing a
+    /// working keymap with an empty one.
+    pub fn is_empty(&self) -> bool {
+        // Every semantic category counts, independently of whether the user
+        // replaced the built-in keybindings. Destructure exhaustively so a
+        // future category cannot silently disappear at this loading boundary.
+        let Self {
+            keybindings, explicit_keys, bindings, layer_bindings, switch_bindings, commands, env, autostart,
+            float_rules, monitors, input, default_layout, workspace_layouts, hide_special_on_workspace_change, disable_keybind_grabbing, focus_on_activate, disable_autoreload, dim_inactive, files: _, skipped: _, motion,
+        } = self;
+        keybindings.is_empty()
+            && dim_inactive.is_none()
+            && explicit_keys.is_empty()
+            && bindings.is_empty()
+            && layer_bindings.is_empty()
+            && switch_bindings.is_empty()
+            && commands.is_empty()
+            && env.is_empty()
+            && autostart.is_empty()
+            && float_rules.is_empty()
+            && monitors.lines.is_empty()
+            && *input == crate::InputConfig::default()
+            && default_layout.is_none()
+            && workspace_layouts.is_empty()
+            && hide_special_on_workspace_change.is_none()
+            && disable_keybind_grabbing.is_none()
+            && focus_on_activate.is_none()
+            && disable_autoreload.is_none()
+            && *motion == wm_core::MotionPolicy::default()
+    }
+
+    /// Logs the read: one summary line, and one line per thing
+    /// skipped.
+    ///
+    /// Per thing, not per category. The rule for this whole module is
+    /// that an unsupported directive is ignored *loudly*, and a count
+    /// is not loud — "47 rules ignored" tells a user nothing they can
+    /// act on, where "float rule carries match:xwayland 1, which this
+    /// reader does not implement" tells them exactly which line to
+    /// rewrite. The lines are `debug` rather than `warn` because a
+    /// normal Omarchy machine produces around sixty of them and none is
+    /// a problem; the summary saying how many there were is `info`.
+    pub fn report(&self) {
+        tracing::info!(
+            files = self.files.len(),
+            bindings = self.keybindings.len(),
+            commands = self.commands.len(),
+            env = self.env.len(),
+            autostart = self.autostart.len(),
+            float_rules = self.float_rules.len(),
+            monitors = self.monitors.lines.len(),
+            default_layout = self.default_layout.map_or("none", |mode| mode.name()),
+            workspace_layouts = self.workspace_layouts.len(),
+            skipped = self.skipped.len(),
+            "hyprland-config: read the desktop's live Hyprland configuration"
+        );
+        for skip in &self.skipped {
+            tracing::debug!(kind = %skip.kind, what = %skip.what, why = %skip.why, "hyprland-config: not carried over");
+        }
+        for line in &self.monitors.lines {
+            tracing::info!(
+                output = %if line.output.is_empty() { "<any>" } else { line.output.as_str() },
+                mode = %line.mode,
+                position = %line.position,
+                scale = %line.scale,
+                extra = %line.extra.join(","),
+                "hyprland-config: monitor line read; applied at startup, on connector hotplug and on an explicit reload, never from the file watch (see docs/hyprland-config.md)"
+            );
+        }
+    }
+}
+
+/// Reads the machine's live Hyprland configuration, or `None` when
+/// there is none to read.
+///
+/// Never fails and never panics: every layer below returns whatever it
+/// managed to read, so the worst outcome of a broken configuration is
+/// an empty [`Reading`] and a log full of reasons.
+pub fn load() -> Option<Reading> {
+    let roots = Roots::of_this_machine()?;
+    let reading = read(&roots);
+    if reading.is_empty() {
+        tracing::info!(
+            user = %roots.user.display(),
+            defaults = %roots.defaults.display(),
+            "hyprland-config: nothing usable found; keeping chonkstep's own bindings"
+        );
+        return None;
+    }
+    reading.report();
+    Some(reading)
+}
+
+/// Reads a configuration from explicit roots. The testable half of
+/// [`load`].
+pub fn read(roots: &Roots) -> Reading {
+    let mut loader = Loader::new(roots);
+    let mut stream = Vec::new();
+    if let Some((entry, syntax)) = roots.entry() {
+        loader.file(&entry, syntax, &mut stream, 0);
+    } else if roots.defaults.join("bindings").is_dir() {
+        // No entry file, but Omarchy's defaults are on disk: a user who
+        // deleted their `~/.config/hypr` still has a desktop's worth of
+        // bindings shipped in `/usr/share`, and reading them is better
+        // than reading nothing. The defaults are what the entry file
+        // would have required anyway.
+        loader.directory(&roots.defaults.join("bindings"), &[], &mut stream, 0);
+    }
+    let mut reading = lower(stream, loader.finish());
+    // Any xkb setting the configuration leaves unset — including one it
+    // computes at runtime, which the Lua reader refuses to render — is
+    // taken from the system's own keyboard configuration, the file
+    // Omarchy's `input.lua` reads its layout from. Here rather than in
+    // `load`, because the live re-read calls `read` directly and must
+    // resolve the keymap the way startup did. And only for a reading
+    // that found something: the system file alone must not turn a desk
+    // with nothing to read into one whose keymap the read replaces.
+    if !reading.is_empty() {
+        let system = crate::system_keyboard(&system_file(&roots.vconsole));
+        let filled = reading.input.fill_keyboard_from(&system);
+        if !filled.is_empty() {
+            reading.skipped.push(Skipped {
+                kind: "input".into(),
+                what: format!("{} taken from {}", filled.join(", "), roots.vconsole.display()),
+                why: "the Hyprland configuration leaves it unset or computes it at runtime; Omarchy's `us,` prefix for a layout with no Latin letters is not applied".into(),
+            });
+        }
+    }
+    reading
+}
+
+/// A small system file's text, or nothing: a missing or unreadable file
+/// reads as empty, never as an error, and an oversized one is cut at the
+/// per-file budget.
+fn system_file(path: &Path) -> String {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.take(MAX_FILE_BYTES).read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+// ---- activation and layering ------------------------------------------
+
+/// Whether this session reads the machine's live Hyprland
+/// configuration.
+///
+/// # Why it is not simply "whenever the files exist"
+///
+/// The files exist on a great many machines that are not asking for
+/// this. Hyprland is a popular compositor; a `~/.config/hypr` is left
+/// behind by trying it for an afternoon, and Omarchy's defaults sit in
+/// `/usr/share` on any machine with the package installed. Reading
+/// them automatically would mean that installing a package, or
+/// uninstalling a compositor badly, silently replaced a chonkstep
+/// user's entire keymap with somebody else's — from a file they have
+/// no reason to think anything is still reading. That is the worst
+/// kind of surprise: invisible, total, and traced back to the wrong
+/// change.
+///
+/// # Why it is not a new opt-in switch either
+///
+/// The user who wants this has already said so. `desktop = "omarchy"`
+/// means "chonkstep is the window manager for my Omarchy desktop", and
+/// it *already* replaces the keymap wholesale with
+/// [`crate::preset::OMARCHY_BINDINGS`] — a hand-transcription of the
+/// very files this reads. Someone who has accepted a frozen copy of
+/// their bindings is not being surprised by the live original; they
+/// are getting the thing the frozen copy was standing in for. Making
+/// them write a second line to get it would be asking them to opt in
+/// twice to one decision.
+///
+/// So: **the posture decides, and the key overrides the posture.**
+/// `keymap = "omarchy"` alone is enough — a chonkstep desk that wants
+/// Hyprland chords wants the user's own Hyprland chords — and
+/// `hyprland_config = false` turns it off from either posture, which
+/// is the escape hatch for "read my file, I will tell you when".
+///
+/// # And what happens to the baked preset
+///
+/// It becomes the **fallback**, not a second source of truth. When
+/// this returns `true` and a configuration is found, the read replaces
+/// the preset's binding table outright — the same replace-don't-merge
+/// rule the preset itself applies, for the same reason: a desk
+/// answering to both a live binding and a frozen one for the same
+/// chord has two answers and no documented winner. When no
+/// configuration is found, or nothing usable comes out of it, the
+/// preset stands exactly as it did. That is what it is for: the
+/// machine where Omarchy is not installed, or is installed in a shape
+/// this reader cannot follow.
+pub fn wanted(config: &crate::Config) -> bool {
+    config.hyprland_config.unwrap_or(
+        config.desktop == crate::preset::Desktop::Omarchy
+            || config.keymap == crate::preset::Keymap::Omarchy,
+    )
+}
+
+/// Applies a reading to a config, in the position the module docs
+/// describe: over the preset, under the file's own keys.
+///
+/// Takes `Option` so the "nothing to read" path is one call rather
+/// than a condition at every call site — and so a caller cannot forget
+/// that nothing-to-read means *keep the preset*.
+pub fn apply(config: &mut crate::Config, reading: Option<&Reading>) {
+    let Some(reading) = reading else { return };
+    if reading.keybindings.is_empty() {
+        // Bindings are the load-bearing half. A read that found files
+        // but no bindings in them is a read that went wrong somewhere
+        // this module did not notice, and replacing a working keymap
+        // with an empty one would leave a user with no way to open a
+        // terminal and fix it. The rest of the read still applies.
+        tracing::warn!(
+            "hyprland-config: no bindings came out of the read; keeping the built-in keymap"
+        );
+    } else {
+        let captures: Vec<_> = config
+            .keybindings
+            .iter()
+            .filter(|(key, action)| {
+                matches!(
+                    action,
+                    Action::Capture(_) | Action::Layout(wm_core::LayoutMode::Freeform)
+                ) && !reading.explicit_keys.contains(key)
+                    && !reading.keybindings.iter().any(|(other, _)| other == key)
+            })
+            .cloned()
+            .collect();
+        config.keybindings = reading.keybindings.clone();
+        config.keybindings.extend(captures);
+    }
+    config.keybindings.retain(|(key, action)| !matches!(action, Action::Capture(_))
+        || !reading.explicit_keys.contains(key)
+        || reading.keybindings.iter().any(|(other, _)| other == key));
+    config.bindings = reading.bindings.clone();
+    config.layer_bindings = reading.layer_bindings.clone();
+    config.switch_bindings = reading.switch_bindings.clone();
+    // Commands are *inserted*, so a `[commands]` entry of the same name
+    // read later from the user's own file replaces this one — the same
+    // rule `preset::apply_keymap` applies to its own declarations.
+    for (name, argv) in &reading.commands {
+        config.commands.insert(name.clone(), argv.clone());
+    }
+    config.session_env = reading.env.clone();
+    config.input = reading.input.clone();
+    if let Some(hide) = reading.hide_special_on_workspace_change {
+        config.hide_special_on_workspace_change = hide;
+    }
+    if let Some(disable) = reading.disable_keybind_grabbing {
+        config.allow_shortcut_inhibit = !disable;
+    }
+    if let Some(focus) = reading.focus_on_activate {
+        config.focus_on_activate = focus;
+    }
+    if let Some(paused) = reading.disable_autoreload {
+        config.disable_autoreload = paused;
+    }
+    config.monitor_rules = reading.monitors.lines.clone();
+    config.autostart = reading.autostart.clone();
+    config.float_policy = reading.float_rules.clone().policy();
+    config.default_layout = reading.default_layout;
+    config.workspace_layouts = reading.workspace_layouts.clone();
+    config.motion = reading.motion.sanitized();
+    config.decorations.dim_inactive = reading.dim_inactive;
+}
+
+// ---- the file graph ---------------------------------------------------
+
+struct Loader<'a> {
+    roots: &'a Roots,
+    globals: lua::Globals,
+    vars: BTreeMap<String, String>,
+    seen: std::collections::BTreeSet<PathBuf>,
+    bytes: u64,
+    files: Vec<PathBuf>,
+    skipped: Vec<Skipped>,
+}
+
+impl<'a> Loader<'a> {
+    fn new(roots: &'a Roots) -> Self {
+        Self {
+            roots,
+            globals: lua::Globals::default(),
+            vars: BTreeMap::new(),
+            seen: std::collections::BTreeSet::new(),
+            bytes: 0,
+            files: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> LoadReport {
+        LoadReport {
+            files: self.files,
+            skipped: self.skipped,
+        }
+    }
+
+    fn note(&mut self, kind: &str, what: impl Into<String>, why: impl Into<String>) {
+        self.skipped.push(Skipped {
+            kind: kind.to_string(),
+            what: what.into(),
+            why: why.into(),
+        });
+    }
+
+    /// Reads one file into `out`, following its includes in place.
+    fn file(&mut self, path: &Path, syntax: Syntax, out: &mut Vec<Directive>, depth: u32) {
+        if depth > MAX_INCLUDE_DEPTH {
+            self.note(
+                "include",
+                path.display().to_string(),
+                "include graph nested too deeply",
+            );
+            return;
+        }
+        if self.files.len() >= MAX_FILES {
+            self.note(
+                "include",
+                path.display().to_string(),
+                format!("more than {MAX_FILES} files in one read"),
+            );
+            return;
+        }
+        // Canonicalized so two names for one file — a symlink into a
+        // compatibility shim, `..` in a `source` line — cannot make
+        // this read it twice or loop forever.
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !self.seen.insert(key) {
+            return;
+        }
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size > MAX_FILE_BYTES {
+            self.note(
+                "include",
+                path.display().to_string(),
+                format!("larger than {MAX_FILE_BYTES} bytes"),
+            );
+            return;
+        }
+        if self.bytes.saturating_add(size) > MAX_TOTAL_BYTES {
+            self.note(
+                "include",
+                path.display().to_string(),
+                "read budget exhausted",
+            );
+            return;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            self.note("include", path.display().to_string(), "unreadable");
+            return;
+        };
+        self.bytes = self.bytes.saturating_add(size);
+        self.files.push(path.to_path_buf());
+        // Lossy rather than strict: a config file with one bad byte in
+        // a comment must not cost the user every binding after it.
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let mut local = Vec::new();
+        match syntax {
+            Syntax::Lua => {
+                let mut globals = std::mem::take(&mut self.globals);
+                lua::read(&text, &self.roots.facts, &mut globals, &mut local);
+                self.globals = globals;
+            }
+            Syntax::Conf => {
+                let mut vars = std::mem::take(&mut self.vars);
+                conf::read(&text, &mut vars, &mut local);
+                self.vars = vars;
+            }
+        }
+        // Splice includes in place, so ordering matches what Hyprland
+        // itself would have done — which is what makes "the user's file
+        // is read after the defaults it requires" true.
+        for entry in local {
+            match entry {
+                Directive::Include(include) => self.include(&include, path, out, depth),
+                Directive::PersistedDeviceDisable { kind } => self.persisted_device_disable(&kind, out),
+                other => out.push(other),
+            }
+        }
+    }
+
+    fn include(&mut self, include: &Include, from: &Path, out: &mut Vec<Directive>, depth: u32) {
+        match include {
+            Include::Path(spec) => {
+                let expanded = self.expand(spec, from);
+                if expanded.is_empty() {
+                    self.note("include", spec.clone(), "no file matched");
+                }
+                for path in expanded {
+                    let syntax = Syntax::of(&path);
+                    self.file(&path, syntax, out, depth + 1);
+                }
+            }
+            Include::Module { name, optional } => match self.resolve_module(name) {
+                Some(path) => self.file(&path, Syntax::Lua, out, depth + 1),
+                None if *optional => {}
+                None => self.note(
+                    "include",
+                    format!("require(\"{name}\")"),
+                    "no module of that name on the search path",
+                ),
+            },
+            Include::ModuleDirectory { prefix } => match self.resolve_directory(prefix) {
+                Some(dir) => self.directory(&dir, &[], out, depth + 1),
+                None => self.note(
+                    "include",
+                    format!("require_all.files(…, \"{prefix}\")"),
+                    "no directory of that name on the search path",
+                ),
+            },
+            // Omarchy's toggle directory, under the state home. Absent
+            // until the first toggle is written, and `require_all`
+            // itself reads nothing from a directory that is not there,
+            // so a missing one is the ordinary case of nothing toggled.
+            Include::StateDirectory { relative, exclude } => {
+                let Some(root) = self.roots.facts.state_root() else {
+                    return;
+                };
+                let dir = root.join(relative);
+                if dir.is_dir() {
+                    self.directory(&dir, exclude, out, depth + 1);
+                }
+            }
+        }
+    }
+
+    /// Every `*.lua`/`*.conf` directly under a directory, sorted —
+    /// Omarchy's own `require_all.files` sorts, and so does the shell
+    /// glob its conf-syntax equivalent expands. A base name in
+    /// `exclude` is skipped, as Omarchy's own loader skips it.
+    fn directory(&mut self, dir: &Path, exclude: &[String], out: &mut Vec<Directive>, depth: u32) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            self.note("include", dir.display().to_string(), "unreadable directory");
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && matches!(
+                        p.extension().and_then(|e| e.to_str()),
+                        Some("lua") | Some("conf")
+                    )
+                    && !p
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| exclude.iter().any(|name| name == stem))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let syntax = Syntax::of(&path);
+            self.file(&path, syntax, out, depth + 1);
+        }
+    }
+
+    /// A `source =` path: `~` expanded, relative paths taken against
+    /// the including file's directory, and a trailing glob expanded by
+    /// listing the directory rather than by shelling out.
+    fn expand(&self, spec: &str, from: &Path) -> Vec<PathBuf> {
+        let spec = spec.trim();
+        let path = if let Some(rest) = spec.strip_prefix("~/") {
+            match &self.roots.facts.home {
+                Some(home) => home.join(rest),
+                None => return Vec::new(),
+            }
+        } else if spec.starts_with('/') {
+            PathBuf::from(spec)
+        } else {
+            from.parent().unwrap_or(Path::new(".")).join(spec)
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return Vec::new();
+        };
+        if !name.contains('*') {
+            return if path.is_file() {
+                vec![path]
+            } else {
+                Vec::new()
+            };
+        }
+        // One glob, in the last component, which is the only shape
+        // Hyprland's own `source` lines and Omarchy's toggles directory
+        // use. A pattern anywhere else is not expanded — deliberately,
+        // because a config reader walking arbitrary globs across a file
+        // system is a surprise nobody asked for.
+        let Some((before, after)) = name.split_once('*') else {
+            return Vec::new();
+        };
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut matched: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n.len() >= before.len() + after.len()
+                            && n.starts_with(before)
+                            && n.ends_with(after)
+                    })
+            })
+            .collect();
+        matched.sort();
+        matched
+    }
+
+    /// A device disable Omarchy persisted for `kind`: one line naming the
+    /// device, in the file Omarchy's toggle writes. The path is under
+    /// `~/.local/state` whatever `XDG_STATE_HOME` says, as Omarchy's own
+    /// toggle and module hardcode it. The line is data from a USB
+    /// descriptor: it becomes a device name, bounded and checked, and is
+    /// never read as Lua or passed to anything that could run it. A
+    /// missing file is the ordinary case of nothing disabled.
+    fn persisted_device_disable(&mut self, kind: &str, out: &mut Vec<Directive>) {
+        use std::io::Read;
+        let Some(home) = &self.roots.facts.home else {
+            return;
+        };
+        let path = home.join(".local/state/omarchy/toggles/hypr").join(format!("{kind}-disabled-name"));
+        let Ok(file) = std::fs::File::open(&path) else {
+            return;
+        };
+        // One byte past the longest name, so an oversized line is seen as one.
+        let mut bytes = Vec::new();
+        if file.take(wm_core::DeviceRule::MAX_NAME as u64 + 2).read_to_end(&mut bytes).is_err() {
+            self.note("device", path.display().to_string(), "unreadable");
+            return;
+        }
+        let line = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+        match std::str::from_utf8(line) {
+            Ok(name) if !name.is_empty() && name.len() <= wm_core::DeviceRule::MAX_NAME && !name.contains(char::is_control) => {
+                out.push(Directive::Device {
+                    name: name.to_string(),
+                    settings: vec![("enabled".into(), "false".into())],
+                });
+            }
+            // Omarchy's own module skips an empty line.
+            Ok("") => {}
+            _ => self.note(
+                "device",
+                path.display().to_string(),
+                "not a device name: one line of at most 256 bytes of text with no control characters",
+            ),
+        }
+    }
+
+    /// `default.hypr.omarchy` against the module search path, exactly
+    /// as `bootstrap.lua` sets it up: `~/.local/state`, then
+    /// `~/.config`, then `$OMARCHY_PATH`.
+    fn resolve_module(&self, name: &str) -> Option<PathBuf> {
+        let relative = module_relative(name)?;
+        self.roots
+            .module_path
+            .iter()
+            .map(|root| root.join(&relative).with_extension("lua"))
+            .find(|p| p.is_file())
+    }
+
+    fn resolve_directory(&self, prefix: &str) -> Option<PathBuf> {
+        let relative = module_relative(prefix)?;
+        self.roots
+            .module_path
+            .iter()
+            .map(|root| root.join(&relative))
+            .find(|p| p.is_dir())
+    }
+}
+
+/// A Lua module name as a relative path, refusing anything that could
+/// climb out of a search root. A configuration naming `..` is not a
+/// configuration this reader is going to open.
+fn module_relative(name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.len() > 200 {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for part in name.split('.') {
+        if part.is_empty() || part == ".." || part.contains('/') || part.contains('\\') {
+            return None;
+        }
+        relative.push(part);
+    }
+    Some(relative)
+}
+
+struct LoadReport {
+    files: Vec<PathBuf>,
+    skipped: Vec<Skipped>,
+}
+
+// ---- lowering ---------------------------------------------------------
+
+/// Turns the directive stream into a [`Reading`]: the one place a
+/// Hyprland statement becomes a chonkstep setting.
+fn lower(stream: Vec<Directive>, report: LoadReport) -> Reading {
+    let mut reading = Reading {
+        files: report.files,
+        skipped: report.skipped,
+        ..Default::default()
+    };
+    let mut window_rules = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut dim = Dim::default();
+    for entry in stream {
+        match entry {
+            Directive::Bind {
+                keys,
+                description,
+                flags,
+                dispatcher,
+            } => {
+                if let Ok(spec) = keys::spec_for(&keys) {
+                    if let Some(combo) = crate::parse_key(&spec) { reading.explicit_keys.push(combo); }
+                }
+                bind(&mut reading, &keys, description.as_deref(), flags, &dispatcher)
+            },
+            Directive::LayerBind {
+                namespace,
+                keys,
+                description,
+                flags,
+                dispatcher,
+            } => layer_bind(
+                &mut reading,
+                namespace,
+                &keys,
+                description.as_deref(),
+                flags,
+                &dispatcher,
+            ),
+            Directive::Unbind { keys } if keys::switch_for(&keys).is_some() => {
+                if let Some((device, edge)) = keys::switch_for(&keys) {
+                    reading.switch_bindings.retain(|binding| binding.device != device || binding.edge != edge);
+                }
+            }
+            Directive::Unbind { keys } => match keys::spec_for(&keys) {
+                Ok(spec) => {
+                    if let Some(combo) = crate::parse_key(&spec) {
+                        reading.explicit_keys.push(combo);
+                        reading
+                            .keybindings
+                            .retain(|(existing, _)| *existing != combo);
+                        reading.bindings.retain(|binding| binding.combo != combo);
+                    }
+                }
+                Err(trouble) => reading.skipped.push(Skipped {
+                    kind: "unbind".into(),
+                    what: keys,
+                    why: trouble.reason(),
+                }),
+            },
+            Directive::Env { name, value } => {
+                // Later wins, the way a config file's last word does.
+                env.retain(|(existing, _)| *existing != name);
+                env.push((name, value));
+            }
+            Directive::Input { name, value } => input(&mut reading, &name, &value),
+            Directive::Cursor { name, value } => cursor(&mut reading, &name, &value),
+            Directive::Binds { name, value } => binds(&mut reading, &name, &value),
+            Directive::Misc { name, value } => misc(&mut reading, &name, &value),
+            Directive::Decoration { name, value } => decoration(&mut dim, &mut reading, &name, &value),
+            Directive::Device { name, settings } => device(&mut reading, name, settings),
+            Directive::ExecOnce { command } => autostart(&mut reading, &command),
+            Directive::WindowRule(rule) => window_rules.push(rule),
+            Directive::Monitor(line) => reading.monitors.lines.push(line),
+            Directive::DefaultLayout { layout } => match wm_core::LayoutMode::parse(&layout) {
+                Some(mode) => reading.default_layout = Some(mode),
+                None => reading.skipped.push(Skipped {
+                    kind: "layout".into(),
+                    what: format!("general.layout = {}", bounded(&layout)),
+                    why: "not a style this desktop has; dwindle (Mosaic) and scrolling (Flow) are read".into(),
+                }),
+            },
+            Directive::WorkspaceLayout { workspace, layout } => match wm_core::LayoutMode::parse(&layout) {
+                // The front ends already hold `workspace` to 1..=99;
+                // the index bound is kept here anyway, because a row
+                // past `MAX_WORKSPACES` is one the manager would refuse.
+                Some(mode) if (1..=wm_core::MAX_WORKSPACES as u32).contains(&workspace) => {
+                    reading.workspace_layouts.insert(workspace as usize - 1, mode);
+                }
+                Some(_) => reading.skipped.push(Skipped {
+                    kind: "workspace-rule".into(),
+                    what: format!("workspace {workspace}"),
+                    why: "outside the workspaces this desktop has".into(),
+                }),
+                None => reading.skipped.push(Skipped {
+                    kind: "workspace-rule".into(),
+                    what: format!("workspace {workspace}, layout:{}", bounded(&layout)),
+                    why: "not a style this desktop has; dwindle (Mosaic) and scrolling (Flow) are read".into(),
+                }),
+            },
+            Directive::Animation { leaf, enabled } => animation(&mut reading, &leaf, enabled),
+            Directive::Ignored { kind, detail } => reading.skipped.push(Skipped {
+                kind: kind.to_string(),
+                what: detail,
+                why: "not carried over; see docs/hyprland-config.md".into(),
+            }),
+            // Spliced by the loader; unreachable here, and harmless.
+            Directive::Include(_) | Directive::PersistedDeviceDisable { .. } => {}
+        }
+    }
+    let (float_rules, notes) = rules::compile(&window_rules);
+    reading.float_rules = float_rules;
+    reading.dim_inactive = dim.enabled.then_some(dim.strength);
+    for note in notes {
+        reading.skipped.push(Skipped {
+            kind: "window-rule".into(),
+            what: note,
+            why: "see docs/hyprland-config.md".into(),
+        });
+    }
+    reading.env = filter_env(env, &mut reading.skipped);
+    reading
+}
+
+/// A value out of a file, cut to a length a log line can carry.
+fn bounded(text: &str) -> String {
+    if text.chars().count() > 80 {
+        text.chars().take(80).collect::<String>() + "…"
+    } else {
+        text.to_string()
+    }
+}
+
+fn layer_bind(
+    reading: &mut Reading,
+    namespace: String,
+    keys: &str,
+    description: Option<&str>,
+    flags: directive::BindFlags,
+    dispatcher: &directive::Dispatcher,
+) {
+    let mut scoped = Reading::default();
+    bind(&mut scoped, keys, description, flags, dispatcher);
+    reading.commands.extend(scoped.commands);
+    reading.skipped.extend(scoped.skipped);
+    let Some(binding) = scoped.bindings.pop() else {
+        return;
+    };
+    let bindings = reading.layer_bindings.entry(namespace).or_default();
+    bindings
+        .retain(|existing| existing.combo != binding.combo || existing.release != binding.release);
+    bindings.push(binding);
+}
+
+/// One binding, through the three answers in [`dispatch`].
+fn bind(
+    reading: &mut Reading,
+    keys: &str,
+    description: Option<&str>,
+    flags: directive::BindFlags,
+    dispatcher: &directive::Dispatcher,
+) {
+    let what = match description {
+        Some(text) => format!("{keys} ({text})"),
+        None => keys.to_string(),
+    };
+    if let Some(switch) = keys::switch_for(keys) {
+        return switch_bind(reading, what, switch, flags.locked, dispatcher);
+    }
+    let spec = match keys::spec_for(keys) {
+        Ok(spec) => spec,
+        Err(trouble) => {
+            reading.skipped.push(Skipped {
+                kind: "bind".into(),
+                what,
+                why: trouble.reason(),
+            });
+            return;
+        }
+    };
+    let Some(combo) = crate::parse_key(&spec) else {
+        reading.skipped.push(Skipped {
+            kind: "bind".into(),
+            what,
+            why: format!("{spec:?} is not a chord this desktop can grab"),
+        });
+        return;
+    };
+    let Some(action) = binding_action(reading, &what, dispatcher) else {
+        return;
+    };
+    // Press and release are independent namespaces. In particular the
+    // F9 release half of push-to-talk must not replace its press half.
+    reading
+        .bindings
+        .retain(|existing| existing.combo != combo || existing.release != flags.release);
+    reading.bindings.push(crate::Binding {
+        combo,
+        action: action.clone(),
+        description: description.map(str::to_string),
+        locked: flags.locked,
+        repeating: flags.repeating,
+        release: flags.release,
+    });
+    if !flags.release {
+        reading
+            .keybindings
+            .retain(|(existing, _)| *existing != combo);
+        reading.keybindings.push((combo, action));
+    }
+}
+
+/// What a binding's dispatcher does, through the three answers in
+/// [`dispatch`], or `None` with the reason recorded against `what`.
+fn binding_action(reading: &mut Reading, what: &str, dispatcher: &directive::Dispatcher) -> Option<Action> {
+    let why = match dispatch::verb_for(dispatcher) {
+        dispatch::Verb::Action(action) => return Some(action),
+        dispatch::Verb::Run(argv) if !argv.is_empty() => {
+            let name = dispatch::command_name(&argv);
+            reading.commands.insert(name.clone(), argv);
+            return Some(Action::Run(name));
+        }
+        dispatch::Verb::Run(_) => "empty command".to_string(),
+        dispatch::Verb::Unbound(reason) => reason.reason().to_string(),
+    };
+    reading.skipped.push(Skipped {
+        kind: "bind".into(),
+        what: what.to_string(),
+        why,
+    });
+    None
+}
+
+/// The longest switch device name a binding carries. Kernel input
+/// device names are far shorter; the bound keeps a hostile file from
+/// storing megabytes per binding.
+const MAX_SWITCH_NAME: usize = 256;
+
+/// `switch:on:Lid Switch` and its kin: a binding on a hardware switch,
+/// resolved through the same answers as a chord, so a script outside
+/// the served list stays unbound here too. A later binding on the same
+/// device and edge replaces an earlier one, as for a chord.
+fn switch_bind(
+    reading: &mut Reading,
+    what: String,
+    (device, edge): (&str, crate::SwitchEdge),
+    locked: bool,
+    dispatcher: &directive::Dispatcher,
+) {
+    let refuse = |reading: &mut Reading, why: String| {
+        reading.skipped.push(Skipped {
+            kind: "bind".into(),
+            what: what.clone(),
+            why,
+        })
+    };
+    if device.is_empty() || device.len() > MAX_SWITCH_NAME {
+        refuse(reading, format!("a switch binding needs a device name of 1 to {MAX_SWITCH_NAME} bytes"));
+        return;
+    }
+    let same = |binding: &crate::SwitchBinding| binding.device == device && binding.edge == edge;
+    if !reading.switch_bindings.iter().any(same) && reading.switch_bindings.len() >= crate::SwitchBinding::MAX {
+        refuse(reading, format!("more than {} switch bindings", crate::SwitchBinding::MAX));
+        return;
+    }
+    let Some(action) = binding_action(reading, &what, dispatcher) else {
+        return;
+    };
+    reading.switch_bindings.retain(|binding| !same(binding));
+    reading.switch_bindings.push(crate::SwitchBinding {
+        device: device.to_string(),
+        edge,
+        action,
+        locked,
+    });
+}
+
+/// Hyprland's `decoration:dim_inactive` and `dim_strength`, gathered
+/// as they are met: the strength keeps Hyprland's default until a line
+/// names one, whichever order the two are written in.
+struct Dim {
+    enabled: bool,
+    strength: f32,
+}
+
+impl Default for Dim {
+    fn default() -> Self {
+        Self { enabled: false, strength: 0.5 }
+    }
+}
+
+fn decoration(dim: &mut Dim, reading: &mut Reading, name: &str, value: &str) {
+    let value = value.trim().trim_matches(['\"', '\'']).to_string();
+    match name {
+        "dim_inactive" => {
+            dim.enabled = matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes")
+        }
+        "dim_strength" => match value.parse::<f32>() {
+            Ok(strength) if strength.is_finite() && (0.0..=1.0).contains(&strength) => dim.strength = strength,
+            _ => reading.skipped.push(Skipped {
+                kind: "decoration".into(),
+                what: format!("dim_strength = {value}"),
+                why: "dim strength must be a number from 0 to 1".into(),
+            }),
+        },
+        _ => {}
+    }
+}
+
+fn input(reading: &mut Reading, name: &str, value: &str) {
+    let value = value.trim().trim_matches(['\"', '\'']).to_string();
+    match name.trim().to_ascii_lowercase().as_str() {
+        "kb_rules" => reading.input.rules = Some(value),
+        "kb_model" => reading.input.model = Some(value),
+        "kb_layout" => reading.input.layout = Some(value),
+        "kb_variant" => reading.input.variant = Some(value),
+        "kb_options" => reading.input.options = Some(value),
+        "repeat_rate" => match value.parse::<i32>() {
+            Ok(rate) if (0..=1000).contains(&rate) => reading.input.repeat_rate = Some(rate),
+            _ => reading.skipped.push(Skipped {
+                kind: "input".into(),
+                what: format!("repeat_rate = {value}"),
+                why: "repeat rate must be an integer from 0 through 1000 (0 disables repeat)".into(),
+            }),
+        },
+        "repeat_delay" => match value.parse::<i32>() {
+            Ok(delay) if (0..=5000).contains(&delay) => reading.input.repeat_delay = Some(delay),
+            _ => reading.skipped.push(Skipped {
+                kind: "input".into(),
+                what: format!("repeat_delay = {value}"),
+                why: "repeat delay must be an integer from 0 through 5000 milliseconds".into(),
+            }),
+        },
+        "sensitivity" => match value.parse::<f64>() {
+            Ok(speed) if speed.is_finite() && (-1.0..=1.0).contains(&speed) => {
+                reading.input.sensitivity = Some(speed)
+            }
+            _ => reading.skipped.push(Skipped {
+                kind: "input".into(),
+                what: format!("sensitivity = {value}"),
+                why: "pointer sensitivity must be between -1 and 1".into(),
+            }),
+        },
+        "natural_scroll" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.natural_scroll = Some(enabled))
+        }
+        "touchpad:natural_scroll" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.touchpad_natural_scroll = Some(enabled))
+        }
+        "tap_to_click" | "touchpad:tap_to_click" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.tap_to_click = Some(enabled))
+        }
+        "disable_while_typing" | "touchpad:disable_while_typing" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.disable_while_typing = Some(enabled))
+        }
+        "clickfinger_behavior" | "touchpad:clickfinger_behavior" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.clickfinger_behavior = Some(enabled))
+        }
+        "left_handed" | "touchpad:left_handed" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.left_handed = Some(enabled))
+        }
+        "scroll_factor" | "touchpad:scroll_factor" => match value.parse::<f64>() {
+            Ok(factor) if factor.is_finite() && (0.01..=10.0).contains(&factor) => {
+                if name.starts_with("touchpad:") {
+                    reading.input.touchpad_scroll_factor = Some(factor)
+                } else {
+                    reading.input.scroll_factor = Some(factor)
+                }
+            }
+            _ => reading.skipped.push(Skipped {
+                kind: "input".into(),
+                what: format!("{name} = {value}"),
+                why: "scroll factor must be between 0.01 and 10".into(),
+            }),
+        },
+        "accel_profile" => match value.to_ascii_lowercase().as_str() {
+            "flat" | "adaptive" => reading.input.accel_profile = Some(value.to_ascii_lowercase()),
+            _ => reading.skipped.push(Skipped {
+                kind: "input".into(),
+                what: format!("accel_profile = {value}"),
+                why: "acceleration profile must be flat or adaptive".into(),
+            }),
+        },
+        "numlock_by_default" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.numlock_by_default = Some(enabled))
+        }
+        // Hyprland's conf spells this one with hyphens and its Lua table
+        // with underscores.
+        "touchpad:tap-and-drag" | "touchpad:tap_and_drag" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.tap_and_drag = Some(enabled))
+        }
+        "touchpad:middle_button_emulation" => parse_input_bool(reading, name, &value, |input, enabled| {
+            input.touchpad_middle_button_emulation = Some(enabled)
+        }),
+        "touchpad:drag_lock" if value.trim() == "2" => refuse_input(
+            reading,
+            name,
+            &value,
+            "drag_lock 2 is libinput's sticky drag lock, which is newer than the libinput binding chonkstep is built with; 1 keeps a drag for a timeout",
+        ),
+        "touchpad:drag_lock" => {
+            parse_input_bool(reading, name, &value, |input, enabled| input.drag_lock = Some(enabled))
+        }
+        "touchpad:tap_button_map" => match wm_core::TapButtonMap::from_name(&value) {
+            Some(map) => reading.input.tap_button_map = Some(map),
+            None => refuse_input(reading, name, &value, "tap button map must be lrm or lmr"),
+        },
+        "touchpad:drag_3fg" => match value.trim().parse::<i64>().ok().and_then(wm_core::MultiFingerDrag::from_number) {
+            Some(drag) => reading.input.drag_3fg = Some(drag),
+            None => refuse_input(reading, name, &value, "drag_3fg must be 0 (off), 1 (three fingers) or 2 (four fingers)"),
+        },
+        "touchdevice:output" => reading.input.touch_output = absolute_output(reading, name, &value),
+        "tablet:output" => reading.input.tablet_output = absolute_output(reading, name, &value),
+        "scroll_method" => match wm_core::ScrollMethod::from_name(&value) {
+            Some(method) => reading.input.scroll_method = Some(method),
+            None => refuse_input(reading, name, &value, "scroll method must be 2fg, edge, on_button_down or no_scroll"),
+        },
+        "scroll_button" => match value.trim().parse::<u32>() {
+            Ok(button) if button <= wm_core::MAX_SCROLL_BUTTON => reading.input.scroll_button = Some(button),
+            _ => refuse_input(
+                reading,
+                name,
+                &value,
+                "scroll button must be an evdev button code from 0 through 300 (0 is the device default)",
+            ),
+        },
+        "follow_mouse" => reading.skipped.push(Skipped {
+            kind: "input".into(),
+            what: format!("follow_mouse = {value}"),
+            why: "focus policy belongs to chonkstep; use focus_follows_mouse in config.toml".into(),
+        }),
+        other => reading.skipped.push(Skipped {
+            kind: "input".into(),
+            what: format!("{other} = {value}"),
+            why: "input setting is not implemented".into(),
+        }),
+    }
+}
+
+fn parse_input_bool(
+    reading: &mut Reading,
+    name: &str,
+    value: &str,
+    assign: impl FnOnce(&mut crate::InputConfig, bool),
+) {
+    match toggle(value) {
+        Some(enabled) => assign(&mut reading.input, enabled),
+        None => reading.skipped.push(Skipped {
+            kind: "input".into(),
+            what: format!("{name} = {value}"),
+            why: "input toggle must be true or false".into(),
+        }),
+    }
+}
+
+/// `touchdevice:output` or `tablet:output`: a connector name. Hyprland's
+/// own placeholders and an empty value keep the default mapping, and
+/// `current`, a tablet that follows focus, is refused by name.
+fn absolute_output(reading: &mut Reading, name: &str, value: &str) -> Option<String> {
+    match value.trim() {
+        "" | "[[Auto]]" | "[[Empty]]" => None,
+        "current" => {
+            refuse_input(reading, name, value, "an output that follows focus is not implemented; name a connector");
+            None
+        }
+        connector => Some(connector.to_string()),
+    }
+}
+
+/// One `input` value refused by name, with what the setting accepts.
+fn refuse_input(reading: &mut Reading, name: &str, value: &str, why: &str) {
+    reading.skipped.push(Skipped {
+        kind: "input".into(),
+        what: format!("{name} = {value}"),
+        why: why.into(),
+    });
+}
+
+/// The animation switches this desktop has a transition for: `global`
+/// is every compositor-started motion, `windows` and `windowsMove` are
+/// window geometry, which here is a layout reflow. Later wins, so a
+/// user's file overrides Omarchy's defaults. Every other leaf — borders,
+/// fades, layers, workspaces — animates something this desktop draws
+/// differently or not at all, and is declined by name.
+fn animation(reading: &mut Reading, leaf: &str, enabled: bool) {
+    if leaf.eq_ignore_ascii_case("global") {
+        reading.motion.enabled = enabled;
+    } else if leaf.eq_ignore_ascii_case("windows") || leaf.eq_ignore_ascii_case("windowsMove") {
+        reading.motion.layout = enabled;
+    } else {
+        reading.skipped.push(Skipped {
+            kind: "animation".into(),
+            what: format!("animation leaf {leaf} (enabled = {enabled})"),
+            why: "no such transition here; only global, windows and windowsMove are read".into(),
+        });
+    }
+}
+
+/// A Hyprland boolean, in any of the spellings its config accepts.
+fn toggle(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// One key of Hyprland's `cursor` table. The keys that decide when the
+/// pointer hides are carried. The warp keys are declined by name: this
+/// desktop moves the pointer only when the user, or a script's
+/// `cursor.move`, asks it to.
+fn cursor(reading: &mut Reading, name: &str, value: &str) {
+    let value = value.trim().trim_matches(['\"', '\'']);
+    let name = name.trim().to_ascii_lowercase();
+    let why = match name.as_str() {
+        "hide_on_key_press" | "hide_on_touch" => match toggle(value) {
+            Some(enabled) if name == "hide_on_key_press" => {
+                reading.input.cursor.hide_on_key_press = Some(enabled);
+                return;
+            }
+            Some(enabled) => {
+                reading.input.cursor.hide_on_touch = Some(enabled);
+                return;
+            }
+            None => "cursor toggle must be true or false",
+        },
+        "inactive_timeout" => match value.parse::<f64>() {
+            Ok(seconds) if seconds.is_finite() && seconds >= 0.0 => {
+                reading.input.cursor.inactive_timeout = Some(seconds);
+                return;
+            }
+            _ => "inactive_timeout must be a non-negative number of seconds (0 never hides)",
+        },
+        "warp_on_change_workspace" | "warp_on_toggle_special" | "warp_back_after_non_mouse_input" | "no_warps"
+        | "persistent_warps" => "chonkstep never warps the pointer on its own; only an explicit cursor.move moves it",
+        _ => "cursor setting is not implemented",
+    };
+    reading.skipped.push(Skipped {
+        kind: "cursor".into(),
+        what: format!("{name} = {value}"),
+        why: why.into(),
+    });
+}
+
+/// One key of the `binds` table. Two are carried: the scratchpad's —
+/// whether a workspace switch takes the shown special down with it —
+/// and `disable_keybind_grabbing`, which is whether a focused client
+/// may take every chord through the shortcut-inhibit protocol.
+/// Everything else in the table is Hyprland's own binding behaviour,
+/// which this desktop answers its own way.
+fn binds(reading: &mut Reading, name: &str, value: &str) {
+    let value = value.trim().trim_matches(['\"', '\'']);
+    let name = name.trim().to_ascii_lowercase();
+    let why = match name.as_str() {
+        "hide_special_on_workspace_change" => match toggle(value) {
+            Some(hide) => {
+                reading.hide_special_on_workspace_change = Some(hide);
+                return;
+            }
+            None => "hide_special_on_workspace_change must be true or false",
+        },
+        "disable_keybind_grabbing" => match toggle(value) {
+            Some(disable) => {
+                reading.disable_keybind_grabbing = Some(disable);
+                return;
+            }
+            None => "disable_keybind_grabbing must be true or false",
+        },
+        _ => "binds setting is not implemented",
+    };
+    reading.skipped.push(Skipped {
+        kind: "binds".into(),
+        what: format!("{name} = {value}"),
+        why: why.into(),
+    });
+}
+
+/// One key of the `misc` table. Two are carried. `focus_on_activate`
+/// is Hyprland's word for whether an application that asks to be
+/// focused through `xdg_activation_v1` gets its way without the user's
+/// own input behind the request: off is Hyprland's default, and Omarchy
+/// turns it on. `disable_autoreload` switches off the one-second
+/// re-read of these files until an explicit `reload` — the same switch
+/// Omarchy's upgrade hooks throw live over the IPC. Everything else in
+/// the table is Hyprland's own housekeeping — its logo, its splash, its
+/// ANR pings — which this desktop has no counterpart for.
+fn misc(reading: &mut Reading, name: &str, value: &str) {
+    let value = value.trim().trim_matches(['\"', '\'']);
+    let name = name.trim().to_ascii_lowercase();
+    let why = match name.as_str() {
+        "focus_on_activate" => match toggle(value) {
+            Some(focus) => {
+                reading.focus_on_activate = Some(focus);
+                return;
+            }
+            None => "focus_on_activate must be true or false",
+        },
+        "disable_autoreload" => match toggle(value) {
+            Some(paused) => {
+                reading.disable_autoreload = Some(paused);
+                return;
+            }
+            None => "disable_autoreload must be true or false",
+        },
+        _ => "misc setting is not implemented",
+    };
+    reading.skipped.push(Skipped {
+        kind: "misc".into(),
+        what: format!("{name} = {value}"),
+        why: why.into(),
+    });
+}
+
+/// One device rule, merged into an earlier rule for the same name as a
+/// later statement in a configuration wins. The name is matched exactly,
+/// never as a pattern, and it and the number of rules are bounded, because
+/// device names come from USB descriptors.
+fn device(reading: &mut Reading, name: String, settings: Vec<(String, String)>) {
+    let skip = |reading: &mut Reading, what: String, why: &str| {
+        reading.skipped.push(Skipped { kind: "device".into(), what, why: why.into() })
+    };
+    if name.is_empty() || name.len() > wm_core::DeviceRule::MAX_NAME || name.contains(char::is_control) {
+        let shown: String = name.chars().take(64).collect();
+        return skip(
+            reading,
+            format!("device {shown:?}"),
+            "a device rule names one device exactly, in 1 to 256 bytes with no control characters",
+        );
+    }
+    let index = match reading.input.devices.iter().position(|rule| rule.name == name) {
+        Some(index) => index,
+        None if reading.input.devices.len() >= wm_core::DeviceRule::MAX_RULES => {
+            return skip(reading, format!("device {name:?}"), "more than 64 device rules in one configuration");
+        }
+        None => {
+            reading.input.devices.push(wm_core::DeviceRule { name: name.clone(), ..Default::default() });
+            reading.input.devices.len() - 1
+        }
+    };
+    for (key, value) in settings {
+        let value = value.trim().trim_matches(['\"', '\'']);
+        let rule = &mut reading.input.devices[index];
+        let setting = key.trim().to_ascii_lowercase();
+        let switch = match setting.as_str() {
+            "enabled" => Some(&mut rule.enabled),
+            "natural_scroll" => Some(&mut rule.natural_scroll),
+            "left_handed" => Some(&mut rule.left_handed),
+            "tap_to_click" | "tap-to-click" => Some(&mut rule.tap_to_click),
+            _ => None,
+        };
+        if let Some(switch) = switch {
+            match toggle(value) {
+                Some(enabled) => *switch = Some(enabled),
+                None => skip(reading, format!("device {name:?} {key} = {value}"), "device toggle must be true or false"),
+            }
+            continue;
+        }
+        let why = match setting.as_str() {
+            "sensitivity" => match value.parse::<f64>() {
+                Ok(speed) if speed.is_finite() && (-1.0..=1.0).contains(&speed) => {
+                    rule.sensitivity = Some(speed);
+                    continue;
+                }
+                _ => "pointer sensitivity must be between -1 and 1",
+            },
+            "accel_profile" => match value.to_ascii_lowercase().as_str() {
+                profile @ ("flat" | "adaptive") => {
+                    rule.accel_profile = Some(profile.to_string());
+                    continue;
+                }
+                _ => "acceleration profile must be flat or adaptive",
+            },
+            _ => "per-device setting is not implemented; a device rule carries enabled, sensitivity, accel_profile, natural_scroll, left_handed and tap_to_click",
+        };
+        skip(reading, format!("device {name:?} {key} = {value}"), why);
+    }
+}
+
+/// One `exec-once` line, filtered.
+///
+/// Two filters, and both exist because starting the wrong thing here
+/// is worse than starting nothing. A command whose Hyprland requests
+/// chonkstep does not serve can only half-work; and Omarchy's own shell
+/// is already started by
+/// `chonk_shell::omarchy_shell`, at the point in the session where
+/// Hyprland's `autostart` would have started it, so taking it from
+/// this list too would start a second copy of the bar.
+fn autostart(reading: &mut Reading, command: &str) {
+    let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let blanket_systemd_import = compact.contains("systemctl --user import-environment")
+        && (compact.contains("$(env") || compact.ends_with(" import-environment"));
+    let blanket_dbus_import = compact.contains("dbus-update-activation-environment")
+        && compact.split_whitespace().any(|word| word == "--all");
+    if blanket_systemd_import || blanket_dbus_import {
+        reading.skipped.push(Skipped {
+            kind: "exec-once".into(),
+            what: command.to_string(),
+            why: "blanket activation-environment imports can leak credentials, build variables, or another session's display; chonkstep publishes a curated session set".into(),
+        });
+        return;
+    }
+    let argv = dispatch::split_command(command);
+    let Some(program) = argv.first().cloned() else {
+        return;
+    };
+    let base = program.rsplit('/').next().unwrap_or(&program).to_string();
+    // `uwsm-app -- <thing>`: look past the wrapper, so the checks below
+    // see the program Omarchy is actually starting.
+    let effective = if base == "uwsm-app" {
+        argv.iter()
+            .find(|a| *a != "uwsm-app" && *a != "--")
+            .cloned()
+            .unwrap_or_else(|| base.clone())
+    } else {
+        base.clone()
+    };
+    let effective = effective
+        .rsplit('/')
+        .next()
+        .unwrap_or(&effective)
+        .to_string();
+    if let Some(reason) = dispatch::hyprland_refusal(&base).or_else(|| dispatch::hyprland_refusal(&effective)) {
+        reading.skipped.push(Skipped {
+            kind: "exec-once".into(),
+            what: command.to_string(),
+            why: reason.reason().to_string(),
+        });
+        return;
+    }
+    if ALREADY_OURS.contains(&effective.as_str()) {
+        reading.skipped.push(Skipped {
+            kind: "exec-once".into(),
+            what: command.to_string(),
+            why:
+                "this desktop starts it itself; running it from here too would start a second copy"
+                    .into(),
+        });
+        return;
+    }
+    if command.contains("&&")
+        || command.contains("||")
+        || command.contains('|')
+        || command.contains('$')
+        || command.contains(';')
+    {
+        reading.autostart.push(vec![
+            "bash".into(),
+            "-lc".into(),
+            command.trim().to_string(),
+        ]);
+        return;
+    }
+    reading.autostart.push(argv);
+}
+
+/// Autostart entries this desktop already owns.
+///
+/// `omarchy-launch-shell` is the bar, the menus, the notifications and
+/// the lock screen — `chonk_shell::omarchy_shell` starts exactly that,
+/// with the theme and scale this session resolved, and
+/// `docs/omarchy-mode.md` already says why it must not also be in an
+/// autostart list.
+const ALREADY_OURS: &[&str] = &["omarchy-launch-shell", "omarchy-shell"];
+
+/// Environment variables, filtered.
+///
+/// Two of Omarchy's are load-bearing lies under this window manager:
+/// `XDG_CURRENT_DESKTOP=Hyprland` and `XDG_SESSION_DESKTOP=Hyprland`
+/// tell every portal, screen-sharing picker and toolkit that Hyprland
+/// is running. Omarchy sets them deliberately, and under Omarchy they
+/// are true. Under chonkstep they are not, and carrying them would
+/// route xdg-desktop-portal at `xdg-desktop-portal-hyprland`, which
+/// would then try to talk to a compositor that is not there — the same
+/// class of failure as a binding that runs `hyprctl`, in the one place
+/// where it would break screen sharing rather than one key.
+///
+/// The session's own display variables are refused for the blunter
+/// reason: they name *this* session, the compositor that owns it
+/// already sets them correctly, and a stale value out of a config file
+/// is how a desktop points its children at a display that does not
+/// exist.
+fn filter_env(env: Vec<(String, String)>, skipped: &mut Vec<Skipped>) -> Vec<(String, String)> {
+    env.into_iter()
+        .filter(|(name, value)| {
+            let refused = match name.as_str() {
+                "XDG_CURRENT_DESKTOP" | "XDG_SESSION_DESKTOP" => {
+                    Some("names Hyprland as the running desktop, which under chonkstep it is not")
+                }
+                "WAYLAND_DISPLAY"
+                | "DISPLAY"
+                | "XDG_SESSION_TYPE"
+                | "XDG_RUNTIME_DIR"
+                | "HYPRLAND_INSTANCE_SIGNATURE" => Some("names this session, which the compositor sets for itself"),
+                "GDK_SCALE" | "GDK_DPI_SCALE" | "QT_SCALE_FACTOR" | "ELM_SCALE" => Some(
+                    "toolkit-wide scale would double-apply or contradict the compositor's per-output monitor scale",
+                ),
+                _ => None,
+            };
+            match refused {
+                Some(why) => {
+                    skipped.push(Skipped { kind: "env".into(), what: format!("{name}={value}"), why: why.into() });
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
+
+// ---- the watch --------------------------------------------------------
+
+/// Noticing that the user changed their Hyprland configuration, so the
+/// session follows it without a restart.
+///
+/// This is the whole point of the module. Omarchy's menu writes these
+/// files; if a rebind through their UI needed a logout to take effect,
+/// "your menu still configures your machine" would be a half-truth.
+///
+/// Polled at one hertz, like `chonk_shell::omarchy_follow`, and for the
+/// same two reasons that module gives. The general one: two `stat`
+/// calls a second on paths that are usually there is nothing, and a
+/// change landing within a second of a menu click is indistinguishable
+/// from instant. The specific one is stronger here — these files are
+/// *replaced*, not modified. `omarchy-menu` writes a temporary file and
+/// renames it over the original, and Omarchy's upgrades move whole
+/// trees; an inotify watch on a path that is unlinked and recreated has
+/// to be re-armed by exactly the kind of code that goes wrong at
+/// 3 a.m., where a signature comparison simply sees a different inode.
+///
+/// The signature covers every file the last read actually opened, plus
+/// the modification time of the directories those files live in — so a
+/// *new* file appearing (a user adding `~/.config/hypr/mine.lua`, an
+/// upgrade dropping a new default in) is noticed too, which a per-file
+/// signature alone would miss until something else changed.
+#[derive(Debug)]
+pub struct Watch {
+    cadence: std::time::Duration,
+    last_checked: Option<std::time::Instant>,
+    seen: bool,
+    signature: Signature,
+}
+
+/// What identifies one watched file: its modification time, size and
+/// inode — `None` when the file is not there, which is itself a change
+/// worth seeing. The inode is in there because these files are written
+/// by `rename`-over, which can leave the timestamp alone.
+type FileIdentity = Option<(std::time::SystemTime, u64, u64)>;
+
+/// The identity of a set of files: each one's (mtime, size, inode), and
+/// each watched directory's mtime. `None` for a file that is not there,
+/// which is itself a change worth seeing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Signature {
+    files: Vec<(PathBuf, FileIdentity)>,
+    directories: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+}
+
+impl Watch {
+    /// A watch over the files a [`Reading`] opened, and the roots they
+    /// came from.
+    pub fn new(roots: &Roots, reading: &Reading) -> Self {
+        Self {
+            cadence: std::time::Duration::from_secs(1),
+            last_checked: None,
+            seen: false,
+            signature: Signature {
+                files: reading.files.iter().cloned().map(|path| (path, None)).collect(),
+                directories: [
+                    roots.user.clone(),
+                    roots.defaults.clone(),
+                    roots.defaults.join("bindings"),
+                    roots.defaults.join("apps"),
+                ].into_iter().map(|path| (path, None)).collect(),
+            },
+        }
+    }
+
+    /// Whether the configuration changed since the last time this
+    /// returned `true` — or since the watch was created, for its first
+    /// look.
+    ///
+    /// The first call baselines and returns `false`: the session just
+    /// resolved from the very files being watched, so what is there now
+    /// is what it is already wearing. Same contract, and the same
+    /// reasoning, as `omarchy_follow::Watch::changed`.
+    pub fn changed(&mut self, now: std::time::Instant) -> bool {
+        if self
+            .last_checked
+            .is_some_and(|last| now.duration_since(last) < self.cadence)
+        {
+            return false;
+        }
+        self.last_checked = Some(now);
+        let changed = self.refresh() && self.seen;
+        self.seen = true;
+        changed
+    }
+
+    /// Re-points the watch at the files a fresh read opened, and
+    /// re-baselines.
+    ///
+    /// Called after a re-read, because the set of files is itself part
+    /// of what a config edit can change: a user adding a `source =`
+    /// line brings a file into the set that was never watched before,
+    /// and a user deleting one takes it out.
+    pub fn follow(&mut self, reading: &Reading) {
+        self.signature.files = reading.files.iter().cloned().map(|path| (path, None)).collect();
+        self.refresh();
+        self.seen = true;
+    }
+
+    /// Reuse the stable path set and replace only scalar metadata. Do not
+    /// short-circuit after a change: every entry needs the same new baseline.
+    fn refresh(&mut self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let mut changed = false;
+        for (path, previous) in &mut self.signature.files {
+            let identity = std::fs::metadata(path)
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len(), m.ino())));
+            changed |= *previous != identity;
+            *previous = identity;
+        }
+        for (path, previous) in &mut self.signature.directories {
+            let identity = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            changed |= *previous != identity;
+            *previous = identity;
+        }
+        changed
+    }
+}
+
+#[cfg(test)]
+mod tests;

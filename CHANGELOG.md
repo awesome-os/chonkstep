@@ -1,0 +1,1740 @@
+# Changelog
+
+All notable changes to chonkstep. Versions are workspace-wide: every
+crate and both session binaries carry the same number.
+
+## [Unreleased]
+
+- An experimental Darwin back end, `wm-darwin`, runs the window manager
+  and themes as a Wayland compositor on SiliconForest. It is off unless
+  built with `--features darwin-backend`; Linux builds and packages don't
+  change. CI lints it for Linux and `aarch64-apple-darwin` and runs its
+  wire tests on Linux.
+- An external display whose EDID can only be read after it is set up,
+  which Apple's display driver does at login and after a dock retrains
+  its links, is probed again for about 16 seconds and adopted again
+  under its real make, model and serial once the EDID arrives. Before,
+  it stayed `Unknown` for the whole session, so `desc:` monitor rules
+  and kanshi profiles never matched it.
+- wlr-output-management heads carry the display's serial number, so
+  kanshi and other clients can tell two identical monitors apart.
+- While adaptive sync is live on a fullscreen game or video, a frame that
+  just misses a refresh of the fixed grid is presented as soon as it is
+  ready, instead of waiting nearly a whole refresh for the next one.
+- In the X11 session, a click inside an unfocused window always focuses
+  and raises it. A window that lost focus with nothing else to take it,
+  such as the only window sent to another workspace, or one opened under a
+  `no_initial_focus` rule, used to pass the click to the application and
+  could only be focused from its titlebar.
+- On the X11 session, a window that asks to stay on top or on every
+  desktop is pinned, and one that demands attention or sets its urgency
+  hint is marked urgent, as XWayland windows already were. A
+  `_NET_WM_STATE_SHADED` request, which the session already advertised,
+  now shades the window.
+- A touchscreen covers one output instead of the whole monitor layout, so a
+  tap on a laptop's own panel lands there while an external display is
+  connected. The output is the one `input:touchdevice:output` names, else
+  the one udev ties the device to, else the built-in panel, else the
+  primary, and a rotated output turns the touch with it. A drawing tablet
+  still spans the whole layout by default, as in Hyprland, and
+  `input:tablet:output` or udev can bind it to one output.
+
+## [0.7.2] - 2026-10-06
+
+- At startup, watch udev for display changes before the first connector
+  read. A display that a dock reports connected just after that read is now
+  adopted through the usual hotplug rescan, instead of staying dark until
+  the next hotplug.
+- A layer surface that names no output, such as a polkit prompt, opens on
+  the focused output instead of the first one. Layer-shell version 5
+  clients, such as hyprtoolkit's dialogs, connect.
+- The Dock clock shows local time instead of UTC (tidux).
+- The Clip's workspace label scales with its tile (tidux).
+- The example configuration says that no desktop starts the Dock (tidux).
+- Builds with Rust 1.99: the deprecated atomic update calls are replaced.
+
+## [0.7.1] - 2026-09-28
+
+- Desktop mode restores a window's monitor, position and size when a
+  display that was briefly unplugged comes back. A move, resize, maximize
+  or fullscreen while it is gone is kept. Spaces mode already restored
+  these windows. Disconnecting the last monitor no longer configures
+  surviving windows down to a tiny size.
+- When a connector refuses its chosen mode, try the other advertised
+  timings, starting with the same resolution at a lower refresh rate, so a
+  bandwidth-limited dock link can still light the display.
+- While a driven external output is connected, including an Apple Silicon
+  USB-C or Thunderbolt connector named `USB-*`, hold the lid switch so
+  closing the laptop does not suspend. Drop that hold when the external
+  output leaves.
+- Return probed DRM devices to the seat, including a secondary GPU whose
+  notifier fails to adopt, so those devices do not stay registered for the
+  rest of the session.
+- A click on the window the pointer is already over does not send an extra
+  pointer motion at the press position.
+- Xwayland inherits the session graphics stack and can use GPU OpenGL with
+  a GLX-enabled private M3 Mesa prefix. Its process passes the same opt-in
+  Mesa guard as native clients.
+- `CHONKSTEP_RENDER_DEVICE` composes into a display-only KMS device such as
+  simpledrm, which has no render node. Its software renderer receives the
+  finished frames, and no client buffers go to its planes.
+- Import LINEAR dma-bufs on drivers that refuse implicit modifiers (zink on
+  Honeykrisp). This fixes the fallback to CPU copies.
+- Add the opt-in `CHONKSTEP_DMABUF_REQUIRE_MESA` guard, which offers
+  linux-dmabuf only to clients running one Mesa build.
+- Add an experimental Apple M3 GPU session
+  (`scripts/wayland-session-m3gpu.sh`, `scripts/install-m3gpu-session.sh`).
+- The Apple M3 session drives the native display card (DCP) when it exists:
+  Mesa's kmsro renders with zink on the M3 directly into the display's scanout
+  buffers, on the single-GPU path with no copy. The simpledrm cross-GPU mode
+  is unchanged. A hardware test covers a kmsro-paired display controller.
+  External Thunderbolt displays can be adopted again on that session.
+  Fullscreen scanout keeps the client's linear layout, accepts
+  opaque-equivalent formats, and waits on atomic in-fences when the display
+  device has no syncobj timeline. Large SHM uploads are staged off the
+  input thread, and the refresh estimate no longer follows software
+  completion time.
+- The default terminal font is 12 px, matching Omarchy's 9 pt Foot face at
+  96 DPI. Super+Space runs `omarchy-menu toggle`.
+- Add BeOS R5 and OS/2 Warp 4 themes.
+
+## [0.7.0] - 2026-09-18
+
+- Restore the NeXTSTEP dock as `chonk-dock`, a standalone application in the
+  `dock/` subproject with native Wayland and X11 backends. Neither compositor
+  links the dock; Omarchy starts no dock process, samplers or hidden surfaces.
+- Restore the original instrument artwork, audio/network/Bluetooth panels,
+  application pins and running indicators, workspace Clip, tile reordering,
+  and minimized-window restore tiles.
+- Restore dockapp hosting, Rust/Python/Go SDKs, the clock, Shelf and appearance
+  switch examples, and `chonk-get`. Stopping the dock shuts down its dockapps
+  and releases its screen reservation. Installations do not register examples
+  or enable autostart.
+- Follow live Wayland output scales and X11 Xft DPI, support explicit output
+  selection, and provide display-specific start/status/stop/toggle controls.
+- Honor external EWMH dock struts in the X11 window manager, including live
+  reservation changes and release when the owning application exits.
+- Include the optional dock and helpers in the Arch and Debian/LCOS binary
+  packages. Add native X11 and Wayland lifecycle/input/scaling tests and SDK
+  checks to CI.
+
+## [0.6.1] - 2026-09-15
+
+- Read Omarchy's default and per-workspace layouts, evaluate window-rule size
+  and position expressions, and support client-only fullscreen inside a tile.
+- Add named special workspaces for scratchpads, monitor focus and workspace
+  moves, and occupied/previous workspace selectors. Keep scratchpad membership
+  and output ownership consistent across pinning, dialogs and separate Spaces.
+- Support disabling and re-enabling outputs, retain parked connectors after
+  failed probes, and preserve unchanged monitors' runtime settings on reload.
+  Reserve non-desktop connectors on hotplug and retry failed display links.
+- Add a motion off-switch, per-window opacity, inactive dimming and a live
+  transparency toggle.
+- Draw drag icons at integer and fractional scales, follow the correct input
+  serial when mouse and touch are held together, and remove icons on drop or lock.
+- Enforce `no_screen_share` in compositor-rendered captures, including cached
+  switcher previews and protected drag icons.
+- Add a shortcut-inhibition escape chord and preserve each window's suspension
+  independently. Validate activation tokens against the focus and input serial
+  that authorized them, rejecting forged future serials.
+- Expose xdg toplevel tags and descriptions, and support `match:xdg_tag` rules.
+- Unify the binding and IPC dispatcher vocabulary, preserve window selectors
+  containing spaces and commas, and retain effective keyboard modes after an
+  invalid configuration edit.
+- Report invalid configuration items and rejected reloads through diagnostics.
+  Honor Omarchy's automatic-reload pause across both configuration and theme
+  watches, with explicit reload still available.
+- Rescan installed application entries off-thread, reject stale menu picks,
+  and prevent named pipes from blocking the application scanner.
+- Bound control-socket requests and connection acceptance per servicing pass,
+  rotate readers fairly, and reuse snapshot and diagnostic serialization.
+
+## [0.6.0] - 2026-09-14
+
+- Remove the built-in dock, its instruments and samplers, the dock tile
+  protocol with its Go and Python SDKs, the persistent workspace switcher and
+  `chonk-get` from both the Wayland and X11 sessions. Omarchy's bar supplies
+  the workspace indicator and system panels; desktop menus and the transient
+  Overview remain.
+- Add the Obsidian, Washi and Relay themes, each with light and dark
+  renditions. One theme drives window frames, desktop menus and window
+  navigation, and its Omarchy export coordinates the rest of the desktop.
+- Register missing built-in themes in Omarchy's theme picker at install time
+  and before the shell starts at each login or hot restart, so an upgrade adds
+  new themes. Existing theme directories and customizations are kept.
+- Add ChonkStep Help to the desktop menu: a searchable guide to the session's
+  resolved shortcuts, with a quick reference for layouts, Overview, Spaces and
+  gestures. The `help` action can be bound to open it directly.
+- Title the root menu "Omarchy" whenever Omarchy's shell or menu is installed,
+  even where `/etc/os-release` names the base distribution, such as Arch Linux
+  ARM. Other hosts, such as LCOS, keep their own OS name.
+- Show Codex, Claude Code, OpenCode and T3 Code agent sessions in an Omarchy
+  top-bar plugin, backed by a session service that runs outside the
+  compositor.
+- Report the full logical screen to bar clients on fractional-scale outputs,
+  so Omarchy's panels match layer-shell units.
+
+- Separate Spaces from the keyboard profile. `interaction_mode = "spaces"`
+  selects per-monitor and dedicated fullscreen Spaces, and `keyboard_mode`
+  selects the keys. The Mac keyboard profile is now experimental and off
+  unless `keyboard_mode = "mac"` is set; the legacy `interaction_mode = "mac"`
+  still implies Mac keys when `keyboard_mode` is unset.
+- Open Omarchy's launcher from Command-Space in the Mac keyboard profile when
+  `desktop = "omarchy"`. `[commands] omarchy-menu` and a `cmd+space` binding
+  still override it.
+- Default Overview to the classic arrangement, a desktop strip above large
+  live previews; `overview_style = "cards"` selects numbered workspace cards
+  with modern themes. Opening and closing Overview from the keyboard animates
+  on the gesture springs and can be reversed part-way.
+- Keep Overview under the fingers while busy windows change titles, resize or
+  appear; refresh live content without replacing the panel or resetting
+  progress.
+- Leave minimized windows out of Overview and its desktop previews. Restore
+  them from the window switcher or from their desktop preview tiles, which are
+  now on by default (`minimized_previews`). Modern themes use wider switcher
+  cards.
+- Keep a shaded window rolled up through Overview. Its card shows only the
+  titlebar strip, and choosing it focuses the window without unrolling it; a
+  click, a taskbar pick or an application's activation request still unrolls
+  it. It used to appear at full size, and picking it unrolled it.
+- Switch to the workspace of a window activated from elsewhere, in every
+  interaction mode. Omarchy's launch-or-focus chords, notification clicks and
+  `focuswindow` gave keyboard focus to a window on a hidden workspace, so the
+  next keystrokes went to an application nobody could see. Behind the lock,
+  such an activation marks the window urgent instead.
+- Size lock surfaces in logical units on fractional-scale outputs. Dividing by
+  the rounded-up integer scale shrank the lock surface.
+
+- Keep window frames and content aligned through buffer-density and viewport
+  changes, and cache decoration rasters against consistent layout inputs.
+- Keep a native Wayland window's size stable when its GPU buffer arrives late
+  during a resize drag. A JBR/Vulkan client on a 150% display could jump much
+  larger or smaller and separate from its titlebar. The resize density is now
+  kept until the requested size is committed at that density and the drag has
+  ended.
+- Keep client buffers and frames aligned during resize. A terminal's cell-grid
+  snap no longer leaves an oversized frame, a late frame from a resize burst
+  cannot undo the final request, and a newly mapped client's size is
+  acknowledged before its first drag.
+- Stretch a framed native window's buffer only while a resize reply is
+  pending, and never once the buffer fills the frame. After a fullscreen or
+  resize, a window geometry that differed from the frame interior kept the
+  buffer stretched per axis, so browser clicks and selections landed off by
+  that ratio.
+- Keep a fullscreen window at its monitor's size when the client answers with
+  another buffer, such as a browser still showing its windowed frame or a
+  fixed-size game. The compositor adopted that size and resized the window
+  straight back on every pass, repainting about twenty times a second for as
+  long as the mismatch lasted.
+
+- Add the System 7 decoration style (`decoration_style = "system7"`): close
+  and zoom boxes, a striped active title, an original Chicago-metric title
+  atlas and a four-pixel invisible resize margin, checked against genuine
+  System 7.5 captures at 1x and 2x. Changing the style on reload reflows
+  existing windows in place on both backends, XWayland windows included.
+- Draw desktop menus, the window switcher, minimized icons and Overview
+  captions in the selected decoration style.
+- Add System 7 Classic, Light Gray and Dark Gray to Omarchy's theme picker,
+  each with its frame recipe and a QuickDraw desktop pattern tiled at native
+  pixel size. Under the default `decoration_style = "auto"`, a theme selects
+  its own frame recipe.
+- Frame client-drawn GTK4 and libadwaita apps, such as Files and Pinta, which
+  mapped with no ChonkStep frame: only a Close button and no usable resize
+  edges. They now get themed borders and resize edges around their own header
+  bar, and are told they are tiled so they drop their invisible shadow. At
+  session start a stock `appmenu:close` GTK button layout becomes
+  `appmenu:minimize,maximize,close`; a layout the user set is left alone.
+  `[decorations] frame_client_drawn = true` puts the full ChonkStep titlebar
+  above such an app's own header bar, a `[decorations] client_side` entry still
+  leaves an app bare, and a reload re-decides open windows.
+- Select decoration styles in the renderer without changing a pixel of the
+  existing default frames, checked by 720 compatibility fixtures and measured
+  performance gates.
+- Skip unchanged decoration-band uploads on both backends while retrying failed
+  X11 uploads and repainting correctly after frame resizes.
+
+- Report cursor and window positions and sizes through Hyprland IPC in logical
+  layout coordinates, matching xdg-output, and accept the same units in move
+  and resize dispatches. `cursorpos -j` answers in JSON.
+- `hyprctl eval hl.monitor(...)` applies the `mode` and `position` Omarchy's
+  monitor scripts send with the scale, or refuses the whole request before
+  changing anything. It used to answer `ok` after applying only the scale.
+  Disabling and mirroring an output are still refused by name. After a
+  monitor hotplug, `monitors -j` no longer reports another output's modes,
+  make and refresh rate.
+- Make every row of Omarchy's SUPER+K keybindings menu runnable. `hyprctl
+  binds` reported window-management bindings with a `chonkstep` dispatcher and
+  a Rust debug rendering, so picking toggle floating, maximize, layout, move or
+  next workspace did nothing. Each binding now reports a verb that replays,
+  shell commands are quoted so they rebuild exactly, `workspace +1`/`-1` step
+  relative to the current workspace, and plain `devices` answers in Hyprland's
+  block format.
+- Run Omarchy's pop-out, window-width, close-all, monitor-scaling and
+  workspace-layout scripts from their chords and menu rows, including SUPER+O,
+  SUPER+Home and CTRL+ALT+DELETE; every request they send is served. `hyprctl`
+  and scripts that need unserved requests (tiled fullscreen, transparency,
+  gaps, aspect, laptop display, clamshell, monitor watch, mirroring) stay
+  unbound, each with its own reason.
+- Bind Omarchy 4's twelve keyboard resize chords from its Lua configuration, and
+  refuse exact-size resize bindings instead of reading them as deltas. Every
+  bound resize delta, including chonkstep's own `grow-width`/`shrink-width`
+  family, is now in logical pixels, so on a scaled output each step is as large
+  as the same `hyprctl dispatch resizeactive` rather than a fraction of it.
+- Read the `suppress_event` window rule. Omarchy's `suppress_event maximize`
+  on every window now keeps a tile in its cell when an application asks to
+  be maximized; `fullscreen` works the same way, `activate` refuses focus
+  on activation, and the compositor's own verbs are unaffected.
+- Open fullscreen or maximized when a client asks before its window maps.
+  An xdg toplevel's `set_fullscreen` or `set_maximized` during setup, and an
+  X11 window's `_NET_WM_STATE` written while withdrawn, were dropped, so
+  games and players that start fullscreen opened windowed. Both now apply at
+  map, through the same path window rules can refuse.
+- Read `idle_inhibit` window rules by mode. Omarchy's `fullscreen` rule for
+  Steam and game-streaming clients counted as always on, so a Steam window
+  left on screen kept the session from dimming and locking. `focus` and
+  `fullscreen` now inhibit only in that state, and `hyprctl clients` reports
+  the result as `inhibitingIdle`.
+- Report the seat's layout list, such as `us,de`, in the `layout` field of
+  `hyprctl devices`, so Omarchy's keyboard-layout widget shows on multi-layout
+  seats. `active_keymap` still names the active layout.
+- Read `and`, `or`, `not` and comparisons in Hyprland Lua configuration the
+  way Lua does, keep `local` variables out of other files, and require `then`
+  after `if`. `if a and b` was read as `if a`, and a user file's `local
+  omarchy_default_bindings = false` turned Omarchy's default bindings off.
+  Calls the reader skips are now logged by name.
+- Bound recursion and work in the Lua configuration reader. `x = x or false`
+  followed by `if x then` looped forever or overflowed the stack, freezing the
+  desktop after a save to `~/.config/hypr` or crash-looping the login. Name
+  cycles, deep expressions, growing rebinds and nested loops now stop at a
+  logged limit.
+- Refuse Lua values known only at runtime instead of using their source text,
+  and fill an unset keyboard layout and variant from `/etc/vconsole.conf`.
+  Omarchy 4's `vconsole.XKBLAYOUT or "us"` reached libxkbcommon as the literal
+  layout, which fell back to a default keymap without Compose on Caps Lock.
+  `XKB_DEFAULT_*` variables and explicit configuration still take precedence.
+- Apply an output-management scale change, and place hotplugged monitors, from
+  the running session's configuration. A scale change from an output-management
+  client, made while `config.toml` did not parse, replaced bindings, input
+  settings and theme with the defaults, and a docked monitor lost its Hyprland
+  monitor rule.
+
+- Run Hyprland switch bindings (`switch:on:Lid Switch`, `switch:off:…`,
+  `switch:…`) from both configuration syntaxes. Omarchy's lid-close handler
+  now locks the session as the lid shuts when no external monitor is
+  connected. While locked, only bindings marked locked run. Opening the lid
+  wakes sleeping screens and resets idle, and a session that starts with the
+  lid closed runs its `switch:on` binding at once.
+- Switch pointer, touch and tablet devices off and on by name with
+  `hl.device({ name = …, enabled = false })`, as Omarchy's touchpad keys and
+  menu toggles send, and read per-device `enabled`, `sensitivity`,
+  `accel_profile`, `natural_scroll`, `left_handed` and `tap_to_click` from
+  `device { }` blocks and `hl.device`. A disabled device releases what it held
+  and neither moves the pointer nor wakes the screen. Keyboards are never
+  disabled.
+- Lock Num Lock at session start under `numlock_by_default`, and apply drag
+  lock, three-finger drag, middle-button emulation, the tap button map, scroll
+  method and scroll button from both Hyprland syntaxes and `[input]`. Removing
+  a key restores the device default. Three-finger drag needs a libinput that
+  provides it.
+- Configure mouse and touchpad scrolling separately. Omarchy's touchpad-only
+  natural scrolling and 0.4 scroll factor also reversed and slowed every mouse.
+  `[input]` now configures mice and `[input.touchpad]` touchpads,
+  `scroll_touchpad` window rules apply, and small factors no longer round
+  high-resolution wheel steps away.
+- Hide the pointer while typing (`hide_on_key_press`), after a touch
+  (`hide_on_touch`) and after `inactive_timeout` seconds without pointer
+  input, read from Omarchy's `cursor` section or a new `[cursor]` table.
+  Bindings and bare modifiers do not hide it, and any pointer input shows it
+  again.
+- Draw the cursor shapes clients name through `wp_cursor_shape_manager_v1`,
+  such as the text beam, link hand and resize arrows, from the Xcursor theme at
+  each output's scale, honoring `XCURSOR_THEME` and a pinned `XCURSOR_SIZE`.
+  Tablet tools now draw a cursor. Theme files are read off the compositor
+  thread with size limits; animated shapes show their first frame.
+- Serve `hl.dsp.cursor.move` and `movecursor X Y` pointer warps in logical
+  coordinates, so Omarchy's keyboard-driven screenshot picker moves its
+  highlight. A warp is refused while locked or while a client holds a pointer
+  constraint.
+- Open the window menu when a client-drawn header bar asks for it, as GTK 4,
+  libadwaita and Qt do on right-click. The request must carry a current pointer
+  or keyboard serial and is refused while locked.
+
+- Allow capture shortcuts over desktop menus, submenus, Help and Overview.
+  Area selection leaves the panel visible and returns keyboard control to it
+  afterwards; full-screen capture also works during window drags, recording
+  and an existing selection.
+- Plan recording regions with the actual fractional scale and capture
+  rounding, so screen and area recording no longer fail at once on
+  fractional-scale displays.
+- Anchor window captures where the window is drawn. A client drawing its own
+  shadow was captured shifted by the shadow margin and cropped at the right
+  and bottom, in toplevel image capture, the window switcher, minimized tiles
+  and Overview.
+- `chonkrec start --demo` records compositor capture controls and cursors for
+  product walkthroughs, while concurrent normal captures stay clean. Recordings
+  recover across compositor restarts and open in Omacut when finalized.
+- Show a persistent, click-through boundary around the area being recorded,
+  with a subtle outward shadow and clipping to the selected display.
+- Bound recording keyframe gaps to one second, including recovery re-encoding.
+  This improves random access but can substantially increase file size on static
+  desktops; native CPU and storage measurements are documented.
+- Require actual video before reporting recording startup, flush small fragments
+  promptly, and normalize output rotation on both old and new wf-recorder
+  versions.
+
+- Hide `ext_foreign_toplevel_list_v1` and `ext_workspace_manager_v1` from
+  clients admitted through `wp_security_context_v1`. The 0.4.4 boundary hid the
+  wlr foreign-toplevel manager but missed its ext twin, so a sandboxed app could
+  still read every window title and switch workspaces. `ext_idle_notifier_v1`
+  stays visible by design.
+- Stop a Hyprland IPC request containing non-ASCII whitespace, such as
+  `dispatch<U+00A0>workspace 2`, from panicking the compositor and ending the
+  session.
+- Read Lua dispatch arguments as Lua 5.4 literals. An escaped quote ended an
+  `exec_cmd` string early, so `exec_cmd("notify-send \"build finished\"")` ran
+  `notify-send \` and answered `ok`, and a key name inside a string could be
+  taken for a field. Malformed literals are refused by name.
+
+- Keep a lock surface requested for an output that was just unplugged. A
+  locker racing the last monitor's removal panicked the compositor; the
+  surface now gets its configure, draws nowhere, and the session stays locked.
+- Keep gamma and color-transform ownership across monitor hotplug. After
+  docking, undocking or plugging in a projector, Omarchy's night light stopped
+  responding and a gamma client's restore on exit was dropped. Surviving
+  outputs keep their owners, and a control for a removed output is sent
+  `failed`.
+- Key DPMS output power controls by output identity. After a monitor was
+  unplugged, a power client could fail on a monitor that was still connected or
+  switch off a newly plugged one. A control for a removed output is now sent
+  `failed`.
+
+- Leave `~/.local/state/chonkstep/appearance-request` for its writer while it
+  is empty and less than a second old. A poll between a shell redirect's
+  truncate and its write, as in `echo light > appearance-request`, deleted the
+  empty file and lost the request. The documented poll interval is corrected
+  to 100 ms.
+
+## [0.5.0] - 2026-09-10
+
+- Live Spaces thumbnails show actual window content, placement, stacking, and
+  per-display membership, with Wayland/XWayland pixel and callback regression tests.
+
+- Add a reversible Mac keyboard profile with application-aware Command keys,
+  terminal clipboard handling, application switching/hiding and capture shortcuts.
+- Preserve clipboard offers copied before enabling Mac mode, including X11
+  owners. Prevent retiring an old input-method grab from disabling its replacement
+  and prevent translated releases leaking into a newly focused client.
+- Add per-output GPU pipeline counters, refresh-aware surface tracking,
+  asynchronous capture downloads and improved frame pacing. Overlay scanout,
+  broader primary scanout and cross-GPU rendering remain explicit experiments.
+- Add isolated product-demo tooling producing real capture-overlay screenshots,
+  a 1080p video walkthrough and the feature's own screenshot/recording exports.
+
+- Fix all seven findings from the per-display Spaces review: no-output gestures,
+  hidden-client keyboard focus on policy reload, fullscreen dialog-family moves,
+  home geometry after borrowing a smaller display, active desktops when enabling
+  separate Spaces, maximized/fullscreen session restore, and pinned-window focus.
+  Full disconnect now preserves parked window sizes, and dialog drags continue
+  after retiring their parent's fullscreen Space.
+
+- Mac mode now provides independent per-display Spaces, local keyboard/swipe
+  navigation and Overview, simultaneous fullscreen, display boundary clipping,
+  dialog-family moves, and preserved membership through hotplug and session
+  restore. Native workspace groups use stable IDs; linked displays remain
+  available through `mac.separate_spaces = false`.
+
+## [0.4.4] - 2026-09-08
+
+- LCOS gains an amd64 X11 package, four themes, desktop branding, and
+  theme-specific wallpapers. LCOS assets are enabled only in that package;
+  the default Arch build retains its existing assets.
+- Client-decorated Wayland windows honor their input regions and resize
+  grab offsets, restoring toolkit resize handles at integer and fractional
+  display scales.
+- Logout signals remain deliverable in launched applications. Nested hot
+  restart reconnects to the original host display and preserves signal delivery.
+- Security-context clients cannot bind privileged capture, clipboard-control,
+  virtual-input, layer-shell, and related globals.
+- Presentation feedback, frame callbacks, and FIFO barriers use actual visible
+  surfaces, including subsurfaces. Hidden animation clients stop redrawing.
+- Appearance changes use one worker with bounded subprocess execution and
+  coalesce pending requests. Unchanged config polling avoids rebuilding its
+  path list, and X11 property reads have explicit size limits.
+- Text pen positions snap to whole pixels and desktop marks are resampled
+  before drawing for more consistent small text and icon edges.
+- Lua `hl.monitor({ …, transform = N })` now reaches the monitor applier.
+  The Lua reader was joining `transform` and its value into one combined
+  string before handing it to the applier, which only recognizes the two
+  separate tokens the classic `.conf` syntax produces — so every
+  Lua-configured monitor rotation was silently refused as an unsupported
+  field. `monitor=` lines with other unsupported fields (`disable`,
+  `mirror`, `cm`, `bitdepth`, …) are still refused whole either way.
+- A `monitor=` line refused for an out-of-range or malformed `scale` now
+  still reserves its layout slot, so a later `auto`-positioned monitor no
+  longer lands on top of it instead of past its width.
+
+## [0.4.3] - 2026-09-07
+
+- Fullscreen publishes zero frame extents, and XWayland sends the settled
+  resize after border changes. This fixes Steam Big Picture rendering into
+  its old window size with black space around it, including SDL clients that
+  wait for borders to disappear before accepting a fullscreen resize.
+- Wayland startup clears inherited GTK scaling overrides from the compositor
+  and activation environment, preventing Steam from multiplying a 2x desktop
+  by `GDK_SCALE=2` and starting at 4x.
+- Imported Hyprland rules now match the entire class and title. Omarchy's size
+  rule for `Steam` no longer catches Big Picture or sign-in windows, and its
+  floating rule no longer catches `steam_app_*` game windows.
+
+## [0.4.2] - 2026-09-07
+
+- Game pointer capture suspends touchpad "disable while typing", allowing held
+  movement keys and camera motion together in Wayland and XWayland games.
+  Normal typing suppression returns when capture ends. The preference is also
+  supported in TOML and imported Hyprland input configuration.
+- Omarchy's screensaver opens fullscreen on fresh accounts without imported
+  window rules, instead of inheriting the generic utility-window size.
+  Explicit imported fullscreen rules still take precedence.
+
+- Capture notifications show the saved screenshot or a thumbnail from the
+  recording, fixing the missing camera icon shown as a pink checkerboard.
+  Video preview failures fall back to a video icon without delaying capture.
+
+## [0.4.1] - 2026-09-07
+
+- Window capture now finishes by clicking the highlighted window. A camera
+  cursor shows the capture hotspot, including at fractional display scales.
+  Dragging out of the toolbar cannot accidentally capture a window.
+- Screen and area recording normalize the output's advertised transform before
+  cropping, fixing upside-down video with wf-recorder 0.4.1 in nested sessions.
+  Changing-content regressions pass with wf-recorder 0.4.1 and 0.6.0.
+- Failed MP4 conversion retains the recoverable recording and encoder log, and
+  reports their paths for diagnosis.
+- Main CI builds both native release packages once. Releases reuse the verified
+  packages and debug symbols from the same commit, waiting for main CI if needed.
+  Release compilation selects only the five installed binaries, and superseded
+  PR checks are cancelled.
+
+The reported Omacut playback stall could not be reproduced in the available
+setup and remains unconfirmed. This release does not claim to resolve it.
+See the [0.4.1 release notes](docs/releases/0.4.1.md).
+
+## [0.4.0] - 2026-09-07
+
+This alpha release adds native capture, finger-following gestures, reversible
+workspace layouts, and a measured capture and background-work performance pass.
+
+### Added and improved
+
+- Native Wayland capture: lossless screen, area and unobscured-window PNGs,
+  automatic saving and PNG clipboard ownership, a keyboard/pointer selector,
+  and region/display recording with a stop indicator and recoverable MP4 export.
+  Omarchy workspace/group shortcuts are preserved; see [Capture](docs/capture.md).
+- Capture controls keep the cursor visible, with clearer icons, spacing and
+  selection feedback. Saved screenshots open in the configured default viewer
+  (imv on the tested Omarchy installation); finished recordings open in Omacut.
+- Native desktop and Overview gestures follow the fingers, support reversal and
+  velocity-aware settling, and let users catch a settling transition.
+- Drag live windows onto desktop thumbnails to move them from Overview.
+- Freeform, Mosaic and Flow workspace layouts are reversible and preserve the
+  floating arrangement when returning to Freeform.
+
+- Overview's desktop thumbnails now have an × control. Removing a desktop
+  preserves its windows on a neighboring desktop, compacts the row, keeps
+  minimized state and focus, and leaves at least one desktop.
+- Swiping past an empty final desktop no longer creates more empty desktops.
+- Native workspace clients receive removal events; stale activation requests
+  cannot recreate a removed desktop.
+- Browser input regressions now exercise Chromium over both Wayland and
+  XWayland at 1x, 1.5x and 2x: exact text selection, held arrow/letter/backspace
+  behavior, release, Omarchy reloads, and Overview focus recovery. The same
+  matrix was also verified with Microsoft Edge; see the
+  [browser input report](docs/engineering/2026-09-06-browser-input.md).
+
+### Performance and reliability
+
+- Sparse capture-overlay damage reduced drawing and resizing CPU by roughly
+  85–86% in repeated nested software-rendered comparisons. Selection allocation
+  traffic fell roughly 69%; an idle selector schedules no periodic redraws.
+- Capture queues, readback caches, clipboard admission and review helpers have
+  explicit bounds. PNG output streams with small scratch buffers, and cancelled
+  screencopy requests no longer strand later requests.
+- Closed detail panels stop their extra polling and request fresh state on
+  opening. Stalled sampler subprocesses are bounded; malformed Tailscale status
+  cannot leave stale actions enabled.
+- Application indexing avoids quadratic deduplication; clipped Dock content
+  skips painting; icons avoid a full pixel clone; impossible layout candidates
+  are rejected before expensive placement work.
+- Session environment discovery reads appended log data rather than repeatedly
+  scanning the complete history. Shaded windows no longer paint full-height
+  side strips.
+
+### Validation and limits
+
+- Qualification includes strict Clippy, documentation, Rust and Python checks,
+  native capture and panel regressions, paired 1 GiB/2 GiB constrained workloads,
+  and a ten-minute, 1,813-cycle stability run.
+- Startup and retained idle memory did not improve significantly. Some 2 GiB
+  pressure checks had worse input latency despite lower CPU usage. Nested
+  software-rendered results do not establish hitch-free native hardware behavior.
+
+See the [0.4.0 release notes](docs/releases/0.4.0.md) and the
+[performance report](docs/engineering/2026-09-07/capture-performance.md) for
+measurements, checkpoint-specific validation and remaining limitations.
+
+## [0.3.2] - 2026-09-06
+
+This release adds macOS-style desktop swipes, proportional live windows in
+Overview, and top-bar-aware window placement to the native Wayland session.
+
+### Added
+
+- Three- and four-finger touchpad swipes switch workspaces horizontally, open
+  Overview upward and dismiss it downward. Gestures commit on finger lift;
+  short, ambiguous, reversed and cancelled strokes do not trigger an action.
+  Finger count, travel threshold and enablement are configurable.
+- Wayland Overview shows live windows at their own proportions over the
+  wallpaper, with desktop thumbnails along the top and a compact selection
+  outline and caption. Small windows are never enlarged; applications keep
+  their actual sizes. X11 retains its existing rasterized Overview fallback.
+- Managed titlebars respect each output's reserved top layer-shell bar during
+  placement, movement, resizing and session restore. A bar appearing late also
+  moves existing titlebars below it; fullscreen still covers the full output.
+
+### Fixed
+
+- New windows now refresh an open Overview even without a saved session layout.
+- Shading a Wayland window no longer leaves stale border pixels on screen.
+- The synthetic x86_64 release-verifier regression fixture now identifies its
+  simulated host consistently when run on an ARM64 build machine.
+
+### Performance
+
+- The swipe recognizer uses at most 40 bytes per seat, allocates nothing during
+  updates, and adds no thread or polling timer. Move snapping borrows targets
+  rather than allocating a vector for every pointer event.
+- Native Overview reuses client GPU textures and sparse decoration buffers,
+  suspends periodic screenshot readbacks while open, and uses no output-sized
+  shell pixel buffer. Selection reuses cached captions; closing releases the
+  native scene and caption storage.
+- In three nested software-rendered sessions per binary with six windows,
+  median first-open PSS growth fell from 19,888 KiB to 2,104 KiB (about 89%),
+  and cumulative input-dispatch time across 12 Overview cycles fell from
+  534,523 to 33,873 microseconds (about 94%). End-to-end latency did not improve
+  proportionally; these results do not establish a hardware latency guarantee.
+
+### Validation
+
+- Strict Clippy, documentation, workspace and Wayland unit tests, and all 26
+  Python harness tests passed during feature qualification.
+- The preserved optimized compositor passed 11 nested cases covering Overview,
+  desktop gestures, fullscreen and buffer-age capture, including live pixels,
+  exposed wallpaper, window proportions and bar boundaries at 1x/2x scale.
+- Allocation coverage checks 100,000 recognition updates and snapping queries
+  with zero allocator requests. The installed native Apple DRM session was
+  also visually checked and remained responsive after opening and closing
+  Overview. Physical trackpad frame latency was not measured.
+
+See [gesture behavior and configuration](docs/gestures.md) and the
+[Overview measurements and limitations](docs/engineering/2026-09-06-overview.md).
+
+## [0.3.1] - 2026-09-06
+
+This patch release concentrates on input correctness, resilient selection
+transfer, sustained resource ownership, and measurable compositor efficiency.
+It also turns the bugs found during release qualification into deterministic
+regressions instead of retries or timing sleeps.
+
+### Fixed
+
+- Fresh Wayland sessions now auto-select per-output DPI scaling when no scale
+  override exists. A 2560x1600 M1 MacBook Air panel selects 2x even when its
+  DRM driver omits physical dimensions, while ordinary 1080p laptop panels
+  remain at 1x and ambiguous external displays are not guessed from resolution
+  alone.
+- Omarchy theme changes and live config reloads now retain the detected or
+  manually selected primary-output scale instead of rebuilding the session
+  with the generic 1x fallback. Explicit `scale` and `CHONKSTEP_SCALE`
+  overrides continue to win.
+- Microsoft Edge and Chromium text selection now lands on the intended caret
+  at 1x, 1.5x and 2x output scale in both windowed and fullscreen modes.
+- Native Wayland and X11 held-key repeat now survives focus transitions,
+  runtime repeat changes, layout reloads, input-method ownership and modal UI;
+  a zero repeat rate reliably disables timers.
+- Clipboard and primary selection now handle UTF-8, binary data, large INCR
+  transfers, backpressure, cancellation, slow consumers, owner death and
+  XWayland restart across 19 real-session cases.
+- Selection protocol objects are retired when clients disconnect or are killed
+  without issuing explicit release requests, preventing dead data-device,
+  primary-selection and data-control records from accumulating.
+- Pointer lock and confinement honor regions immediately, survive their full
+  focus lifecycle and no longer deadlock on first confined motion.
+- Client-requested xdg move and resize operations require the exact live
+  pointer serial, seat and client; stale, cross-client and drag-and-drop serials
+  can no longer initiate window-management grabs.
+- A Chromium configure-order race no longer loses the first requested resize.
+  CI now separately observes requested geometry and the buffer the client has
+  actually presented before taking screenshots.
+- X11 window identity and input focus survive withdraw/remap cycles; destroyed
+  clients no longer leave stale window records, selection transfers or repeat
+  state behind.
+- XWayland minimize/restore no longer lets an unchanged modal-state publish
+  race the hidden-state removal and resurrect `_NET_WM_STATE_HIDDEN` on an
+  already restored window. The exact ICCCM/EWMH round trip passed 100
+  consecutive fresh optimized-compositor sessions after the fix.
+- X11 autostart receives ChonkStep's reserved XWayland display, GLES 2 capture
+  uses a compatible readback path, and offscreen capture restores the correct
+  nested EGL surface and buffer-age state.
+- Native release-package validation no longer combines `pipefail` with
+  early-exiting `grep -q` consumers, which could report a present ELF unwind
+  section as missing depending on architecture and process scheduling. Archive,
+  ELF architecture, dependency, exact `.eh_frame`, build-ID and split-debug
+  checks now consume stable snapshots of their producers' complete output.
+- Omarchy menu generations reject stale actions, the initial menu is loaded
+  once rather than twice, and panel results are no longer discarded merely
+  because an unrelated tile refreshed.
+
+### Performance
+
+- A stalled 8 MiB clipboard transfer previously added 8,196 KiB of compositor
+  anonymous PSS in every trial; bounded staging reduced the measured addition
+  to 0 KiB in all seven matched trials while preserving every payload byte.
+- The controlled 8 MiB X11-to-Wayland partial-write path went from 8,192
+  temporary allocations requesting 272,629,760 bytes cumulatively to zero.
+- Matched two-hour lifecycle runs reduced requested-live Rust growth by 61.2%,
+  peak live allocation by 9,999,644 bytes, and anonymous-plus-swap growth by
+  56.4%, while non-pipe descriptors and thread counts remained flat.
+- Locked relative-pointer reports no longer request invisible renders: 128
+  observed reports went from 128 render attempts to zero, and an 8,192-report
+  burst delivered every raw delta with zero render attempts or submissions.
+- Hidden Dock instruments start sampling on demand and suspend while hidden.
+  In the published seven-pair fixture, idle CPU fell from 0.233% to 0.0833% of
+  one core, context switches from 45.92 to 12.10 per second, and startup used
+  18 fewer threads.
+- Glyph retention is budgeted, long-label fitting avoids quadratic reraster
+  work, unchanged backgrounds skip decoding/upload, and redundant owned-pixel
+  copies were removed from compositor chrome.
+- Ignored NetworkManager virtual-device/profile rows allocate nothing in the
+  parser, and the normal 56px clock render uses 32 allocator requests instead
+  of 52 with byte-identical output across sizes 8 through 128.
+
+### Validation
+
+- The principal before/after comparison used two matched 7,202-second nested
+  software-rendered lifecycle soaks totaling 59,089 churn cycles. A separate
+  306-second heaptrack pair isolated the retained protocol allocation stacks.
+- Startup and idle guardrails use seven alternating samples per executable and
+  60-second measurement windows. Clipboard backpressure uses seven alternating
+  before/after pairs, resumes every consumer and validates every payload byte.
+- The frozen release executable passed 200 nested end-to-end cases plus all
+  three installed-Omarchy checks with no skipped clients, including real Edge,
+  Chromium and isolated Chonkcraft matrices, plus 16 consecutive live
+  Omarchy-theme transitions at a retained 2x scale. Release qualification also
+  ran the formerly intermittent XWayland minimize/restore round trip through
+  100 fresh optimized compositor processes without a failure and the forced
+  release-verifier SIGPIPE regression through 50 consecutive clean runs.
+- These results do not claim a matched Hyprland victory, native DRM/KMS frame
+  timing, game FPS improvement or universal hardware coverage. Full commands,
+  raw samples, hashes and limitations are in `docs/engineering/2026-09-05/`.
+
+## [0.3.0] - 2026-09-05
+
+The release where ChonkStep became an Omarchy compositor rather than a
+parallel desktop, while its Wayland backend gained the compatibility,
+recovery, performance, and diagnostics needed for serious daily use.
+Everything below is on both sessions unless it names one.
+
+### Fixed
+
+- **Transient dialogs now behave as a family on both Wayland and X11.**
+  Toplevel children are centred on their parent, modal children redirect
+  parent focus/drag/close gestures, and minimize, restore, and workspace
+  moves carry the bounded transient tree. Runtime parent and modal changes
+  are tracked through xdg-dialog, `WM_TRANSIENT_FOR`, and
+  `_NET_WM_STATE_MODAL` ([#55](https://github.com/iconidentify/chonkstep/issues/55)).
+- **A mid-session XWayland crash no longer leaves ghost frames or a stale
+  `DISPLAY`.** The live XWM disconnect path retires every X11 window and its
+  auxiliary state, then makes one bounded restart attempt; an end-to-end
+  test kills the real server and maps a window through its replacement
+  ([#58](https://github.com/iconidentify/chonkstep/issues/58)).
+- **Configuration decisions are inspectable.** Both binaries support
+  `--check-config [PATH]` and `--print-config [PATH]`, effective values name
+  their winning layer, Hyprland parser refusals are retained by
+  `hyprctl configerrors`, and formerly silent plugin/animation directives
+  are reported ([#60](https://github.com/iconidentify/chonkstep/issues/60)).
+- **Secret storage and portal global shortcuts are routed explicitly.** The
+  compositor serves Hyprland's global-shortcuts protocol with bounded,
+  duplicate-safe registrations and maps configured `global, app:id`
+  bindings to press/release events; the portal documentation now inventories
+  exported and missing interfaces honestly
+  ([#61](https://github.com/iconidentify/chonkstep/issues/61)).
+- **Desktop menus are keyboard-operable.** Up/Down wrap through enabled
+  rows, Left/Right traverse cascades, Enter/Space activate the highlighted
+  item, menus hold the modal keyboard grab while open, and `root-menu` is a
+  bindable action ([#62](https://github.com/iconidentify/chonkstep/issues/62)).
+- **Assistive and automation clients can inject a pointer.** The compositor
+  serves `zwlr_virtual_pointer_manager_v1` v2, maps absolute input to an
+  optional output, batches protocol frames, and routes motion, buttons, and
+  axes through the same focus, grab, confinement, shell, and idle path as
+  physical devices ([#63](https://github.com/iconidentify/chonkstep/issues/63)).
+- **Monitor hot-plug now reconciles the live desktop instead of leaving
+  dark or phantom outputs.** Debounced DRM probes adopt new connectors,
+  withdraw unplugged output globals, rebuild output-management and gamma
+  state, reapply monitor rules, and rescue windows stranded on a removed
+  screen without restarting the session
+  ([#47](https://github.com/iconidentify/chonkstep/issues/47)).
+- **Touchscreens now reach native clients and compositor chrome.** The
+  Wayland seat advertises `wl_touch`, libinput touch slots keep their
+  down-time focus through motion/up, and taps or drags on titlebars, the
+  desktop, and shell furniture use the existing click machinery. Lid and
+  tablet-mode switch events are now named in the log instead of discarded
+  ([#48](https://github.com/iconidentify/chonkstep/issues/48)).
+- **Single-window screen sharing is now a compositor capability.** The
+  standard foreign-toplevel list and all three ext image-capture globals
+  expose output and toplevel sources, long-lived shm capture sessions
+  refresh constraints after geometry/scale changes and stop on source
+  removal, and window capture shares the existing offscreen pixel path
+  without bypassing the lock screen. Legacy wlr screencopy remains as a
+  fallback ([#51](https://github.com/iconidentify/chonkstep/issues/51)).
+- **Local socket connection storms can no longer grow compositor work
+  without bound.** The Hyprland request/event sockets and native control
+  socket retain at most 64 clients apiece, accept-and-close overflow with
+  once-per-episode diagnostics, and share rotating aggregate read budgets.
+  Silent one-shot requests expire while legitimately quiet subscribers do
+  not. Wayland calloop source reconciliation now uses reusable membership
+  sets and remains linear in the retained descriptor count; a live storm
+  test drives both Hyprland populations past their caps and proves overflow
+  never enters the compositor source set
+  ([#80](https://github.com/iconidentify/chonkstep/issues/80)).
+- **Fractional XSETTINGS scales no longer round GTK X11 applications to
+  the nearest integer size.** `Gdk/UnscaledDPI` now carries the remainder
+  left by `Gdk/WindowScalingFactor`, so their product reproduces
+  `Xft/DPI`: a 1.5x desktop publishes 72 pre-scale DPI times a 2x window
+  factor instead of 96 DPI times 2. Wire-level tests cover 1.25x, 1.5x,
+  and 2.5x; the independently physical-pixel Xcursor size remains scaled
+  once ([#86](https://github.com/iconidentify/chonkstep/issues/86)).
+- **Protocol-object teardown now removes every hot-path ledger entry it
+  created.** Input-method popups and idle inhibitors are bounded and
+  pruned on object or client destruction, same-surface idle inhibitors
+  retain per-object reference counts, and session-lock surfaces are
+  removed with their `wl_surface`. A second lock surface for one physical
+  output is refused even when a distinct `wl_output` resource names it
+  ([#96](https://github.com/iconidentify/chonkstep/issues/96)).
+- **Crash recovery can no longer resurrect an unlocked desktop.** The
+  Omarchy posture now resolves its shipped `omarchy-system-lock` entry
+  point while an explicit `lock_command` remains authoritative. A
+  recovered Wayland compositor enters a blank, input-isolated lock
+  domain before launching that command and waits asynchronously for a
+  relaunched Omarchy shell's IPC; a missing or unlaunchable command
+  fails closed instead of exposing the session
+  ([#53](https://github.com/iconidentify/chonkstep/issues/53)).
+- **Fullscreen applications now own their output's desktop plane.** A
+  focused fullscreen window occludes the Omarchy `Top` bar and chonkstep's
+  above-shell dock/menu on only the output it occupies, while protocol
+  `Overlay` surfaces and the session lock remain above it. Rendering and
+  hit-testing share the same predicate, so hidden furniture cannot retain
+  clicks; a nested real-client test also proves keyboard focus remains with
+  the fullscreen application for screensaver dismissal
+  ([#33](https://github.com/iconidentify/chonkstep/issues/33)).
+- **Stopping SDDM can no longer turn a transient DRM/VT handoff race into
+  a permanent black screen.** The managed UWSM supervisor performs no
+  synchronous user-manager calls during teardown. Omarchy integration also
+  installs a reversible SDDM service drop-in that expands orderly shutdown
+  from 5 to 20 seconds, backs retries off by 3 seconds, and disables the
+  two-start permanent rate-limit latch. Recovery docs now require a logged-in
+  text VT plus `reset-failed`/`start` rather than presenting a live-session
+  restart as safe ([#29](https://github.com/iconidentify/chonkstep/issues/29)).
+- **Long window titles are middle-elided and confined to one titlebar
+  line.** Real window chrome now shares the same elision policy as the
+  Alt-Tab switcher and Overview cards. The common text rasterizer also
+  disables cosmic-text's default word wrapping and clips every glyph to
+  its requested box, so even wide fallback glyphs cannot paint into the
+  client area ([#31](https://github.com/iconidentify/chonkstep/issues/31)).
+- **linux-dmabuf no longer advertises a display-only KMS primary as its
+  render device on split hardware.** DRM sessions now prefer EGL's actual
+  renderer node, use a KMS fallback only when it resolves to a real render
+  node, and otherwise disable dmabuf feedback and direct client-buffer
+  scanout. This prevents xdg-desktop-portal-wlr from crashing on Asahi's
+  separate `apple-drm` / `asahi` devices while retaining the safe fast path
+  ([#28](https://github.com/iconidentify/chonkstep/issues/28)).
+- **A stock Omarchy configuration no longer silently changes the
+  desktop to focus-follows-mouse.** The live Hyprland bridge now imports
+  hardware-facing keyboard and repeat settings but deliberately leaves
+  focus policy to chonkstep's own `focus_follows_mouse` setting. Omarchy's
+  shipped `follow_mouse = 1` is declined by name and the documented
+  click-to-focus default remains true in practice
+  ([#30](https://github.com/iconidentify/chonkstep/issues/30)).
+
+### Performance
+
+- **Opaque compositor-owned buffers now participate in occlusion.** Theme
+  chrome and the black-backed cover wallpaper declare their full opaque
+  region at import, avoiding needless blending and allowing lower scene
+  elements to be culled; arbitrary client shell buffers remain conservative
+  ([#64](https://github.com/iconidentify/chonkstep/issues/64)).
+- **DRM composition is deadline-scheduled against predicted vblank.** A
+  per-output, time-based asymmetric render estimator delays steady-cadence
+  composition for fresher input, grows its safety margin after misses, and
+  keeps first/post-idle frames immediate. Synchronous preview readback now
+  runs after submission instead of widening the deadline path
+  ([#46](https://github.com/iconidentify/chonkstep/issues/46)).
+- **Frame performance is measurable in live and CI sessions.** Fixed-size
+  per-phase totals, maxima, and power-of-two dispatch/render histograms are
+  readable and resettable through the opt-in test door; the E2E harness
+  brackets visible and hidden workloads with them. An off-by-default
+  `profile` feature also enables ChonkStep and Smithay tracing spans
+  ([#49](https://github.com/iconidentify/chonkstep/issues/49)).
+- **The native control socket now builds desktop snapshots only on a
+  semantic edge or readable request.** A cheap stamp covers window-manager
+  state, output/workarea changes, the monitor under the pointer, and shell
+  theme state; quiet clients still have buffered writes serviced without a
+  deep diff. Monitor inspection is borrowed, and a live bar test proves 16
+  unchanged compositor wakeups build zero snapshots while an explicit
+  request builds exactly one ([#94](https://github.com/iconidentify/chonkstep/issues/94)).
+- **Omarchy focus grabs no longer scale with every inert popup object.**
+  The one active grab is now an indexed invariant, making the common
+  input guard O(1) instead of searching all G grab objects. Surface
+  destruction prunes whitelists from the exhaustive `wl_surface`
+  callback instead of every dispatch pass; at 60 wakes, the stable path
+  eliminates 120G staged/committed vector scans per second while keeping
+  the protocol's implicit-remove and keyboard handoff behavior exact.
+- **Lock-surface upkeep is now event-driven.** A new lock surface, its
+  destruction, or an output size/scale change schedules one configure
+  and focus reconciliation; an animated but otherwise stable lock screen
+  returns immediately. With M lock surfaces and 60 compositor wakes per
+  second, the steady state drops 120M lock-surface state mutex acquisitions
+  plus 60 focus-membership scans per second to zero. Scale changes also
+  reconfigure the lock before the same pass renders, eliminating a stale-
+  size frame at the new scale.
+- **A connected output manager is now idle when the outputs are.** Host
+  resize, config reload, IPC scale, and wlr-output-management apply paths
+  explicitly invalidate the retained protocol snapshot; clean dispatch
+  passes return before reading any `Output` state. A persistent `kanshi`
+  connection at 60 compositor wakes per second therefore goes from 60N
+  mode-lock/read comparisons per second for N outputs to zero, while
+  repeated mutations still coalesce into one exact delta batch.
+- **Multi-output visibility math is now genuinely disjoint.** The old
+  overlap helper used signed `saturating_sub`, which preserves a negative
+  distance; casting that miss to `u64` made a non-overlapping monitor look
+  enormous, could overflow and panic in debug builds, and could select the
+  wrong output for frame callbacks in release builds. Intersections now use
+  widened edge arithmetic and clamp misses to zero. Tests cover flush edges,
+  opposite-monitor objects, and adversarial `i32`/`u32` extents.
+- **Each output now assembles only the scene that can reach it.** Ledger
+  rectangles admit the common case in constant time, while an object outside
+  them falls back to Smithay's exact surface-tree bounds so subsurfaces,
+  shadows, and popups still cross monitor edges correctly. Disjoint windows,
+  shell furniture, layers, frames, lock surfaces, and cursors are omitted
+  before import/element construction; notably, a cursor on one display can no
+  longer disqualify direct scanout on another. For N outputs with non-spanning
+  content, surface-element construction falls from N copies per tree to one—a
+  50% reduction on two displays and 75% on four—while whole-desktop and region
+  captures use the same bounded scene path.
+- **Steady scene and protocol assembly no longer hide nested vector
+  allocations.** Wayland surface trees now stream render elements directly
+  into each output's retained scene instead of allocating one temporary vector
+  per visible tree, per output, per frame. Output management compares live
+  heads directly with its retained baseline, and lock upkeep walks the disjoint
+  output/surface ledgers in place. At 60 Hz, the old code created and freed 60
+  vectors per visible surface tree/output, plus 60 for a persistent manager and
+  60 for a live lock screen; all three paths are now allocation-free after
+  their retained ledgers reach capacity, with identical ordering, protocol,
+  and configure behavior.
+- **Idle inhibition follows the visible scene and reconciles only on its
+  edges.** A decorated toplevel stays protocol-mapped when its hidden frame is
+  parked, so checking only that mapped bit let an invisible video/player
+  suppress Omarchy's lock and suspend indefinitely. Idle policy now shares the
+  renderer's exact frame/direct-slot predicate, and protocol-inhibitor, window,
+  layer, destruction, and lock transitions invalidate one sparse pass while
+  pixel commits take a two-boolean fast path. A real self-timed client held an
+  inhibitor and a 250 ms idle notification through 30 commits, then moved via
+  Omarchy's silent-send binding: the instrumented run performed exactly three
+  reconciliations (startup, visible, parked), versus at least 32 under the
+  former once-per-dispatch path—a greater than 90% reduction—and observed the
+  idle event immediately after the window became invisible.
+- **On-screen scene assembly is allocation-stable after warm-up.** Each
+  output now rebuilds its heterogeneous render-element list in retained
+  storage instead of creating and dropping a fresh vector per frame. The DRM
+  path rotates three buffers for the scene being built, the flip in flight,
+  and a directly scanned-out scene, preserving the exact `wl_buffer.release`
+  lifetime while recycling the retired scanout allocation. A non-empty scene
+  previously required at least one vector allocation and free per output per
+  frame (60 pairs/second on one 60 Hz display, 120 on two); after capacities
+  settle, unchanged scene cardinality requires zero. Unit coverage proves the
+  direct-scanout rotation recovers the retired buffer's capacity rather than
+  discarding it.
+- **Parked applications receive no invisible animation budget.** Frame
+  callbacks and presentation feedback now follow the same stacking visibility
+  predicate as rendering: windows on another workspace, miniaturized windows,
+  and mapped-but-policy-hidden Omarchy layers sleep until a transition exposes
+  them. A live callback-driven client was parked while a self-timed neighbour
+  kept the active workspace rendering; the preserved before binary delivered
+  51 callbacks across 50 neighbour presentations, while the new path delivered
+  zero (100% of invisible callbacks removed) and resumed the target for another
+  30 frames immediately after its workspace was exposed. The saving scales
+  with every parked animation and avoids both client-side rendering and
+  compositor-side protocol-tree walks.
+- **Surface commits carry one resolved identity through their whole
+  lifecycle.** A commit now performs one read-only owner-index probe and
+  reuses the result for snapshot invalidation, scale selection, xdg lifecycle,
+  and damage admission; only the first late XWayland association scans and
+  extends the index. Ordinary non-window surfaces now receive a constant-time
+  miss instead of a client-table fallback scan. Popup ancestry is likewise
+  resolved once and inherited by scale and visibility, which also fixes popups
+  on a secondary output being told the primary output's scale. In the
+  1,800-commit/201-window release
+  workload this removes roughly 361,800 xdg-role comparisons, 5,400 redundant
+  owner hash probes, 1,800 unchanged hash-map writes, and 1,800 duplicate popup
+  lookups. Three alternating samples were scheduler-noise neutral (median 100
+  CPU ticks both before and after), so the deterministic operation reduction,
+  not a timing percentage, is the performance claim.
+- **Omarchy taskbar protocol publication is demand-driven.** The wlr
+  foreign-toplevel snapshot/diff now runs only after a real window-manager
+  invalidation or a new manager bind, while output management returns before
+  allocating when no manager is bound. Idle inhibition likewise checks a
+  sparse rule index and resolves explicit inhibitor ownership through the
+  surface index. With a real foreign-toplevel subscriber, 201 windows, and
+  1,800 unchanged hidden-surface commits, deterministic toplevel snapshots
+  fell from 1,800 to zero, eliminating roughly 361,800 window-record
+  clone/diff operations; three alternating release samples reduced median
+  compositor CPU from 130 to 100 Linux process ticks (23.1%). In the matching
+  no-subscriber scene, 361,800 idle-policy checks and 1,800 output snapshot
+  allocations also fall to zero; timing was neutral at scheduler-tick
+  precision, so only the operation reduction is claimed there. Live coverage
+  proves a post-bind fullscreen transition still emits a completed protocol
+  batch and agrees with Hyprland IPC.
+- **Layer layout follows protocol changes instead of unrelated client
+  traffic.** Layer commits/destruction, output geometry/scale, and Omarchy's
+  namespace visibility policy explicitly invalidate placement; a monotonic
+  core workarea revision makes Dock, reload, and screen-layout baselines
+  recompose exactly once. Ordinary app commits no longer lock every layer's
+  cached state, allocate three layout vectors, rebuild workareas, or revisit
+  EWMH publication. A real exclusive-zone layer bar plus 1,800 hidden app
+  commits retained zero hidden renders and reduced median compositor CPU from
+  22 to 20 Linux process ticks across three alternating release pairs (9.1%).
+  Without a layer, timing was neutral at one-tick precision while the same
+  sample deterministically eliminated 5,400 transient allocations.
+- **Surface ownership lookup is constant-time.** Native Wayland toplevels are
+  indexed when their role is created; XWayland surfaces add the same edge on
+  their first associated commit, and both destruction paths remove it at the
+  exact lifetime boundary. A normal toplevel commit asks for its owner up to
+  four times, so the 1,800-commit/201-window profiling scene drops from roughly
+  1.45 million record comparisons to 7,200 hash probes. Five alternating
+  release-build samples reduced median compositor CPU from 103 to 99 Linux
+  process ticks (3.9%) while retaining the hidden-scene assertion; one low
+  scheduler outlier was excluded by reporting the median rather than the mean.
+- **Output membership follows surface lifetime instead of commit rate.**
+  Each Wayland surface now enters the session's outputs once when it is
+  created, and dead weak handles are pruned from Smithay's output sets at the
+  matching destruction callback. The steady commit path no longer locks and
+  probes one output hash set per output, and the end of every dispatch no
+  longer locks each output and sweeps every known surface. At 60 Hz that turns
+  60 membership probes and 60 full-set sweeps per output per second into zero;
+  late `wl_output` bindings remain correct because Smithay replays entry for
+  known live surfaces. Reversed release-build A/B runs over 1,800 hidden
+  commits averaged 64.5 to 62.0 compositor CPU ticks with 101 surfaces (3.9%)
+  and 107 to 103 ticks with 201 surfaces (3.7%). The dedicated workload reads
+  Linux process accounting, uses the client commit counter as its duration,
+  and verifies the parked client still causes no render stream.
+- **Invisible Wayland commits no longer schedule compositor frames.**
+  Surface commits now enter the damage pipeline only when their toplevel,
+  popup, layer, lock, cursor, or input-method surface is present in the scene
+  being displayed. Self-timed clients remain mapped and responsive on parked
+  workspaces, but can no longer spend scene-build, damage-pass, or page-flip
+  work on pixels nobody can see; ordinary applications are likewise suppressed
+  behind the lock screen, and disabled Omarchy layers stay out of the render
+  loop. A real 60 Hz Wayland probe supplies its own clock and reports progress
+  independently of compositor callbacks: one 60-commit visible interval
+  produced 62 render submissions (the commits plus two test barriers), while
+  the equivalent interval after Omarchy's silent workspace send produced zero.
+  Before this change the commit handler set global damage unconditionally, so
+  all 60 hidden commits scheduled frames. Unit tests pin framed, client-drawn,
+  unmanaged, and parked stacking policy; the live test crosses the real
+  protocol, Omarchy binding, workspace manager, renderer, and telemetry path.
+- **Eligible fullscreen clients can bypass composition on real hardware.**
+  The DRM session now offers Smithay's conservative primary-plane direct
+  scanout path: same GPU, exact swapchain format/modifier, fullscreen opaque
+  topmost element, and a successful atomic KMS test, with automatic GLES
+  fallback for everything else. linux-dmabuf feedback advertises only the
+  scanout pairs common to every attached output, and client buffers stay held
+  until a later page flip has actually replaced them. At 2560x1600x60, a
+  continuously changing fullscreen client otherwise produces 245.8 million
+  composited output pixels and 937.5 MiB of swapchain writes per second; this
+  path can eliminate that pass. The exact hardware saving is workload- and
+  driver-dependent and cannot be measured under the nested backend, so state
+  transitions are logged and `CHONKSTEP_NO_DIRECT_SCANOUT=1` is an immediate
+  A/B/escape switch. Unit tests cover buffer lifetime, independent plane
+  gates, and honest multi-output format intersection; the full nested suite
+  covers the unchanged composition fallback.
+- **Held compositor bindings no longer allocate on every repeat tick.**
+  The Wayland repeat scheduler batches its bounded catch-up count in scalar
+  state instead of constructing a temporary vector. At Omarchy's default
+  25 Hz repeat rate this removes roughly 25 heap allocations per second while
+  a repeatable volume or brightness binding is held, without changing delay,
+  cadence, or the four-event post-stall burst limit.
+- **Screenshot requests are deadline-driven and work on an idle desktop.**
+  The Wayland compositor resolves the marker path once, probes it at the same
+  bounded 100 ms cadence as restart/reload requests, and services it before
+  deciding whether scene damage warrants a frame. An animated client therefore
+  no longer turns an absent screenshot marker into one failed `openat` per
+  frame, while a desk with no client damage can now take a screenshot at all.
+  A compositor-only ten-second syscall trace under continuous animation fell
+  from 876 to 368 file operations (58.0%) and from 692 to 184 failed `openat`
+  calls (73.4%). Two reversed 30-second release pairs moved whole-process CPU
+  from 11.316% to 11.249% of one core (0.6%, effectively neutral); the syscall
+  count and new idle-session behavior are the claimed improvements.
+- **Window previews follow actual surface damage instead of a wall clock.**
+  Every toplevel and subsurface commit marks only its owning preview stale;
+  static windows are captured once and then stay out of the synchronous GLES
+  readback path while another client animates. Failed imports remain throttled,
+  Overview's immediate card-resolution upgrade is unchanged, and boosted
+  buffers are still reduced to the normal 256px cap after Overview closes.
+  Capture timing now lives with each window record, removing the per-frame
+  thread-local hash-map borrow and dead-window pruning pass. Across three
+  alternating release-build trials with eight static clients and one animated
+  client, preview readbacks fell from 9.00/s to 1.00/s (88.9%), compositor CPU
+  from 47.915% to 26.462% of one core (44.8%), and context switches from
+  220.1/s to 180.7/s (17.9%). Real nested sessions cover miniaturize/restore
+  and Overview navigation in addition to the scheduling unit tests.
+- **Hyprland event snapshots are demand-driven; client aggregation is
+  linear-time.** A connected
+  Omarchy/Quickshell event socket no longer makes every buffer commit or
+  housekeeping wake rebuild and clone the complete monitor, workspace,
+  window, binding, and device state. Socket readiness, compositor-state
+  invalidation, and output backpressure are tracked separately; query replies
+  remain fresh, successful mutations publish after they apply, and a new
+  subscriber is baselined before a simultaneous request so its first event
+  cannot be lost. Workspace aggregation and focus-history construction now
+  take one client pass instead of repeated and quadratic scans. With a
+  persistent subscriber and a continuously animating real Wayland client,
+  trace instrumentation measured 300 full snapshots in five seconds before
+  selective invalidation and zero after the initial state settled (100% of
+  steady-state snapshot construction removed). Whole-process CPU in that
+  render-dominated microbenchmark remained within run-to-run scheduler noise;
+  the allocation/work counter, not a noisy CPU percentage, is the claimed
+  result. Live tests cover Quickshell's queries, request/event ordering, real
+  windows, reload and exec effects, and mutations crossing from ChonkStep's
+  native control socket into the Hyprland event stream.
+- **Dynamic event-source reconciliation is allocation-stable.** Both backends
+  append shell/IPC descriptors into caller-owned scratch storage, and Wayland
+  prunes calloop registrations in place. A normal IPC-enabled Wayland pass no
+  longer constructs at least three transient `Vec`s; capacity grows only when
+  the largest observed connection set grows. Across three alternating 12-second
+  release trials with a continuously animating Wayland client, compositor CPU
+  moved from 12.056% to 11.861% of one core (1.6% relative); wake counts stayed
+  level, as expected for an allocation-only change.
+- **Client traffic no longer amplifies filesystem marker polling.** Restart,
+  reload, and appearance requests now own cached paths and a shared 100 ms
+  deadline; display/input/IPC events remain immediate but cannot turn absent
+  marker files into one failed syscall per frame. Under identical release
+  builds with ten seconds of continuous `weston-simple-shm` commits, `unlink`
+  attempts fell from 1,325 to 313 (76.4%), failed file syscalls from 3,752 to
+  2,245 (40.2%), and all file-related syscalls from 11,141 to 9,637 (13.5%).
+- **Housekeeping sleeps until real deadlines instead of polling at 60 Hz.**
+  Display/input/IPC/dockapp descriptors still wake both backends immediately;
+  submenu dwell, metered dockapp frames and panels, supervision, and Wayland
+  `binde` repeat contribute their exact next deadline. Only worker results and
+  marker files use the conservative 100 ms idle ceiling. Alternating release
+  builds under an isolated 2560x1600 Weston host reduced zero-client CPU from
+  1.175% to 0.850% of one core (27.7%) and voluntary context switches from
+  1,462 to 457 per 20 seconds (68.7%). With 12 real Wayland terminals mapped,
+  CPU fell from 6.499% to 5.875% (9.6%) and wakeups fell 53.4%. Real nested
+  tests cover reload markers, menu cascades, built-in and streamed panels, and
+  a held 25 Hz binding sourced from an Omarchy/Hyprland config.
+- **Idle housekeeping reuses live client snapshots.** The launcher lamps and
+  session-layout debounce now compare borrowed client state before allocating,
+  cloning class names, or rescanning the desktop-application index. Real
+  client and pin changes still rebuild the owned snapshots immediately, and
+  the unchanged path still advances restore/debounce deadlines. In alternating
+  release-build trials under one isolated 2560x1600 Weston host with 12 real
+  Wayland terminals mapped, compositor CPU fell from 6.582% to 6.305% of one
+  core on average (4.2% relative); the 16 ms event cadence and UI behavior were
+  unchanged.
+
+### Release hardening
+
+- **Cold software-renderer startup no longer flakes the Wayland CI.**
+  GitHub's llvmpipe runner was observed spending 16 seconds inside EGL
+  initialization before its fallback, exhausting nearly all of the old
+  20-second socket deadline. The boot poll now allows 45 seconds while
+  still returning immediately on success and failing immediately if the
+  compositor exits, so it is more tolerant without weakening assertions.
+- **Connection-close teardown cannot leave ghost Wayland windows.** Some
+  clients destroy their `wl_surface` explicitly; others exit and let the
+  server tear their object graph down. Smithay may report the generic surface
+  destruction before the xdg-toplevel destruction in the latter path. The
+  reverse ownership index now preserves native xdg edges until the role
+  callback retires the complete window record, while XWayland's detachable
+  associations still disappear at the surface boundary. A controlled live
+  regression first confirmed that the client received `xdg_toplevel.close`
+  but its mapped ledger record survived indefinitely; all three Omarchy
+  close/focus scenarios now observe both process closure and record removal.
+- **Nested restore and key-repeat coverage is deterministic across distros.**
+  Session restore now relaunches an in-tree xdg client under the saved terminal
+  identity, so the assertion measures Chonkstep's geometry pipeline rather than
+  a particular Foot release's cell negotiation. The repeat regression observes
+  the compositor's live emission count and 40 ms interval directly instead of
+  timing a burst of shell processes on a loaded runner. The restore path passed
+  ten consecutive real nested sessions locally before the replacement landed.
+- **Workspace examples have collision-free artifact names.** The Bluetooth
+  pairing and Wi-Fi join design sheets no longer both compile to
+  `target/.../examples/preview`; their explicit `preview-btpair` and
+  `preview-netjoin` targets remove Cargo's overwrite warning and the future
+  hard-error it warned about.
+- **A slow nested boot now explains itself.** If the compositor exits, fails
+  to publish its Wayland socket, or never answers the test door, the harness
+  includes the final 80 compositor log lines in the failure instead of a bare
+  timeout while preserving the existing performance deadline.
+- **Public Rust documentation is a CI gate.** Broken API links and rustdoc
+  warnings now fail the build; the existing stale/private links have been
+  corrected, while all executable examples continue to pass as doctests.
+- **Clippy is strict across the entire workspace.** The last theme and Wayland
+  warning backlog is resolved, including a 6.4 KiB graphics enum imbalance and
+  avoidable per-pixel slice chunking; every warning now fails CI for every crate.
+- **Headless browser tests get a real private D-Bus session.** Chromium no
+  longer burns its startup deadline retrying the hosted runner's invalid bus
+  address. Hardwareless runners select Chromium's documented SwANGLE software
+  GLES backend instead of intermittently spending the entire deadline on DRM
+  and Vulkan probes; the real viewport-backed scale-and-resize path remains
+  exercised. A live browser gets a load-tolerant bounded startup poll, while an
+  exited process now fails immediately with its status and captured log.
+- **Release automation now trusts immutable action revisions.** CI, native
+  package attestation, artifact assembly, and the future AUR publisher pin
+  every third-party GitHub Action to a full commit instead of a mutable tag.
+  CI also runs RustSec's dependency audit so a newly disclosed vulnerability
+  cannot pass silently, and every unsafe block must state the invariant that
+  makes its libc, EGL, or raw-descriptor operation sound.
+- **The text stack no longer depends on unmaintained `rustybuzz`.** All
+  consumers now use `cosmic-text` 0.19 and its `harfrust` shaper. This also
+  replaces two obsolete `ttf-parser` releases with one current dependency;
+  workspace tests and the full nested-desktop suite cover the resulting font
+  measurement and rendering changes.
+- **Disconnected Hyprland IPC clients no longer pin a CPU core.** Empty
+  request probes and quiet event subscribers are removed as soon as their
+  peer closes. Previously their permanently readable hangup fds survived
+  forever; a live desktop with 23 accumulated probes was measured at 1,560
+  event-loop passes per second and 99% of one core. Unit tests cover both
+  sockets, and a nested-compositor regression verifies that repeated probes
+  leave neither descriptors nor an unhealthy server behind.
+- **Full desktop behavior now runs in CI.** The Wayland job boots an isolated
+  Weston headless host and runs ChonkStep's complete real-client integration
+  suite: Chromium and native terminals, window input/geometry, Omarchy's
+  themes/menu/bar, lock, gamma and `hyprsunset`, Hyprland IPC, protocols,
+  workspaces, session restore, and crash supervision. Python and Go SDK tests
+  are now first-class CI jobs as well.
+- **Test controls cannot poison a later login.** Application launches now
+  remove compositor-private backend, debug, restart, and test variables while
+  preserving the documented child API. The Wayland session also scrubs stale
+  selectors from both its process and systemd's user activation environment
+  before startup, including a compositor-owned cursor size as one atomic pair.
+  Its supervisor test begins with a deliberately poisoned environment and
+  proves none of it reaches the compositor. The old cleanup attempt using the
+  nonexistent `dbus-update-activation-environment --unset` option is gone;
+  Omarchy's systemd user manager now performs the deletion through its real
+  API.
+- **The browser scale regression has a faithful test.** The Chromium scale-2
+  scenario no longer clicks through the always-on-top dock while intending to
+  grab Chromium's client-side resize edge. It runs dockless, exercises the
+  actual browser surface, and passes against current Chromium under the same
+  headless compositor path CI uses. On hosted runners that prohibit Chromium's
+  user-namespace sandbox, only this isolated `about:blank` test process opts
+  out; local browser tests retain normal sandboxing.
+
+### Omarchy-compatible session and install path
+
+- **A real managed login.** ChonkStep now ships a dedicated UWSM session,
+  publishes only the desktop environment variables a session owns, reaches
+  `graphical-session.target` and `xdg-desktop-autostart.target`, and treats a
+  session-manager stop as logout rather than a compositor crash. Omarchy's
+  suspend lock, input method, portals, shell, and application scopes therefore
+  follow the same lifecycle they do under Hyprland.
+- **Explicit, reversible installation.** The release package provides
+  `omarchy install desktop-chonkstep` and its matching remove command. The
+  installer preserves Omarchy's autologin user, selects the managed ChonkStep
+  session, enables an Omarchy-native SDDM theme with a session picker, and
+  selects the `desktop = "omarchy"` posture in a new config or one without an
+  explicit desktop choice while preserving an explicit user choice; it never patches
+  Omarchy-owned files. A tag-driven workflow publishes the
+  release PKGBUILD and `.SRCINFO` to the AUR, making the intended entry path
+  `omarchy pkg aur add chonkstep` followed by the install command.
+- **Native GitHub packages while AUR registration is unavailable.** A preview
+  tag builds, tests, and publishes pacman-installable `x86_64` and `aarch64`
+  packages on matching GitHub runners, with checksums and GitHub provenance
+  attestations. The ARM package links against Arch Linux ARM rather than an
+  Ubuntu cross-toolchain.
+- **Omarchy's configuration has real effects.** Monitor position and scale,
+  input repeat settings, bind flags, layer-scoped bindings, window rules, Lua
+  long strings, and window move/resize/centre/fullscreen dispatchers are
+  applied or refused with a named reason. `movefocus l/r/u/d` and Omarchy's
+  `SUPER + Arrow` chords now perform native geometry-ranked spatial focus over
+  floating frames, while hidden, miniaturized, and no-focus clients are
+  excluded. `movetoworkspacesilent` and Omarchy's ten
+  `SUPER + SHIFT + ALT + digit` chords now send a window without following it;
+  the exposed window receives focus instead of leaving the keyboard stranded.
+  Bindings inside unsupported submaps can no longer leak into the global keymap.
+- **Hyprland-compatible IPC reports live state.** Window, monitor, workspace,
+  keyboard, binding, reload, and refusal data now come from the running desk;
+  `exec --` preserves argv; mapping events and addresses agree with the
+  foreign-toplevel protocol; `hyprctl dispatch movefocus l/r/u/d` reaches the
+  same native spatial focus as Omarchy's bindings, and
+  `hyprctl dispatch movetoworkspacesilent` reaches the native send path;
+  unsupported tiling commands no longer claim success. This is enough for Omarchy's current shell,
+  menus, scripts, and bar to operate without a ChonkStep-specific fork.
+- **The protocols ordinary clients expect.** The Wayland compositor now serves
+  activation, cursor-shape, primary-selection, text-input/input-method,
+  relative-pointer and pointer-constraints, presentation-time,
+  `hyprland-ctm-control-v1`, and `hyprland-toplevel-mapping-v1`. Night light
+  works through the stock `hyprsunset`; linux-dmabuf publishes default
+  feedback from the session's authoritative DRM node even when EGL device
+  discovery is unavailable. The public ScreenCast portal path was exercised
+  through PipeWire on a clean Omarchy VM and returned real desktop frames.
+- **Small interaction parity.** Escape closes the root menu and all of its
+  cascades, while preserving the existing Escape behavior for instrument
+  panels and modal overlays.
+
+### A desktop that hosts Omarchy
+
+chonkstep now stands where Hyprland stands on an Omarchy 4 machine:
+it runs Omarchy's own shell, mirrors Omarchy's own menu, wears
+Omarchy's own theme and background, and feeds Omarchy's bar - all
+through Omarchy's public extension points (its JSONC menu, its
+`current/theme` state, its Quickshell plugin system), never by
+emulating Hyprland.
+
+- **Omarchy's shell, hosted.** A Wayland session starts `omarchy-shell`
+  (the Quickshell process behind Omarchy's bar, panels, pickers,
+  notifications, OSD and lock screen) through Omarchy's own
+  `omarchy-launch-shell`, exactly as Omarchy's Hyprland autostart does.
+  Every Omarchy menu row that ends in a panel - the speed tests, Style
+  > Theme, the volume keys - now works here. `omarchy_shell = false`
+  opts out; the key is inert without Omarchy or on X11. The shell's
+  Background plugin is the one surface the compositor declines (it
+  would paint over the desk and take the root menu's right-click); the
+  surface stays a healthy client and is simply never shown.
+- **Omarchy Bar, on request.** The shell's bar starts hidden - the Dock
+  and the Clip already hold the corners - and the root menu's new
+  `Omarchy Bar` row switches it on and off, remembering the choice in
+  chonkstep's own state (never Omarchy's, so it does not follow you
+  into a Hyprland session). Hidden means not drawn, not clickable, no
+  reserved edge; the bar keeps running and is whole the instant it is
+  shown. Underneath: a `Backend::set_layer_surface_hidden` verb and
+  one `layer_presented` predicate every layer-shell consumer asks.
+- **Omarchy's menu, in the root menu.** Right-click the desk and the
+  `Omarchy` submenu *is* Omarchy's menu: read from
+  `omarchy-menu.jsonc` (and your extension file) on every reload, kind
+  inferred as Omarchy's `MenuModel.js` infers it, every `when` /
+  `checked` / `disabled` condition evaluated the way Omarchy evaluates
+  it (batched, in the background, never on the desktop's thread), and
+  every action run exactly as Omarchy runs it (`bash -lc <action>`,
+  detached). Only the rows that would command Hyprland are left out.
+  `omarchy_menu = false` turns the submenu off.
+- **Omarchy's theme, followed.** `theme = "omarchy"` (or the `Omarchy
+  (...)` row in the Theme submenu) reads the palette
+  `omarchy-theme-set` leaves under `~/.local/state/omarchy/current/
+  theme/` and dresses chrome, dock, menus and terminals in it - light
+  or dark as the palette says - on chonkstep's own geometry, and keeps
+  watching, so an Omarchy theme switch restyles this desk within a
+  second. The desk wears Omarchy's *current background* as its
+  wallpaper too (whatever format Omarchy ships it in), repainting when
+  `omarchy-theme-bg-next` cycles it, and the Wallpaper submenu offers
+  `Omarchy's Background` so any built-in theme can wear it. The other
+  direction: `omarchy-export-themes` writes the eight built-in themes
+  as Omarchy themes into `~/.config/omarchy/themes/`, so
+  `omarchy-theme-set amber-phosphor` dresses the rest of the machine
+  to match.
+- **A socket for the bar.** Always-on, newline-framed JSON at
+  `$XDG_RUNTIME_DIR/chonkstep/control-<display>.sock` (also in
+  `CHONKSTEP_CONTROL_SOCKET`): workspaces, outputs, the focused window,
+  the theme, each re-sent when it changes, and two verbs (`snapshot`,
+  `focus-workspace`). `docs/control-socket.md` is the contract;
+  its first clients are two Omarchy bar widgets under `omarchy/plugins/`
+  - `chonkstep.workspaces` (the strip Omarchy's own widget cannot draw
+  here, because it asks Hyprland) and `chonkstep.theme`.
+- **Making room.** The Dock steps out from under a layer-shell bar's
+  exclusive zone (top and right edges) and back the moment the bar
+  goes; maximized windows refit to the workarea live. Those are the
+  only two edges the Dock yields to: a left or bottom bar still pushes
+  the workarea but overlaps the Clip and the icon row today. Omarchy's
+  terminals (`org.omarchy.terminal`, alacritty, kitty), which Omarchy
+  configures to draw no chrome of their own, get this desktop's frame:
+  the compositor now answers every xdg-decoration negotiation
+  server-side, as Hyprland does, and `[decorations] client_side` is
+  the opt-out for a client that really should stay bare.
+- **Plumbing the integration needed.** `[commands]` (named shell
+  commands a `run <name>` keybinding refers to - the action vocabulary
+  stays closed, the names may now stand for `omarchy-menu`), `terminal`
+  and `autostart` in the config, and the XF86 media keysyms. Three
+  protocols Omarchy's shell and tools speak: `ext-data-control-v1` and
+  `wlr-data-control` (clipboard managers), `virtual-keyboard-v1`
+  (`wtype`), and `hyprland-focus-grab-v1` (the shell's popups dismiss
+  on a click elsewhere). And three bugs living under the shell exposed:
+  a hot-restart marker every child process inherited, a
+  `_NET_WORKAREA` PropertyNotify storm (14,000 events a second with a
+  bar reserving an edge), and a Smithay layer-shell pre-commit hook
+  that disconnected any client destroying a layer surface the way Qt
+  and GTK do (Smithay #1979, guarded in-tree).
+
+### Chrome, decided by what the client says
+
+- The per-name allowlist (`self_decorating_apps`) is gone, replaced by
+  reading what each client actually says on the two decoration
+  protocols: xdg-decoration negotiations are concluded server-side,
+  KDE's `org_kde_kwin_server_decoration` - the only one GTK speaks - is
+  now advertised and its client-side declarations believed, and
+  `_MOTIF_WM_HINTS` is read by one parser on every leg. `[decorations]`
+  in the config corrects both directions (`client_side` to keep an xdg
+  client bare, `server_side` to frame a KDE or X11 client that declares
+  chrome and draws none), reaches XWayland windows too, and a reload
+  re-decides the chrome of every window already open. The old key
+  still parses, as `decorations.client_side`. And the floor under it:
+  `drag_modifier` (Alt by default) moves a window with a left drag and
+  resizes it with a right drag from anywhere on its content, and the
+  new `window-menu` action (`control+escape`) opens the window commands
+  menu, so a window with no titlebar from either side is still yours to
+  move, resize and close.
+
+### Light and dark, everywhere
+
+- Every theme now has two deliberate renditions of itself - a light
+  one and a dark one - along a new session-wide `appearance` axis.
+  Same identity, same chrome geometry, two designed dresses: fills,
+  chisel ramps, menu palettes, the full 16-color terminal scheme and
+  the wallpaper artwork's own mood each exist per side. The focused
+  titlebar stays ink on both sides (focus must stay legible on a pale
+  desk), light-mode selection highlights use each theme's accent
+  rather than inverting to white, and every wallpaper artwork gained a
+  counterpart rendition so the composition survives the mood change.
+  With nothing configured, each theme wears its native mood - dark for
+  seven of the eight, light for Ivory Halftone - so nothing changes
+  until you ask.
+- Switching is live and scriptable: write `light`, `dark` or `toggle`
+  to `$XDG_STATE_HOME/chonkstep/appearance-request` and the session
+  applies it within a tick through the same in-place path a theme pick
+  takes; the current mode is published (atomically) at
+  `$XDG_STATE_HOME/chonkstep/appearance` for anything - a dockapp, a
+  script - to read. `appearance = "light"|"dark"` in the config seeds
+  a first session. See the new `docs/appearance.md` for the whole
+  contract.
+- Applications follow. Terminals the desktop spawns get both foot
+  color sections plus the current `initial-color-theme`, and running
+  ones are retinted on the spot via foot's SIGUSR1/SIGUSR2 color-theme
+  switch. GTK4/libadwaita/Electron apps follow live through GSettings
+  `color-scheme` and the desktop portal; GTK3 follows when the
+  `gtk-theme` in play is a member of an installed light/dark pair
+  (Adwaita/Adwaita-dark and friends - a hand-picked theme is never
+  overwritten); the X11 session republishes the pair member over
+  XSETTINGS. Dockapps follow through the existing `ThemeChanged`
+  broadcast, whose `theme_toml` now carries an `appearance` tag, and
+  SDK apps get `CHONKSTEP_APPEARANCE` beside `CHONKSTEP_THEME`.
+  `docs/appearance.md` has the honest table of what follows live and
+  what waits for its next launch (Qt, notably, is documented rather
+  than forced).
+- `chonk-switch` (`examples/chonk-switch`): the appearance switch as a
+  dock tile - a machined slide toggle in the desktop's chiseled idiom,
+  sun and moon trading places at the midpoint of a quarter-second
+  throw. Built purely on the platform's public surfaces (the Python
+  SDK for the tile, the appearance files for the mode), which makes it
+  the citizenship test a third-party instrument would take: it knows
+  nothing the docs don't say. It follows the mode file rather than its
+  own optimism - a click throws immediately but settles back if the
+  desktop refuses - and a hidden tile samples nothing.
+
+### Instrument panels
+
+- The Instrument Platform grows its second surface: click an
+  instrument's tile and a framed detail panel unfolds beside the dock,
+  streamed by the same process over the same socket, with the shell
+  drawing the chiseled chrome and owning placement and every dismissal
+  gesture (click-away, Escape, a tile re-click). One panel on screen
+  at a time; a panel is a popover, not a window, and never takes
+  keyboard focus. Every platform guarantee extends to it unchanged: the
+  desktop never blocks on a panel, and a hung instrument's panel is
+  torn down by the same ping machinery as its tile.
+- The wire grew honestly: panel frames cross the transport as bounded
+  top-to-bottom bands under one generation (a full-size panel cannot
+  fit one datagram), flow control drops only whole generations so a
+  repaint can never tear mid-stripe, panels get the one input kind
+  tiles never needed (Motion, for hover), and the shell now says its
+  protocol version in Welcome so a client can ask before speaking
+  panel messages. Protocol 2, specified byte-for-byte in
+  `docs/dockapp-protocol.md` section 11.
+- Both SDKs speak it: `open_panel` in Python and Go, with banding kept
+  out of authors' hands - draw whole panels and the SDK slices them
+  into maximal legal bands; `draw_rows` exists for the economical case
+  (a hover highlight is one narrow band, not a repaint). Illegal states
+  are unrepresentable: no frame before the grant, and a panel request
+  on a version-1 shell fails with a clean local error instead of
+  letting the shell disconnect the dockapp. The spec was negotiated
+  adversarially - two consumers built from the written contract alone,
+  every discrepancy ruled on and folded back until all three
+  implementations agreed byte for byte - and the conformance probe
+  (`chonk-panel-probe` in `chonk-testkit`) plays the whole conversation
+  over a real socket.
+- One limitation documented rather than fudged: a click inside an
+  application window does not reach the shell on either backend, so it
+  does not dismiss the panel. Escape, the tile re-click, and
+  panel-replacement cover the gap.
+
+### Real hardware
+
+- wlr-output-management: `wlr-randr` and `kanshi` can list and
+  configure outputs. Scale applies live - fractionally - and a
+  primary-scale change restyles the whole chrome through the same path
+  a config reload takes. What the backend cannot honor (disabling an
+  output, transforms) is refused with `failed()` and a named log line
+  rather than accepted and botched.
+- Fractional scale, end to end: fractional-scale-v1 and viewporter are
+  in, each output carries its own scale, and the integral `wl_output`
+  fallback advertises the ceiling - a client without the protocol
+  renders sharp and is downscaled, never blurred up. Watched on the
+  wire: foot at preferred scale 1.5 committing pixel-crisp into its
+  viewport, and a live `wlr-randr --scale 1.25` mid-session with the
+  client re-committing to match.
+- Real damage tracking with EGL buffer age: the nested renderer used to
+  admit full-frame damage every frame. Now the idle desktop repaints
+  about 1% of what it did, truly idle periods render nothing, and
+  `CHONKSTEP_FULL_DAMAGE=1` remains the escape hatch.
+
+### XWayland and application fixes
+
+- The last EWMH gap: the XWayland root now listens as well as speaks.
+  A pager's `_NET_ACTIVE_WINDOW` and `_NET_CURRENT_DESKTOP` client
+  messages translate into the same activation and desktop-switch
+  events every other path queues - proven by a pager round-tripping a
+  workspace switch in the end-to-end suite. `wmctrl -a` commands the
+  Wayland session now, not just reads it.
+- Input no longer dies after a window minimizes itself (Edge's own
+  menu does this): "no window focused" now clears seat focus and the
+  Activated state for real, so hiding and restoring the same window is
+  a real leave, enter, and configure. Miniaturized windows are told
+  Suspended - the protocol's word for them.
+- Explicit GPU sync on DRM sessions that support syncobj
+  (`wp_linux_drm_syncobj_v1`), with a readiness blocker on every
+  dmabuf commit - the canonical Chromium-on-NVIDIA flicker (sampling a
+  buffer the client's GPU was still writing) fixed at the compositor.
+- An XWayland client asking to be decorated is decorated: smithay's
+  `is_decorated` answers "is client-side decorated", not "wants
+  decorations", and the X11 arm of the chrome policy read it with the
+  sign flipped - every XWayland client's decoration decision was
+  inverted. Found by Spotify arriving frameless with `MWM_DECOR_ALL`
+  set; one sign flip, verified live.
+- GTK3 X11 apps are no longer double-scaled: the desktop's XSETTINGS
+  manager already publishes the scaling story
+  (`Gdk/WindowScalingFactor`, `Xft/DPI`, `Gdk/UnscaledDPI`), so the
+  launcher stopped forcing `GDK_SCALE` on top of it - LibreOffice
+  rendered at 4x on a scale-2 session while both were in play. Qt has
+  no XSETTINGS client, so `QT_SCALE_FACTOR` stays.
+
+### Showing up at the login screen
+
+An audit of "chonkstep is not showing up in SDDM" from both install
+routes, against what SDDM 0.21 actually does (its greeter lists a
+session only after opening the entry as the `sddm` user, stats an
+absolute `TryExec` when one is present, and hides the whole Wayland
+list without `/dev/dri`; its stock session wrappers launch `Exec`
+through an unquoted `exec $@`).
+
+- `scripts/verify-install.sh` (also installed to
+  `/usr/lib/chonkstep/`): proves an install is one a login manager
+  will offer - entries present, world-readable, parseable, `Exec` /
+  `TryExec` targets executable, `desktop-file-validate` clean - and
+  diagnoses the machine: pickerless greeter themes, missing
+  `/dev/dri`, `SessionDir=` overrides, which route owns the entries.
+  `--root` points it at a staged tree, e.g. a makepkg `$pkgdir`.
+- The Arch packaging's default recipe now builds: plain `makepkg -si`
+  in `packaging/arch/` used to pick the release PKGBUILD, whose
+  source was the nonexistent stable `v0.2.0` tag archive, so the
+  download 404ed before anything was built. The branch-head
+  recipe is now the default `PKGBUILD`; the pinned-tag twin waits as
+  `PKGBUILD-release`.
+- The `-git` package ships the portal backend map: `package()` had
+  dropped `chonkstep-portals.conf`, so a `-git` install exported
+  `XDG_CURRENT_DESKTOP=chonkstep` with no portal config behind it and
+  screen sharing silently failed. Both recipes also gained `bash` in
+  `depends` and `TryExec=` in their session entries - safe for a
+  package (pacman guarantees the target under `/usr`), and left out
+  of the checkout installer's entries on purpose: the greeter's
+  `TryExec` stat runs as the `sddm` user, and a default 0700 home
+  (login.defs `HOME_MODE`) would fail it and hide the session.
+- `scripts/install.sh` writes the session entries with an explicit
+  mode instead of piping through `sudo tee`: tee honors the caller's
+  umask, and a hardened umask (077) left entries 0600 - unreadable by
+  the greeter user, which renders as a blank row or no row at all.
+  It also refuses a checkout path containing whitespace, quotes or
+  backslashes, with the reason spelled out (no `.desktop` escaping
+  survives SDDM's `exec $@` wrapper), and its closing instructions
+  now tell the truth on Omarchy 4: SDDM is enabled there, but the
+  stock greeter theme draws no session picker and hardwires
+  interactive logins to Hyprland (uwsm), so the honest routes -
+  `[Autologin] Session=chonkstep.desktop`, or a theme with a session
+  menu - are printed instead of "pick chonkstep in the session list".
+- The marker scripts reach the session they signal:
+  `scripts/restart.sh` and `scripts/reload.sh` hardcoded
+  `~/.local/state`, while the binaries resolve `XDG_STATE_HOME`
+  first - with that variable set, a restart or reload request was
+  dropped in a directory the running session never polls. Both now
+  resolve the same way the binaries do, as do the log paths in
+  `scripts/xsession.sh` and `scripts/start-session.sh`.
+- `docs/quickstart.md`'s login section walks the three machines a
+  user actually has (a DM with a picker, Omarchy 4's pickerless SDDM,
+  no DM at all) and ends in a troubleshooting list ordered by how the
+  failures bite, with the verifier as its first line.
+
+## [0.2.0] - 2026-08-30
+
+The release where the desktop stopped asking you to restart it, and
+where "runs my applications" became a verified claim instead of a
+hope. Everything below is on both sessions unless it names one.
+
+### Live everything
+
+- A theme pick, a UI scale change, and any edit to
+  `~/.config/chonkstep/config.toml` now apply to the running session
+  in place - nothing closed, no window lost, every dockapp kept. One
+  path (`apply_session_state`) serves startup and reload alike, so a
+  setting cannot be reloadable but not startable or the reverse.
+  `scripts/reload.sh` triggers it, or bind the new `reload` action to
+  a key. This matters most on Wayland, where a restart costs every
+  client; the restart gesture (`scripts/restart.sh`, the `restart`
+  action) remains for the one thing a running process cannot apply to
+  itself: a new build.
+- New config settings: `terminal_font_px` (the terminal's type size at
+  1x scale, with the launch geometry derived from the monitor rather
+  than fixed), `restore_session`, and `lock_command` (both below).
+- Three new themes - Jade Lacquer, Ivory Halftone (the light one, which
+  keeps the dark focused titlebar so focus stays legible), and Indigo
+  Filament - for eight built-in themes total.
+- The shell's terminal is now foot (Wayland-native, server-side-
+  decoration aware) instead of urxvt.
+
+### The Living Desktop
+
+- Session restore (`restore_session = true`): the desktop records each
+  window's application, geometry, workspace and shape as you work -
+  debounced, atomically rewritten from the live client set, so a
+  window you closed is forgotten the moment you close it - and
+  relaunches that layout on the next login. Off by default; a session
+  that spawns applications you did not just ask for is opt-in.
+- A crash watchdog in `scripts/wayland-session.sh` supervises the
+  compositor: an abnormal exit is logged, marked, and restarted with
+  the recorded layout; a clean logout ends the session; more than
+  three crashes in a minute trips a brake instead of crash-looping.
+  With `lock_command` set (any ext-session-lock locker, e.g.
+  swaylock), a recovered session comes back locked, not exposed.
+- Dockapps already survived a compositor restart (they hold no display
+  connection - the shell re-adopts them into the same tile); the
+  session around them now survives too.
+
+### The Overview
+
+- A modal Exposé (`super+up` by default, the bindable `overview`
+  action): every window on the desk as a card in miniature real
+  chrome - the theme's titlebar, a sunken well holding a live
+  capture - over a strip of genuine Clip tiles for the workspaces.
+  Arrows move, Return or a click focuses, right-click opens the real
+  window-commands menu, clicking a workspace tile switches desks with
+  the panel open, Escape dismisses.
+- Sharp and fast from its first night on real hardware: captures are
+  served at card resolution while the panel is open (no more upscaled
+  smear), and the selection plate is its own small surface, so moving
+  it is a surface move rather than a full-panel repaint.
+
+### The Instrument Platform, opened
+
+- The dockapp system - out-of-process tiles that push finished pixels
+  over a private socket and get theme, scale, input and supervision in
+  return - is now a documented platform, not a Rust-only internal:
+  `docs/dockapp-protocol.md` specifies every byte of the wire format,
+  and `docs/instrument-platform.md` traces each guarantee (a tile
+  cannot freeze, crash, or wedge the desktop) to the mechanism that
+  enforces it.
+- Dependency-free Python and Go bindings (`bindings/`), each with a
+  working clock; the Python one is verified live in a nested session.
+- `chonk-get`: install a dockapp from a git URL or local path, build
+  it, and register it - plus `list` and `remove`.
+- The Shelf (`examples/chonk-shelf`): clipboard history as a
+  three-tile stack, built on the same platform.
+- The platform's discipline is enforced, not advised: "a dock widget
+  must not do I/O" is a build error (clippy `disallowed_methods` /
+  `disallowed_types`, denied in CI), widgets are handed their data
+  instead of the means to fetch it, a tile that cannot be drawn at the
+  requested scale is refused at the codec, and the protocol's failure
+  modes have tests rather than arguments.
+
+### Wayland: applications, honestly
+
+- Client-side decorations are honored end to end. A native client that
+  negotiated nothing self-decorates, as the protocol says; one that
+  requests client-side keeps its own chrome (Chromium, Edge); one that
+  requests server-side, or leaves the choice to the compositor, gets
+  the chiseled frame. X11 clients that set Motif hints are likewise
+  left unframed. One titlebar per window, whoever draws it.
+- Client-decorated windows are movable and resizable: the pointer
+  ledger answers where the pointer actually is, `resize_request`
+  reaches the core from a client's own grips, drags end when the
+  button comes up, and size arbitration no longer lets the compositor
+  and the client fight (the Edge resize flicker, the maximize that
+  didn't).
+- Outputs advertise the real scale, so native clients finally render
+  at the desktop's size - while the compositor's own composition stays
+  physical and byte-exact. Client minimize buttons work. The dock
+  column is reserved so maximize respects it.
+- Ecosystem protocols: wlr-layer-shell (launchers, bars, notification
+  daemons), ext-session-lock (with an absolute contract: while locked,
+  the scene is lock surfaces over black and nothing else, on screen
+  and in every capture path), and idle-notify. A desktop that cannot
+  lock is not usable professionally; this one locks.
+- XWayland parity: the compositor publishes EWMH to the XWayland root
+  (client list, active window, desktops, workarea with the dock
+  reservation, frame extents - read-only for now, and the docs say
+  so), forwards maximize/fullscreen state to clients, and holds focus
+  for a window whose surface has not arrived yet.
+  `docs/xwayland-compatibility.md` records exactly what works, what
+  doesn't, and how to verify both.
+
+### Verification
+
+- The compositor can be driven from the outside: a test-only control
+  socket (`CHONKSTEP_TEST_SOCKET`) injects synthetic pointer and
+  keyboard events through the production input path, with a barrier
+  that acks only after dispatch and a rendered frame. `chonk-testkit`
+  boots an isolated nested session, launches real clients, injects
+  input, and asserts on captured pixels - the recipe that found three
+  hand-found regressions is now infrastructure (`scripts/e2e.sh`).
+- CI gates: workspace tests, an X11 smoke test against a live Xvfb
+  display (EWMH handshake, client management, framing policy), a
+  Wayland build+test job against the real system libraries, and the
+  clippy bans above.
+
+## [0.1.0] - 2026-08-28
+
+The foundation: a NeXTSTEP-style desktop as an X11 window manager,
+then the same desktop as a Wayland compositor.
+
+- Chiseled decorations specified to the pixel: titlebar metrics, the
+  raised relief recipe, the button glyph bitmaps, the resizebar with
+  corner grips; focused black, unfocused gray.
+- Window management: all-edge resize with directional cursors, smart /
+  cascade / center placement, edge-resistance snapping, shade,
+  miniaturize to icon tiles, fullscreen, a modal Alt-Tab switcher with
+  live thumbnails, and real workspaces driven from the dock Clip.
+- The shell: right-click root menu with cascading submenus generated
+  from the system's `.desktop` entries, the launcher dock with
+  drag-to-pin, eight wallpaper artworks, five LED instruments (network,
+  CPU/memory, sound, link, power) plus the analog clock, and a theme
+  engine - five themes at this point - restyling chrome, menus,
+  wallpaper, dock and terminal palette at once.
+- EWMH compliance on X11: `_NET_SUPPORTED`, client list, active
+  window, workspaces, workarea; activation, close, fullscreen and
+  maximize requests honored; `scripts/verify-ewmh.sh` checks a live
+  session from the outside.
+- The dual architecture: one backend-generic shell (`chonk-shell` over
+  `wm-core` / `wm-theme`) behind two backends, `wm-x11` and
+  `wm-wayland` (Smithay). The compositor runs nested in a window or as
+  a real login session on DRM/KMS with libinput and libseat - VT
+  switching, multi-monitor on the primary GPU, the hardware cursor
+  where the driver provides a plane - with XWayland from boot.
+- Installer (`scripts/install.sh`) putting both sessions in a login
+  manager's picker, `scripts/update.sh` (pull, rebuild, hot-restart),
+  and in-place hot restart that keeps windows open on X11 via the
+  SaveSet.

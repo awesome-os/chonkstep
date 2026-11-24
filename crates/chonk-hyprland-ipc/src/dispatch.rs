@@ -1,0 +1,2051 @@
+//! Dispatch: turning Hyprland's verbs into chonkstep's, or refusing.
+//!
+//! Mosaic and Flow translate spatial actions directly; Freeform preserves
+//! traditional geometry. Inapplicable tree messages deliberately succeed
+//! quietly, so the same shortcut stays predictable in all three styles.
+//! Unavailable grouping and system actions remain explicit errors.
+//!
+//! Omarchy often appears to provide a fallback:
+//!
+//! ```sh
+//! hyprctl dispatch "hl.dsp.focus({ window = \"address:$ADDR\" })" \
+//!   || hyprctl dispatch focuswindow "address:$ADDR"
+//! ```
+//!
+//! But `hyprctl` 0.56.2 exits zero regardless of the response text, so
+//! that `||` branch is dead when the refusal is discarded. Refusal is
+//! therefore not treated as a compatibility mechanism: caller-visible
+//! paths are implemented, hidden from chonkstep-owned menus, or tracked
+//! as a bug. It remains the only truthful protocol answer for a request
+//! whose requested behavior is unavailable.
+//!
+//! So: [`Outcome::Unsupported`] is a first-class result here, not a
+//! shortfall, and it is reported to the caller as an error string
+//! beginning with `Invalid dispatcher`. The server logs and counts each
+//! one because most non-interactive callers will otherwise hide it.
+
+use crate::state::{
+    workspace_index_from_hypr_id, Snapshot, Window, MAX_SPECIAL_NAME, MAX_SPECIAL_WORKSPACES, NESTED_DEVICES,
+};
+use hypr_dispatch::{Flattened, LuaCall, Support, MAX_WORKSPACE};
+
+/// What a dispatch request asks chonkstep to do.
+///
+/// Deliberately chonkstep's vocabulary, not Hyprland's: this is the
+/// point where the translation is finished. The host maps these onto
+/// `WindowManager` calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Switch to a workspace, by **0-based chonkstep index**.
+    FocusWorkspace(usize),
+    /// Focus a specific window, by `ClientId::as_u64()`.
+    FocusWindow(u64),
+    /// Focus the nearest visible window in a root-coordinate direction.
+    FocusDirection(Direction),
+    /// Close a specific window.
+    CloseWindow(u64),
+    /// Close the focused window.
+    KillActive,
+    /// Move a window (or the focused one) to a 0-based workspace index.
+    /// `follow` distinguishes Hyprland's ordinary and `silent` verbs.
+    MoveToWorkspace { window: Option<u64>, workspace: usize, follow: bool },
+    /// Show the named special workspace on the active output, or hide it
+    /// if it is the one shown there — `togglespecialworkspace [NAME]`.
+    ToggleSpecialWorkspace(String),
+    /// Move a window (or the focused one) onto the named special
+    /// workspace — `movetoworkspace[silent] special[:NAME][,window]`.
+    /// With `follow` the special is shown and the window focused.
+    MoveToSpecial { window: Option<u64>, name: String, follow: bool },
+    /// Run a command line through the user's POSIX shell. This is the
+    /// spelling used by Lua's `hl.dsp.exec_cmd`, whose single string is
+    /// explicitly shell source.
+    ExecShell(String),
+    /// Execute an argv exactly. `hyprctl dispatch exec -- <argv...>`
+    /// removes its `--` client-side and flattens the arguments on the
+    /// wire, so the private `classic_exec` reconstructs the only unambiguous
+    /// direct-argv forms before this crosses into the compositor.
+    ExecArgv(Vec<String>),
+    /// Set or toggle fullscreen on the focused window.
+    Fullscreen(Fullscreen),
+    /// Hyprland's `fullscreenstate <internal> <client>`: the compositor's
+    /// own mode and the one the window is told, each 0 (none), 1
+    /// (maximized) or 2 (fullscreen), already checked to be in range.
+    /// `0 2` is Omarchy's tiled fullscreen — the client drops its chrome
+    /// inside a tile that does not move. The host applies Hyprland's
+    /// rule that asking for the state a window already has clears both.
+    FullscreenState { window: Option<u64>, internal: u8, client: u8 },
+    ToggleMaximize,
+    /// Focus the next/previous window.
+    CycleFocus { forward: bool },
+    MoveWindow { window: u64, x: i32, y: i32, relative: bool },
+    ResizeWindow { window: u64, width: i32, height: i32, relative: bool },
+    CenterWindow(u64),
+    RaiseWindow(u64),
+    SetPinned { window: u64, pinned: Option<bool> },
+    SetTag { window: u64, tag: String, present: bool },
+    /// `setprop <window> opaque <value>` and its Lua form: force the
+    /// window opaque for the session (`Some(true)`), let its opacity
+    /// rule apply again (`Some(false)`), or toggle (`None`). The one
+    /// window property that is modeled; every other `set_prop` is
+    /// refused by name.
+    SetOpaque { window: u64, opaque: Option<bool> },
+    /// Scale in protocol units (120 == 1.0), avoiding floating-point
+    /// equality in an action that is compared in conformance tests.
+    SetMonitorScale { output: String, scale_120: u32 },
+    /// `hl.monitor` with a mode or position, with or without a scale. The
+    /// mode and position keep their monitor-rule spellings (`preferred`,
+    /// `WxH@RATE`, `auto`, `XxY`), already checked against the snapshot,
+    /// and the compositor resolves them exactly as a reload of the same
+    /// line would.
+    ConfigureMonitor { output: String, scale_120: Option<u32>, mode: Option<String>, position: Option<String> },
+    /// Take one named output out of the desktop layout, or put it back:
+    /// `keyword monitor NAME,disable`, its `NAME,preferred,auto,auto`
+    /// re-enable, and `hl.monitor({ output = NAME, disabled = BOOL })`.
+    /// The host refuses to disable the last output in the layout.
+    SetMonitorEnabled { output: String, enabled: bool },
+    /// Power one named output, or every output when `output` is `None`.
+    SetDpms { output: Option<String>, powered: bool },
+    /// Select a group from the seat keymap. Hyprland accepts next,
+    /// previous, or a zero-based numeric group.
+    SwitchKeyboardLayout { device: String, target: LayoutTarget },
+    /// Hide or restore the compositor-owned pointer image. This is a
+    /// live session property used by Omarchy's screensaver, not a
+    /// persisted Hyprland configuration mutation.
+    SetCursorHidden(bool),
+    /// Pause or resume the session's one-second re-read of its Hyprland
+    /// configuration — `misc:disable_autoreload`, the switch Omarchy's
+    /// pacman hooks throw around every `omarchy-settings` upgrade so a
+    /// half-replaced tree is never loaded. A live session property, not
+    /// persisted configuration; an explicit `reload` still re-reads
+    /// while paused, which is what the resume hook relies on.
+    SetAutoreload { paused: bool },
+    /// `debug.suppress_errors = true`, which Omarchy's reload guard sets
+    /// beside the pause and writes back on resume. Already the case:
+    /// chonkstep has no on-screen configuration-error surface — refusals
+    /// are served by `configerrors` and logged — so the host applies
+    /// nothing and the answer is truthful. `false` asks for a surface
+    /// that does not exist and never reaches here; the parser refuses it
+    /// by name.
+    SuppressConfigErrors,
+    /// Switch one input device on or off by its exact libinput name: the
+    /// request Omarchy's touchpad and touchscreen toggles make. Parsing has
+    /// already refused a name that no pointer, touch or tablet device
+    /// carries, and switching off a name that any keyboard carries.
+    SetInputDeviceEnabled { name: String, enabled: bool },
+    /// Move the pointer to a point in logical layout coordinates, the
+    /// units `cursorpos` and `clients` report. The host refuses it while
+    /// the session is locked or a client holds a pointer constraint.
+    WarpPointer { x: i32, y: i32 },
+    /// Focus an output: warp the pointer to it and hand the keyboard to
+    /// its most recent window. Parsing has already refused it while the
+    /// session is locked; the host refuses it again against the live
+    /// lock, and resolves the target against the live output list
+    /// because an output can go between the answer and the apply.
+    FocusMonitor(MonitorTarget),
+    /// Re-home the active Space to another output, under separate Spaces
+    /// only: parsing refuses it by name on the shared desktop.
+    MoveWorkspaceToMonitor(MonitorTarget),
+    ReloadConfig,
+    SetDiagnostic { name: String, enabled: bool },
+    SetLogFilter(String),
+    /// Set or toggle membership in the current workspace layout.
+    SetFloating {
+        window: u64,
+        floating: Option<bool>,
+    },
+    SetWorkspaceLayout {
+        workspace: usize,
+        mode: String,
+    },
+    ToggleLayout,
+    MoveDirection(Direction),
+    LayoutNoop,
+    /// Run a ChonkStep binding that has no Hyprland dispatcher, named by
+    /// the label `binds` reported for it (`chonkstep overview`).
+    Binding(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fullscreen {
+    Toggle,
+    On,
+    Off,
+}
+
+/// A root-coordinate direction, kept protocol-local so this crate
+/// remains independent of `wm-core` as promised by its public design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// The output a `focusmonitor` / `movecurrentworkspacetomonitor`
+/// argument names, kept symbolic: a name is checked against the snapshot
+/// here and resolved again by the host, a step or direction only there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorTarget {
+    /// `+N` / `-N`, wrapping along the monitor list; `current` is `+0`.
+    Relative(i32),
+    /// `l` / `r` / `u` / `d`: the nearest output that way.
+    Direction(Direction),
+    /// A connector name exactly as `monitors` reports it.
+    Name(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutTarget {
+    Next,
+    Previous,
+    Index(u32),
+}
+
+/// The result of parsing one dispatch request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Understood, and chonkstep can do it.
+    Run(Action),
+    /// Understood, and chonkstep cannot do it. The string says why, in
+    /// terms of what chonkstep is rather than what it lacks.
+    Unsupported(String),
+    /// Not understood at all.
+    Unknown(String),
+}
+
+impl Outcome {
+    /// The line Hyprland would put on the wire for this outcome.
+    ///
+    /// `ok` is Hyprland's success response and callers test for it;
+    /// failures begin with `Invalid dispatcher` for the same reason.
+    pub fn response(&self) -> String {
+        match self {
+            Outcome::Run(_) => "ok".to_string(),
+            Outcome::Unsupported(why) | Outcome::Unknown(why) => {
+                format!("Invalid dispatcher: {why}")
+            }
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Outcome::Run(_))
+    }
+}
+
+/// Parse a dispatch argument string.
+///
+/// `args` is everything after `dispatch` — either a classic verb with
+/// its own arguments (`workspace 3`) or a Lua call
+/// (`hl.dsp.focus({ workspace = "3" })`).
+pub fn parse(args: &str, snapshot: &Snapshot) -> Outcome {
+    let args = args.trim();
+    if args.is_empty() {
+        return Outcome::Unknown("empty dispatch".to_string());
+    }
+
+    // Omarchy 4 configures Hyprland in Lua and writes dispatch as Lua.
+    // Recognising it is not optional: it is the *first* form every
+    // Omarchy script and the bar's workspace widget sends.
+    if let Some(rest) = args.strip_prefix("hl.dsp.") {
+        return parse_lua(rest, snapshot);
+    }
+    // `hl.dispatch(hl.dsp....)` is the form `omarchy-capture-region`
+    // sends through `hyprctl eval`.
+    if let Some(rest) = args.strip_prefix("hl.dispatch(hl.dsp.") {
+        return parse_lua(rest.trim_end_matches(')'), snapshot);
+    }
+
+    let (verb, rest) = split_verb(args);
+    parse_classic(&verb, rest, snapshot)
+}
+
+/// Split the verb from its arguments on the first whitespace character,
+/// whatever its width; see `Request::parse`, which splits the same way.
+fn split_verb(args: &str) -> (String, &str) {
+    let (verb, rest) = split_word(args);
+    (verb.to_ascii_lowercase(), rest)
+}
+
+/// Keep selector suffixes verbatim: whitespace inside a window title
+/// belongs to its identity, not to the dispatcher's argument separators.
+fn split_word(args: &str) -> (&str, &str) {
+    let args = args.trim();
+    args.split_once(char::is_whitespace).map_or((args, ""), |(word, rest)| (word, rest.trim()))
+}
+
+/// The value of an `opaque` property request: `None` toggles.
+fn opaque_value(value: &str) -> Option<Option<bool>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "toggle" => Some(None),
+        "1" | "true" | "on" => Some(Some(true)),
+        "0" | "false" | "off" => Some(Some(false)),
+        _ => None,
+    }
+}
+
+fn parse_classic(verb: &str, rest: &str, snapshot: &Snapshot) -> Outcome {
+    // The vocabulary is the shared table's, not this match's. A name the
+    // table does not list is unknown here exactly as it is to a
+    // binding, and a name it refuses is refused here with the same
+    // words a binding is refused with — "chonkstep understands exactly
+    // what you asked for and is not able to do it" is a much better
+    // error to read at 2am than "unknown dispatcher", and it is the one
+    // that tells a script author their fallback path is the right one
+    // to write. Only the lowering below is this crate's own.
+    let Some(entry) = hypr_dispatch::classic(verb) else {
+        return Outcome::Unknown(format!("unknown dispatcher {verb:?}"));
+    };
+    match entry.support {
+        Support::Unsupported(why) | Support::BindingOnly(why) => return Outcome::Unsupported(why.to_string()),
+        Support::Served | Support::IpcOnly(_) => {}
+    }
+
+    match verb {
+        "layoutmsg" | "togglesplit" | "swapsplit" | "pseudo" | "splitratio" => {
+            Outcome::Run(Action::LayoutNoop)
+        }
+        "togglelayout" => Outcome::Run(Action::ToggleLayout),
+        "layout" => layout_action(snapshot.active_workspace().map_or(0, |w| w.index), rest),
+        "swapnext" => Outcome::Run(Action::MoveDirection(if rest.contains("prev") {
+            Direction::Left
+        } else {
+            Direction::Right
+        })),
+        "movewindow" | "swapwindow" | "movewindoworgroup" => match rest.trim() {
+            "l" | "left" => Outcome::Run(Action::MoveDirection(Direction::Left)),
+            "r" | "right" => Outcome::Run(Action::MoveDirection(Direction::Right)),
+            "u" | "up" => Outcome::Run(Action::MoveDirection(Direction::Up)),
+            "d" | "down" => Outcome::Run(Action::MoveDirection(Direction::Down)),
+            _ => Outcome::Unsupported("window movement requires a direction".into()),
+        },
+        "workspace" | "focusworkspaceoncurrentmonitor" => match workspace_selector(rest, snapshot) {
+            Ok(WorkspaceSelector::Numbered(index)) => Outcome::Run(Action::FocusWorkspace(index)),
+            // `workspace special:NAME` shows the special: the overlay
+            // `togglespecialworkspace` drops down, reached by name.
+            Ok(WorkspaceSelector::Special(name)) => Outcome::Run(Action::ToggleSpecialWorkspace(name)),
+            Err(why) => Outcome::Unsupported(why),
+        },
+        "togglespecialworkspace" => match special_name(rest, snapshot) {
+            Ok(name) => Outcome::Run(Action::ToggleSpecialWorkspace(name)),
+            Err(why) => Outcome::Unsupported(why),
+        },
+        "focuswindow" => match resolve_window(rest, snapshot) {
+            Some(window) => Outcome::Run(Action::FocusWindow(window.id)),
+            None => Outcome::Unsupported(format!("no window matches {rest:?}")),
+        },
+        "movefocus" => match rest.trim().to_ascii_lowercase().as_str() {
+            "l" | "left" => Outcome::Run(Action::FocusDirection(Direction::Left)),
+            "r" | "right" => Outcome::Run(Action::FocusDirection(Direction::Right)),
+            "u" | "up" => Outcome::Run(Action::FocusDirection(Direction::Up)),
+            "d" | "down" => Outcome::Run(Action::FocusDirection(Direction::Down)),
+            other => Outcome::Unsupported(format!("unknown focus direction {other:?}")),
+        },
+        "closewindow" => match resolve_window(rest, snapshot) {
+            Some(window) => Outcome::Run(Action::CloseWindow(window.id)),
+            None => Outcome::Unsupported(format!("no window matches {rest:?}")),
+        },
+        "killactive" => Outcome::Run(Action::KillActive),
+        "movetoworkspace" | "movetoworkspacesilent" => {
+            // `movetoworkspace 3`, its `silent` counterpart, or either
+            // spelling with `,address:0x...` selecting a window.
+            let follow = verb == "movetoworkspace";
+            let (target, window) = match rest.split_once(',') {
+                Some((target, window)) => (target.trim(), Some(window.trim())),
+                None => (rest, None),
+            };
+            let selector = match workspace_selector(target, snapshot) {
+                Ok(selector) => selector,
+                Err(why) => return Outcome::Unsupported(why),
+            };
+            let window = match window {
+                None => None,
+                Some(selector) => match resolve_window(selector, snapshot) {
+                    Some(window) => Some(window.id),
+                    None => return Outcome::Unsupported(format!("no window matches {selector:?}")),
+                },
+            };
+            Outcome::Run(move_action(selector, window, follow))
+        }
+        "exec" => classic_exec(rest),
+        "fullscreen" => {
+            if rest.trim() == "1" {
+                Outcome::Run(Action::ToggleMaximize)
+            } else if rest.trim() == "2" {
+                Outcome::Run(Action::Fullscreen(Fullscreen::On))
+            } else {
+                Outcome::Run(Action::Fullscreen(Fullscreen::Toggle))
+            }
+        }
+        // `fullscreenstate <internal> <client>`, acting on the focused
+        // window as in Hyprland; the Lua form's `window` field arrives
+        // as a third word and names another.
+        "fullscreenstate" => {
+            let (internal, rest) = split_word(rest);
+            let (client, selector) = split_word(rest);
+            let level = |name: &str, value: Option<&str>| fullscreen_level("fullscreenstate", name, value);
+            match (level("internal", Some(internal)), level("client", Some(client))) {
+                (Ok(internal), Ok(client)) => {
+                    let window = if selector.is_empty() {
+                        None
+                    } else {
+                        match resolve_window(selector, snapshot) {
+                            Some(window) => Some(window.id),
+                            None => return Outcome::Unsupported(format!("no window matches {selector:?}")),
+                        }
+                    };
+                    Outcome::Run(Action::FullscreenState { window, internal, client })
+                }
+                (Err(why), _) | (_, Err(why)) => Outcome::Unsupported(why),
+            }
+        }
+        "cyclenext" => Outcome::Run(Action::CycleFocus { forward: !rest.contains("prev") }),
+        // The second half of Omarchy's Alt-Tab: the focused window to
+        // the top of the stack.
+        "bringactivetotop" => match snapshot.focused_window() {
+            Some(window) => Outcome::Run(Action::RaiseWindow(window.id)),
+            None => Outcome::Unsupported("no window is focused".to_string()),
+        },
+        "resizeactive" => classic_geometry(rest, snapshot, true, true),
+        "resizewindowpixel" => classic_geometry(rest, snapshot, true, false),
+        "moveactive" => classic_geometry(rest, snapshot, false, true),
+        "movewindowpixel" => classic_geometry(rest, snapshot, false, false),
+        "centerwindow" => selected_window(rest, snapshot)
+            .map(|window| Outcome::Run(Action::CenterWindow(window.id)))
+            .unwrap_or_else(|| Outcome::Unsupported(format!("no window matches {rest:?}"))),
+        "alterzorder" => {
+            let (mode, selector) = split_word(rest);
+            if mode != "top" {
+                Outcome::Unsupported(format!("alterzorder mode {mode:?} is not supported; only top is available"))
+            } else {
+                selected_window(selector, snapshot)
+                    .map(|window| Outcome::Run(Action::RaiseWindow(window.id)))
+                    .unwrap_or_else(|| Outcome::Unsupported(format!("no window matches {selector:?}")))
+            }
+        }
+        // `setprop <window> opaque toggle|1|0`, the classic spelling
+        // Omarchy's transparency toggle falls back to. Any other
+        // property is refused by name, exactly as the Lua form is.
+        "setprop" => {
+            // The selector may contain spaces (a Lua title selector is
+            // already decoded). Property and value are the final words;
+            // splitting from the front would change the selected window.
+            let Some((prefix, last)) = rest.trim().rsplit_once(char::is_whitespace) else {
+                return Outcome::Unsupported("setprop takes a window, a property and a value".to_string());
+            };
+            let (window, prop, value) = match (last, prefix.trim_end().rsplit_once(char::is_whitespace)) {
+                ("opaque", _) => (prefix.trim_end(), last, "toggle"),
+                (_, Some((window, prop))) => (window.trim_end(), prop, last),
+                (_, None) => (prefix, last, "toggle"),
+            };
+            if prop != "opaque" {
+                return Outcome::Unsupported(format!(
+                    "window property {prop:?} is not modeled; opaque is the one setprop property ChonkStep serves"
+                ));
+            }
+            let Some(opaque) = opaque_value(value) else {
+                return Outcome::Unsupported(format!("setprop opaque takes toggle, 1 or 0, not {value:?}"));
+            };
+            match resolve_window(window, snapshot) {
+                Some(window) => Outcome::Run(Action::SetOpaque { window: window.id, opaque }),
+                None => Outcome::Unsupported(format!("no window matches {window:?}")),
+            }
+        }
+        // `toggleopaque`: `setprop activewindow opaque toggle` in one
+        // word, and what the native `toggle-opaque` binding reports.
+        "toggleopaque" => match snapshot.focused_window() {
+            Some(window) => Outcome::Run(Action::SetOpaque { window: window.id, opaque: None }),
+            None => Outcome::Unsupported("no window is focused".to_string()),
+        },
+        "pin" => selected_window(rest, snapshot)
+            .map(|window| Outcome::Run(Action::SetPinned { window: window.id, pinned: None }))
+            .unwrap_or_else(|| Outcome::Unsupported(format!("no window matches {rest:?}"))),
+        "togglefloating" | "setfloating" | "settiled" => selected_window(rest, snapshot)
+            .map(|window| {
+                Outcome::Run(Action::SetFloating {
+                    window: window.id,
+                    floating: match verb {
+                        "setfloating" => Some(true),
+                        "settiled" => Some(false),
+                        _ => None,
+                    },
+                })
+            })
+            .unwrap_or_else(|| Outcome::Unsupported(format!("no window matches {rest:?}"))),
+        "tagwindow" => classic_tag(rest, snapshot),
+        "movecursor" => {
+            let mut fields = rest.split_whitespace().map(str::parse::<i32>);
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(Ok(x)), Some(Ok(y)), None) => Outcome::Run(Action::WarpPointer { x, y }),
+                _ => Outcome::Unsupported("movecursor requires integer x and y".to_string()),
+            }
+        }
+        // ChonkStep's own verbs, as `binds` reports a binding with no
+        // Hyprland dispatcher; Omarchy's keybindings menu hands that pair
+        // straight back. Only a label this snapshot reports replays, so a
+        // caller cannot name an arbitrary action, and while the session is
+        // locked only a binding marked locked does.
+        "chonkstep" => {
+            let label = rest.trim();
+            match snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.dispatcher == "chonkstep" && binding.argument == label)
+            {
+                Some(binding) if snapshot.locked && !binding.locked => Outcome::Unsupported(format!(
+                    "chonkstep {label} is not a locked binding and the session is locked"
+                )),
+                Some(_) => Outcome::Run(Action::Binding(label.to_string())),
+                None => Outcome::Unsupported(format!("chonkstep has no bound action named {label:?}")),
+            }
+        }
+        "dpms" => parse_dpms(rest, snapshot),
+        "focusmonitor" => focus_monitor(rest, snapshot),
+        "movecurrentworkspacetomonitor" => move_workspace_to_monitor(rest, snapshot),
+        // A name the table lists as served with no request here is a
+        // table the code has not caught up with; the conformance test
+        // over the table fails before this can be reached.
+        other => Outcome::Unknown(format!("dispatcher {other:?} has no request here")),
+    }
+}
+
+/// Parse the Lua dispatch forms Omarchy 4 actually sends.
+///
+/// This is not a Lua interpreter and does not try to be. The arguments
+/// are read as real Lua literals — a string is decoded with Lua's own
+/// escape rules, and a field is a key of a table rather than a word
+/// found somewhere in the text, because `exec_cmd`'s string is a
+/// command to run — and then the call is flattened onto the classic
+/// vocabulary by the shared table, so `hl.dsp.window.move({ workspace
+/// = "3" })` is answered by exactly the code that answers
+/// `movetoworkspace 3`, and a Lua spelling can never reach a dispatcher
+/// the classic side does not serve, or be refused where it is served.
+/// A path the table does not know is refused *as unknown rather than
+/// as understood*, which is the safe direction: a Lua call mis-parsed
+/// into a plausible action would be exactly the confident wrong answer
+/// this module forbids.
+fn parse_lua(rest: &str, snapshot: &Snapshot) -> Outcome {
+    let (path, body) = match rest.split_once('(') {
+        Some((path, body)) => (path.trim(), body.trim_end().trim_end_matches(')')),
+        None => (rest.trim(), ""),
+    };
+    let args = match lua_arguments(body) {
+        Ok(args) => args,
+        Err(error) => return Outcome::Unsupported(format!("hl.dsp.{path}: invalid Lua arguments: {error}")),
+    };
+    match hypr_dispatch::flatten(path, &LuaArgs(&args)) {
+        Flattened::Verb { name, arg } => parse_classic(name, &arg, snapshot),
+        // Shell source, as the Lua API defines it; classic `exec` is an
+        // argv and is reconstructed by `classic_exec` instead.
+        Flattened::ExecShell(command) if command.is_empty() => {
+            Outcome::Unknown("hl.dsp.exec_cmd with no command".to_string())
+        }
+        Flattened::ExecShell(command) => Outcome::Run(Action::ExecShell(command)),
+        Flattened::Unknown => Outcome::Unknown(format!("unknown Lua dispatcher hl.dsp.{path}")),
+    }
+}
+
+/// A read argument list, as the shared flattening looks at it.
+struct LuaArgs<'a>(&'a [Literal]);
+
+impl LuaCall for LuaArgs<'_> {
+    fn field(&self, key: &str) -> Option<String> {
+        lua_field(self.0, key)
+    }
+
+    fn positional(&self) -> Option<String> {
+        lua_string(self.0)
+    }
+}
+
+/// Parse an expression sent through `hyprctl eval`. Eval is mutation in
+/// Omarchy's Lua configuration API; known families are either lowered
+/// to an action or refused by name, never misreported as an unknown
+/// request.
+pub fn parse_eval(source: &str, snapshot: &Snapshot) -> Outcome {
+    let source = source.trim();
+    if source.starts_with("hl.dispatch(hl.dsp.") {
+        return parse(source, snapshot);
+    }
+    if let Some(body) = source.strip_prefix("hl.monitor(").and_then(|value| value.strip_suffix(')')) {
+        let args = match lua_arguments(body) {
+            Ok(args) => args,
+            Err(error) => return Outcome::Unsupported(format!("hl.monitor: invalid Lua arguments: {error}")),
+        };
+        // Every key is accounted for before anything changes. A request that
+        // also asked to mirror the output must not come back `ok` having
+        // applied only its scale.
+        for arg in &args {
+            let Literal::Table(fields) = arg else {
+                return Outcome::Unsupported("hl.monitor takes one table of named keys".to_string());
+            };
+            for (key, _) in fields {
+                match key.as_deref() {
+                    Some("output" | "mode" | "position" | "scale" | "disabled") => {}
+                    Some(other) => {
+                        return Outcome::Unsupported(format!(
+                            "hl.monitor key {other:?} is not supported; output, mode, position, scale and disabled are"
+                        ))
+                    }
+                    None => return Outcome::Unsupported("hl.monitor takes named keys only".to_string()),
+                }
+            }
+        }
+        let Some(output) = lua_field(&args, "output") else {
+            return Outcome::Unsupported("hl.monitor requires a named output".to_string());
+        };
+        // `disabled` is the whole request: Omarchy's clamshell and
+        // laptop-display toggles write exactly `{ output, disabled = true }`,
+        // and a geometry given beside it would describe an output that is
+        // about to leave the layout. The name may be a disabled output's,
+        // which plain `monitors` omits.
+        if let Some(value) = lua_field(&args, "disabled") {
+            let Some(disabled) = parse_bool(&value) else {
+                return Outcome::Unsupported("hl.monitor disabled must be true or false".to_string());
+            };
+            if ["mode", "position", "scale"].iter().any(|key| lua_field(&args, key).is_some()) {
+                return Outcome::Unsupported(
+                    "hl.monitor disabled combines with output only; enable the output first, then configure it"
+                        .to_string(),
+                );
+            }
+            if !monitor_known(snapshot, &output) {
+                return Outcome::Unsupported(format!("hl.monitor names unknown output {output:?}"));
+            }
+            return Outcome::Run(Action::SetMonitorEnabled { output, enabled: !disabled });
+        }
+        let Some(monitor) = snapshot.monitors.iter().find(|monitor| monitor.name == output) else {
+            return Outcome::Unsupported(if snapshot.disabled_monitors.iter().any(|monitor| monitor.name == output) {
+                format!("hl.monitor: output {output:?} is disabled; enable it with disabled = false first")
+            } else {
+                format!("hl.monitor names unknown output {output:?}")
+            });
+        };
+        let scale_120 = match lua_field(&args, "scale") {
+            None => None,
+            Some(value) => match value.parse::<f64>() {
+                Ok(scale) if scale.is_finite() && (0.5..=4.0).contains(&scale) => Some((scale * 120.0).round() as u32),
+                _ => return Outcome::Unsupported("hl.monitor scale must be a number between 0.5 and 4".to_string()),
+            },
+        };
+        let mode = match lua_field(&args, "mode") {
+            None => None,
+            Some(mode) if monitor_advertises(monitor, &mode) => Some(mode),
+            Some(mode) => {
+                return Outcome::Unsupported(format!("hl.monitor mode {mode:?} is not one {output} advertises"))
+            }
+        };
+        let position = match lua_field(&args, "position") {
+            None => None,
+            Some(position) if position.trim().eq_ignore_ascii_case("auto") || monitor_position(&position).is_some() => {
+                Some(position)
+            }
+            Some(position) => {
+                return Outcome::Unsupported(format!("hl.monitor position {position:?} must be auto or XxY"))
+            }
+        };
+        return Outcome::Run(match (scale_120, mode, position) {
+            (None, None, None) => {
+                return Outcome::Unsupported("hl.monitor needs a mode, position or scale".to_string())
+            }
+            (Some(scale_120), None, None) => Action::SetMonitorScale { output, scale_120 },
+            (scale_120, mode, position) => Action::ConfigureMonitor { output, scale_120, mode, position },
+        });
+    }
+    if let Some(body) = source.strip_prefix("hl.config(").and_then(|value| value.strip_suffix(')')) {
+        return parse_config(body);
+    }
+    if let Some(call) = source.strip_prefix("hl.device(") {
+        return parse_device(call.strip_suffix(')'), snapshot);
+    }
+    if let Some(call) = source.strip_prefix("hl.workspace_rule(") {
+        let args = match lua_arguments(call.strip_suffix(')').unwrap_or(call)) {
+            Ok(args) => args,
+            Err(error) => return Outcome::Unsupported(format!("hl.workspace_rule: invalid Lua arguments: {error}")),
+        };
+        let workspace = lua_field(&args, "workspace")
+            .and_then(|s| s.parse::<i32>().ok())
+            .and_then(workspace_index_from_hypr_id);
+        return match (workspace, lua_field(&args, "layout")) {
+            (Some(workspace), Some(mode)) if workspace < 99 => layout_action(workspace, &mode),
+            _ => Outcome::Unsupported(
+                "workspace_rule requires a workspace from 1 to 99 and a layout".into(),
+            ),
+        };
+    }
+    Outcome::Unknown(format!("unknown eval expression {source:?}"))
+}
+
+/// The longest device name `hl.device` accepts: the bound a configuration's
+/// device rules have, since both name the same devices.
+const MAX_DEVICE_NAME: usize = 256;
+
+/// `hl.device({ name = "…", enabled = BOOL })`. Only `enabled` changes at
+/// runtime, and every other device setting belongs in the configuration.
+/// The name is a Lua string with its escapes decoded, and has to be exactly
+/// a device the snapshot lists: a name cut short at an escaped quote would
+/// be a plausible, different device.
+fn parse_device(body: Option<&str>, snapshot: &Snapshot) -> Outcome {
+    let args = match body.map(lua_arguments) {
+        Some(Ok(args)) => args,
+        Some(Err(error)) => return Outcome::Unsupported(format!("hl.device: invalid Lua arguments: {error}")),
+        None => return Outcome::Unsupported("hl.device: invalid Lua arguments: unterminated call".to_string()),
+    };
+    let Some(Literal::Str(name)) = lua_value(&args, "name") else {
+        return Outcome::Unsupported("hl.device requires the device's name as a quoted string".to_string());
+    };
+    if name.is_empty() || name.len() > MAX_DEVICE_NAME {
+        return Outcome::Unsupported(format!("hl.device names a device in 1 to {MAX_DEVICE_NAME} bytes"));
+    }
+    let Some(enabled) = lua_field(&args, "enabled").as_deref().and_then(parse_bool) else {
+        return Outcome::Unsupported("hl.device requires enabled = true or false".to_string());
+    };
+    let keys = args.iter().flat_map(|arg| match arg {
+        Literal::Table(fields) => fields.as_slice(),
+        _ => &[],
+    });
+    if let Some(key) = keys.filter_map(|(key, _)| key.as_deref()).find(|key| !matches!(*key, "name" | "enabled")) {
+        return Outcome::Unsupported(format!("hl.device changes only enabled at runtime; {key} belongs in the configuration"));
+    }
+    if NESTED_DEVICES.contains(&name.as_str()) {
+        return Outcome::Unsupported(format!(
+            "{name:?} is the nested session's logical device, not a libinput device, and cannot be switched"
+        ));
+    }
+    let devices = &snapshot.devices;
+    if !enabled && devices.keyboards.iter().any(|keyboard| keyboard.name == *name) {
+        return Outcome::Unsupported(format!(
+            "hl.device will not disable {name:?}: a device with keys stays on, so the lock screen can always be typed into"
+        ));
+    }
+    let known = devices.mice.iter().chain(&devices.touch).chain(&devices.tablets).any(|device| device.name == *name);
+    if !known {
+        return Outcome::Unsupported(format!("hl.device names no pointer, touch or tablet device {name:?}"));
+    }
+    Outcome::Run(Action::SetInputDeviceEnabled { name: name.clone(), enabled })
+}
+
+fn layout_action(workspace: usize, mode: &str) -> Outcome {
+    if matches!(
+        mode.trim(),
+        "freeform" | "mosaic" | "flow" | "dwindle" | "scrolling"
+    ) {
+        Outcome::Run(Action::SetWorkspaceLayout {
+            workspace,
+            mode: mode.trim().into(),
+        })
+    } else {
+        Outcome::Unsupported(
+            "layout must be Freeform, Mosaic/dwindle or Flow/scrolling (lowercase)".into(),
+        )
+    }
+}
+
+/// Whether `name` is an output in the layout or a disabled one.
+fn monitor_known(snapshot: &Snapshot, name: &str) -> bool {
+    snapshot.monitors.iter().chain(&snapshot.disabled_monitors).any(|monitor| monitor.name == name)
+}
+
+/// `keyword monitor NAME,…`: Omarchy's Display panel toggles a row off with
+/// `NAME,disable` and back on with `NAME,preferred,auto,auto`. The first
+/// takes the output out of the layout; the second puts a disabled output
+/// back, and on an output already in the layout means what the same
+/// monitor line means in the configuration. Anything past the scale —
+/// a transform, a colour depth — belongs in the configuration.
+fn parse_keyword_monitor(spec: &str, snapshot: &Snapshot) -> Outcome {
+    let fields: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let (Some(&name), Some(&mode)) = (fields.first(), fields.get(1)) else {
+        return Outcome::Unsupported("keyword monitor requires NAME,disable or NAME,MODE,POSITION,SCALE".to_string());
+    };
+    if name.is_empty() {
+        return Outcome::Unsupported("keyword monitor requires an output name".to_string());
+    }
+    if mode.eq_ignore_ascii_case("disable") {
+        if fields.len() > 2 {
+            return Outcome::Unsupported("keyword monitor NAME,disable takes nothing after disable".to_string());
+        }
+        if !monitor_known(snapshot, name) {
+            return Outcome::Unsupported(format!("keyword monitor names unknown output {name:?}"));
+        }
+        return Outcome::Run(Action::SetMonitorEnabled { output: name.to_string(), enabled: false });
+    }
+    if fields.len() > 4 {
+        return Outcome::Unsupported(format!(
+            "keyword monitor {name}: {:?} belongs in the configuration; mode, position and scale apply live",
+            fields[4]
+        ));
+    }
+    if snapshot.disabled_monitors.iter().any(|monitor| monitor.name == name) {
+        // Back into the layout, where the configuration's own rule for it
+        // and the automatic placement apply, which is what
+        // `preferred,auto,auto` asks for.
+        return Outcome::Run(Action::SetMonitorEnabled { output: name.to_string(), enabled: true });
+    }
+    let Some(monitor) = snapshot.monitors.iter().find(|monitor| monitor.name == name) else {
+        return Outcome::Unsupported(format!("keyword monitor names unknown output {name:?}"));
+    };
+    let mode = mode.to_string();
+    if !monitor_advertises(monitor, &mode) {
+        return Outcome::Unsupported(format!("keyword monitor mode {mode:?} is not one {name} advertises"));
+    }
+    let position = fields.get(2).map(|value| value.to_string()).filter(|value| !value.is_empty());
+    if let Some(position) = &position {
+        if !position.eq_ignore_ascii_case("auto") && monitor_position(position).is_none() {
+            return Outcome::Unsupported(format!("keyword monitor position {position:?} must be auto or XxY"));
+        }
+    }
+    let scale_120 = match fields.get(3).map(|value| value.trim()).filter(|value| !value.is_empty()) {
+        None => None,
+        Some(value) if value.eq_ignore_ascii_case("auto") => None,
+        Some(value) => match value.parse::<f64>() {
+            Ok(scale) if scale.is_finite() && (0.5..=4.0).contains(&scale) => Some((scale * 120.0).round() as u32),
+            _ => return Outcome::Unsupported("keyword monitor scale must be auto or a number between 0.5 and 4".to_string()),
+        },
+    };
+    Outcome::Run(Action::ConfigureMonitor { output: name.to_string(), scale_120, mode: Some(mode), position })
+}
+
+/// Parse the supported workspace, monitor and diagnostic keyword mutations.
+pub fn parse_keyword(source: &str, snapshot: &Snapshot) -> Outcome {
+    if let Some(spec) = source.trim().strip_prefix("workspace ") {
+        if let Some((workspace, mode)) = spec.split_once(',') {
+            if let Some(index) = workspace
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .and_then(workspace_index_from_hypr_id)
+                .filter(|&i| i < 99)
+            {
+                if let Some(mode) = mode.trim().strip_prefix("layout:") {
+                    return layout_action(index, mode);
+                }
+            }
+        }
+        return Outcome::Unsupported("workspace requires N, layout:MODE".into());
+    }
+    let source = source.trim();
+    if let Some(spec) = source.strip_prefix("monitor ") {
+        return parse_keyword_monitor(spec, snapshot);
+    }
+    let mut fields = source.split_whitespace();
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some("cursor:invisible"), Some(value), None) => match parse_bool(value) {
+            Some(hidden) => Outcome::Run(Action::SetCursorHidden(hidden)),
+            None => Outcome::Unsupported(
+                "keyword cursor:invisible requires true or false".to_string(),
+            ),
+        },
+        // Hyprland's own spelling of the reload guard's switch, for a
+        // `sudo hyprctl keyword misc:disable_autoreload true` typed by
+        // hand; it reaches the same live flag as `hl.config`.
+        (Some("misc:disable_autoreload"), Some(value), None) => match parse_bool(value) {
+            Some(paused) => Outcome::Run(Action::SetAutoreload { paused }),
+            None => Outcome::Unsupported(
+                "keyword misc:disable_autoreload requires true or false".to_string(),
+            ),
+        },
+        _ => Outcome::Unsupported(
+            "keyword does not mutate chonkstep's configuration. \
+             chonkstep reads ~/.config/hypr and re-reads it within a second of an edit, \
+             so edit the file instead, or use `hyprctl eval hl.monitor({...})` for a live \
+             mode, position, scale or disable change. `keyword monitor NAME,disable` and \
+             `keyword monitor NAME,MODE,POSITION,SCALE` are the two keyword forms served."
+                .to_string(),
+        ),
+    }
+}
+
+/// `hl.config({ TABLE = { KEY = BOOL, ... }, ... })`: the three live
+/// properties chonkstep models — `cursor.invisible`,
+/// `misc.disable_autoreload` and `debug.suppress_errors` — with every
+/// other table or key refused by name.
+///
+/// Every key in the call is checked before anything is produced.
+/// Omarchy's reload guard sends `misc` and `debug` together in one
+/// call, and its resume writes back whatever its earlier `getoption`
+/// read, which after a failed read is the word `null`: a call that is
+/// half right is refused whole, so the guard never gets `ok` for a
+/// pause or a restore it did not get. One call sets one property;
+/// `debug.suppress_errors = true` rides along with either because it
+/// changes nothing.
+fn parse_config(body: &str) -> Outcome {
+    let args = match lua_arguments(body) {
+        Ok(args) => args,
+        Err(error) => return Outcome::Unsupported(format!("hl.config: invalid Lua arguments: {error}")),
+    };
+    let mut cursor_hidden = None;
+    let mut autoreload_paused = None;
+    let mut suppress_errors = None;
+    for arg in &args {
+        let Literal::Table(tables) = arg else {
+            return Outcome::Unsupported("hl.config takes one table of named keys".to_string());
+        };
+        for (table, settings) in tables {
+            let Some(table) = table.as_deref() else {
+                return Outcome::Unsupported("hl.config takes named keys only".to_string());
+            };
+            let Literal::Table(settings) = settings else {
+                return Outcome::Unsupported(format!("hl.config {table} must be a table of settings"));
+            };
+            for (key, value) in settings {
+                let Some(key) = key.as_deref() else {
+                    return Outcome::Unsupported(format!("hl.config {table} takes named keys only"));
+                };
+                let slot = match (table, key) {
+                    ("cursor", "invisible") => &mut cursor_hidden,
+                    ("misc", "disable_autoreload") => &mut autoreload_paused,
+                    ("debug", "suppress_errors") => &mut suppress_errors,
+                    _ => {
+                        return Outcome::Unsupported(format!(
+                            "hl.config {table}.{key} is not a live property of chonkstep; \
+                             cursor.invisible, misc.disable_autoreload and debug.suppress_errors are"
+                        ))
+                    }
+                };
+                let text = match value {
+                    Literal::Str(text) | Literal::Word(text) => text.as_str(),
+                    Literal::Table(_) => "",
+                };
+                match parse_bool(text) {
+                    Some(flag) => *slot = Some(flag),
+                    None => return Outcome::Unsupported(format!("hl.config {table}.{key} requires true or false")),
+                }
+            }
+        }
+    }
+    if suppress_errors == Some(false) {
+        return Outcome::Unsupported(
+            "hl.config debug.suppress_errors = false: chonkstep has no on-screen configuration-error \
+             surface to unsuppress; refusals are served by `configerrors` and logged"
+                .to_string(),
+        );
+    }
+    match (cursor_hidden, autoreload_paused, suppress_errors) {
+        (Some(_), Some(_), _) => Outcome::Unsupported(
+            "hl.config sets cursor.invisible or misc.disable_autoreload in one call, not both".to_string(),
+        ),
+        (Some(hidden), None, _) => Outcome::Run(Action::SetCursorHidden(hidden)),
+        (None, Some(paused), _) => Outcome::Run(Action::SetAutoreload { paused }),
+        (None, None, Some(true)) => Outcome::Run(Action::SuppressConfigErrors),
+        (None, None, _) => Outcome::Unsupported("hl.config: no property to set".to_string()),
+    }
+}
+
+/// Parse `switchxkblayout DEVICE next|prev|N` after the request table
+/// has separated the command name from its arguments.
+pub fn parse_switch_keyboard_layout(source: &str, snapshot: &Snapshot) -> Outcome {
+    let mut fields = source.split_whitespace();
+    let Some(device) = fields.next() else {
+        return Outcome::Unsupported("switchxkblayout requires a device and layout".to_string());
+    };
+    let Some(target) = fields.next() else {
+        return Outcome::Unsupported("switchxkblayout requires next, prev, or a layout index".to_string());
+    };
+    if fields.next().is_some() {
+        return Outcome::Unsupported("switchxkblayout accepts exactly one device and one layout".to_string());
+    }
+    if device != "all" && !snapshot.devices.keyboards.iter().any(|keyboard| keyboard.name == device) {
+        return Outcome::Unsupported(format!("switchxkblayout names unknown keyboard {device:?}"));
+    }
+    let target = match target.to_ascii_lowercase().as_str() {
+        "next" => LayoutTarget::Next,
+        "prev" | "previous" => LayoutTarget::Previous,
+        value => match value.parse::<u32>() {
+            Ok(index) => LayoutTarget::Index(index),
+            Err(_) => return Outcome::Unsupported("layout must be next, prev, or a zero-based index".to_string()),
+        },
+    };
+    Outcome::Run(Action::SwitchKeyboardLayout { device: device.to_string(), target })
+}
+
+fn parse_dpms(source: &str, snapshot: &Snapshot) -> Outcome {
+    let mut fields = source.split_whitespace();
+    let Some(state) = fields.next() else {
+        return Outcome::Unsupported("dpms requires on, off, or toggle".to_string());
+    };
+    let output = fields.next().map(str::to_string);
+    if fields.next().is_some() {
+        return Outcome::Unsupported("dpms accepts one optional output name".to_string());
+    }
+    if output.as_deref().is_some_and(|name| !snapshot.monitors.iter().any(|monitor| monitor.name == name)) {
+        return Outcome::Unsupported(format!("dpms names unknown output {:?}", output.as_deref().unwrap_or_default()));
+    }
+    let powered = match state.to_ascii_lowercase().as_str() {
+        "on" => true,
+        "off" => false,
+        "toggle" => {
+            let current = output.as_deref()
+                .and_then(|name| snapshot.monitors.iter().find(|monitor| monitor.name == name))
+                .or_else(|| snapshot.focused_monitor())
+                .is_none_or(|monitor| monitor.powered);
+            !current
+        }
+        _ => return Outcome::Unsupported("dpms state must be on, off, or toggle".to_string()),
+    };
+    Outcome::Run(Action::SetDpms { output, powered })
+}
+
+/// One axis of `fullscreenstate`, refused by name for anything but the
+/// three modes Hyprland numbers. A missing field is refused too rather
+/// than defaulted: Hyprland reads a missing axis as "keep the current
+/// one", and a request this cannot honour exactly is not answered `ok`.
+fn fullscreen_level(spelling: &str, name: &str, value: Option<&str>) -> Result<u8, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(format!(
+            "{spelling} needs both internal and client, each 0 (none), 1 (maximized) or 2 (fullscreen)"
+        ));
+    };
+    match value.parse::<u8>() {
+        Ok(level @ 0..=2) => Ok(level),
+        _ => Err(format!("{spelling}: {name} must be 0 (none), 1 (maximized) or 2 (fullscreen), not {value:?}")),
+    }
+}
+
+fn selected_window<'a>(selector: &str, snapshot: &'a Snapshot) -> Option<&'a Window> {
+    if selector.trim().is_empty() {
+        snapshot.focused_window()
+    } else {
+        resolve_window(selector.trim(), snapshot)
+    }
+}
+
+fn classic_geometry(rest: &str, snapshot: &Snapshot, resize: bool, active_form: bool) -> Outcome {
+    let original = rest.trim();
+    let (rest, exact) = original
+        .strip_prefix("exact")
+        .map(|rest| (rest.trim(), true))
+        .unwrap_or((original, false));
+    let (numbers, selector) = rest.split_once(',').map_or((rest, ""), |(a, b)| (a.trim(), b.trim()));
+    let mut fields = numbers.split_whitespace();
+    let Some(x) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+        return Outcome::Unsupported("window geometry requires two integer coordinates".to_string());
+    };
+    let Some(y) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+        return Outcome::Unsupported("window geometry requires two integer coordinates".to_string());
+    };
+    let selector = if active_form { fields.collect::<Vec<_>>().join(" ") } else { selector.to_string() };
+    let Some(window) = selected_window(&selector, snapshot) else {
+        return Outcome::Unsupported(format!("no window matches {selector:?}"));
+    };
+    if resize {
+        Outcome::Run(Action::ResizeWindow { window: window.id, width: x, height: y, relative: !exact })
+    } else {
+        Outcome::Run(Action::MoveWindow { window: window.id, x, y, relative: !exact })
+    }
+}
+
+fn classic_tag(rest: &str, snapshot: &Snapshot) -> Outcome {
+    let (raw_tag, selector) = split_word(rest);
+    if raw_tag.is_empty() { return Outcome::Unsupported("tagwindow requires a tag".to_string()); }
+    let Some(window) = selected_window(selector, snapshot) else {
+        return Outcome::Unsupported(format!("no window matches {selector:?}"));
+    };
+    let (present, tag) = raw_tag.strip_prefix('-').map_or((true, raw_tag.trim_start_matches('+')), |tag| (false, tag));
+    Outcome::Run(Action::SetTag { window: window.id, tag: tag.to_string(), present })
+}
+
+/// The value of `key = ...` in the first table argument that has the key.
+/// Only a table's own keys count: a key name that appears inside a
+/// string value, or in a nested table, is not a field of the call.
+fn lua_value<'a>(args: &'a [Literal], key: &str) -> Option<&'a Literal> {
+    args.iter().find_map(|arg| match arg {
+        Literal::Table(fields) => {
+            fields.iter().find(|(name, _)| name.as_deref() == Some(key)).map(|(_, value)| value)
+        }
+        _ => None,
+    })
+}
+
+/// The text of `key = "value"` (or `key = value`) in an argument list.
+/// A table value has no text and is left to the caller's named refusal.
+fn lua_field(args: &[Literal], key: &str) -> Option<String> {
+    match lua_value(args, key)? {
+        Literal::Str(text) | Literal::Word(text) => Some(text.clone()),
+        Literal::Table(_) => None,
+    }
+}
+
+/// Whether `request` names a mode `monitor` can drive, in the spellings a
+/// monitor rule accepts. The named choices are resolved by the compositor
+/// against the same list; `WxH` and `WxH@RATE` must match an advertised
+/// size, with the rate within the 1 Hz a printed `refreshRate` can drift
+/// from the timing it came from.
+///
+/// A snapshot with no mode list for the output (the nested backend has no
+/// connector to enumerate) cannot refuse anything here. The spelling is
+/// still checked, and the compositor resolves the mode against the live
+/// output before it answers, refusing there what it cannot drive.
+fn monitor_advertises(monitor: &crate::state::Monitor, request: &str) -> bool {
+    let request = request.trim().to_ascii_lowercase();
+    if matches!(request.as_str(), "preferred" | "highrr" | "highres") {
+        return true;
+    }
+    let (size, rate) = request.split_once('@').map_or((request.as_str(), None), |(size, rate)| (size, Some(rate)));
+    let Some((Ok(width), Ok(height))) = size.split_once('x').map(|(w, h)| (w.parse::<i64>(), h.parse::<i64>())) else {
+        return false;
+    };
+    let millihertz = match rate.map(str::parse::<f64>) {
+        None => None,
+        Some(Ok(hz)) if hz.is_finite() && hz > 0.0 && hz <= 10_000.0 => Some((hz * 1000.0).round() as i64),
+        Some(_) => return false,
+    };
+    if monitor.modes.is_empty() {
+        return true;
+    }
+    monitor.modes.iter().any(|mode| {
+        mode.width as i64 == width
+            && mode.height as i64 == height
+            && millihertz.is_none_or(|millihertz| (mode.refresh_millihertz as i64 - millihertz).abs() <= 1000)
+    })
+}
+
+/// A monitor-rule position, `XxY`.
+fn monitor_position(value: &str) -> Option<(i32, i32)> {
+    let (x, y) = value.trim().split_once(['x', 'X'])?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// The first argument that is a bare string literal.
+fn lua_string(args: &[Literal]) -> Option<String> {
+    args.iter().find_map(|arg| match arg {
+        Literal::Str(text) => Some(text.clone()),
+        _ => None,
+    })
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" | "1" | "on" | "yes" => Some(true),
+        "false" | "0" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// The deepest table nesting an argument list may use. Omarchy's
+/// deepest is two (`hl.config({ cursor = { ... } })`); the bound exists
+/// because tables are read recursively and the payload is untrusted.
+/// Length needs no bound of its own: strings are read iteratively, and
+/// the whole request is already capped at [`crate::request::MAX_REQUEST`].
+const MAX_LUA_DEPTH: usize = 16;
+
+/// One value in a Lua argument list, as far as dispatch reads Lua.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Literal {
+    /// A string literal in any of Lua's three spellings, decoded.
+    Str(String),
+    /// A number, `true`, `false`, `nil` or a name, kept as its source
+    /// text. Every caller reads these as text (an integer, a scale, a
+    /// boolean), so deciding here what a number is would be a second
+    /// place to get it wrong.
+    Word(String),
+    /// A table constructor: each field with its key, or `None` for a
+    /// positional one.
+    Table(Vec<(Option<String>, Literal)>),
+}
+
+/// Why an argument list is not made of the Lua literals dispatch reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LuaError {
+    /// The input ends inside a string or table.
+    Unterminated(&'static str),
+    /// A backslash escape Lua does not have, or a malformed one.
+    InvalidEscape(char),
+    /// Byte escapes that together are not UTF-8. Lua would accept the
+    /// bytes, but they cannot be a command line or a selector.
+    InvalidUtf8,
+    TooDeep,
+    /// The input ends where a value should be.
+    MissingValue,
+    /// Anything that is not a literal: an operator, a call, a stray
+    /// character.
+    Unexpected(char),
+}
+
+impl std::fmt::Display for LuaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LuaError::Unterminated(what) => write!(f, "unterminated {what}"),
+            LuaError::InvalidEscape(escape) => write!(f, "invalid escape \\{}", escape.escape_debug()),
+            LuaError::InvalidUtf8 => f.write_str("string escapes decode to bytes that are not UTF-8"),
+            LuaError::TooDeep => write!(f, "tables nested deeper than {MAX_LUA_DEPTH}"),
+            LuaError::MissingValue => f.write_str("a value is missing"),
+            LuaError::Unexpected(character) => write!(f, "unexpected {character:?}"),
+        }
+    }
+}
+
+/// Read a whole argument list: comma-separated literals and nothing else.
+fn lua_arguments(body: &str) -> Result<Vec<Literal>, LuaError> {
+    let mut reader = LuaReader { text: body, at: 0 };
+    let mut args = Vec::new();
+    reader.skip_space();
+    if reader.peek().is_none() {
+        return Ok(args);
+    }
+    loop {
+        args.push(reader.value(0)?);
+        reader.skip_space();
+        match reader.peek() {
+            None => return Ok(args),
+            Some(b',') => {
+                reader.at += 1;
+                reader.skip_space();
+            }
+            Some(_) => return Err(reader.unexpected()),
+        }
+    }
+}
+
+/// A cursor over an argument list. `at` only ever advances over ASCII
+/// bytes or over a whole literal, so it always sits on a character
+/// boundary; the slices below use `get` regardless, because the input
+/// is a client's.
+struct LuaReader<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> LuaReader<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.at).copied()
+    }
+
+    fn peek_after(&self, offset: usize) -> Option<u8> {
+        self.text.as_bytes().get(self.at + offset).copied()
+    }
+
+    fn skip_space(&mut self) {
+        while self.peek().is_some_and(is_lua_space) {
+            self.at += 1;
+        }
+    }
+
+    fn unexpected(&self) -> LuaError {
+        self.text.get(self.at..).and_then(|rest| rest.chars().next()).map_or(LuaError::MissingValue, LuaError::Unexpected)
+    }
+
+    /// Step over `byte`, after any whitespace, or say what is there instead.
+    fn expect(&mut self, byte: u8, within: &'static str) -> Result<(), LuaError> {
+        self.skip_space();
+        match self.peek() {
+            Some(found) if found == byte => {
+                self.at += 1;
+                self.skip_space();
+                Ok(())
+            }
+            None => Err(LuaError::Unterminated(within)),
+            Some(_) => Err(self.unexpected()),
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Literal, LuaError> {
+        match self.peek() {
+            None => Err(LuaError::MissingValue),
+            Some(b'"' | b'\'') => self.string(),
+            Some(b'[') if matches!(self.peek_after(1), Some(b'[' | b'=')) => self.string(),
+            Some(b'{') => self.table(depth + 1),
+            Some(byte) if is_word_byte(byte) => Ok(Literal::Word(self.word().to_string())),
+            Some(_) => Err(self.unexpected()),
+        }
+    }
+
+    fn string(&mut self) -> Result<Literal, LuaError> {
+        let (text, length) = string_literal(self.text.get(self.at..).unwrap_or_default())?;
+        self.at += length;
+        Ok(Literal::Str(text))
+    }
+
+    fn word(&mut self) -> &'a str {
+        let start = self.at;
+        while self.peek().is_some_and(is_word_byte) {
+            self.at += 1;
+        }
+        self.text.get(start..self.at).unwrap_or_default()
+    }
+
+    fn table(&mut self, depth: usize) -> Result<Literal, LuaError> {
+        if depth > MAX_LUA_DEPTH {
+            return Err(LuaError::TooDeep);
+        }
+        self.at += 1;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_space();
+            match self.peek() {
+                None => return Err(LuaError::Unterminated("table")),
+                Some(b'}') => {
+                    self.at += 1;
+                    return Ok(Literal::Table(fields));
+                }
+                Some(_) => {}
+            }
+            fields.push(self.field(depth)?);
+            self.skip_space();
+            match self.peek() {
+                None => return Err(LuaError::Unterminated("table")),
+                Some(b',' | b';') => self.at += 1,
+                Some(b'}') => {}
+                Some(_) => return Err(self.unexpected()),
+            }
+        }
+    }
+
+    /// One table field: `name = value`, `[key] = value`, or a positional
+    /// value.
+    fn field(&mut self, depth: usize) -> Result<(Option<String>, Literal), LuaError> {
+        if self.peek() == Some(b'[') && !matches!(self.peek_after(1), Some(b'[' | b'=')) {
+            self.at += 1;
+            self.skip_space();
+            let key = match self.value(depth)? {
+                Literal::Str(key) | Literal::Word(key) => key,
+                Literal::Table(_) => return Err(LuaError::Unexpected('}')),
+            };
+            self.expect(b']', "table")?;
+            self.expect(b'=', "table")?;
+            return Ok((Some(key), self.value(depth)?));
+        }
+        if self.peek().is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_') {
+            let start = self.at;
+            let name = self.word();
+            self.skip_space();
+            if self.peek() == Some(b'=') && self.peek_after(1) != Some(b'=') {
+                // `a.b = 1` is an assignment, not a table field.
+                if !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+                    return Err(LuaError::Unexpected('='));
+                }
+                self.at += 1;
+                self.skip_space();
+                return Ok((Some(name.to_string()), self.value(depth)?));
+            }
+            self.at = start;
+        }
+        Ok((None, self.value(depth)?))
+    }
+}
+
+fn is_lua_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// The bytes of a number, a boolean, `nil` or a name, including the sign
+/// and exponent characters of a number such as `-1.5e+3`.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'+' | b'-')
+}
+
+/// Decode one Lua string literal at the start of `src`: `"..."`, `'...'`
+/// or a long bracket, with Lua 5.4's escapes. Returns the text and the
+/// number of bytes the literal spans.
+///
+/// Lua strings are bytes, and `\xNN` and `\ddd` each name one byte, so
+/// the decoded bytes are collected first and checked as UTF-8 once at the
+/// end. Decoding escape by escape into `char`s would garble a multibyte
+/// character spelled as separate byte escapes.
+fn string_literal(src: &str) -> Result<(String, usize), LuaError> {
+    let bytes = src.as_bytes();
+    let quote = match bytes.first() {
+        Some(b'[') => return long_bracket(src),
+        Some(&quote @ (b'"' | b'\'')) => quote,
+        _ => return Err(LuaError::MissingValue),
+    };
+    let mut out = Vec::new();
+    let mut at = 1;
+    loop {
+        let Some(&byte) = bytes.get(at) else {
+            return Err(LuaError::Unterminated("string"));
+        };
+        at += 1;
+        match byte {
+            _ if byte == quote => break,
+            // Lua refuses an unescaped line break in a short string: it
+            // does not end the string, so the string never ended.
+            b'\n' | b'\r' => return Err(LuaError::Unterminated("string")),
+            b'\\' => {
+                let Some(&escape) = bytes.get(at) else {
+                    return Err(LuaError::Unterminated("string"));
+                };
+                at += 1;
+                match escape {
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'a' => out.push(0x07),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'v' => out.push(0x0b),
+                    b'\\' | b'"' | b'\'' => out.push(escape),
+                    // A backslash before a line break is one newline;
+                    // `\r\n` and `\n\r` count as one break.
+                    b'\n' | b'\r' => {
+                        if bytes.get(at).is_some_and(|&next| matches!(next, b'\n' | b'\r') && next != escape) {
+                            at += 1;
+                        }
+                        out.push(b'\n');
+                    }
+                    // `\z` skips the whitespace after it, line breaks included.
+                    b'z' => {
+                        while bytes.get(at).copied().is_some_and(is_lua_space) {
+                            at += 1;
+                        }
+                    }
+                    // Exactly two hex digits.
+                    b'x' => {
+                        let digit = |offset: usize| bytes.get(at + offset).copied().and_then(hex_digit);
+                        let (Some(high), Some(low)) = (digit(0), digit(1)) else {
+                            return Err(LuaError::InvalidEscape('x'));
+                        };
+                        out.push((high << 4) | low);
+                        at += 2;
+                    }
+                    // Up to three decimal digits, naming a byte.
+                    b'0'..=b'9' => {
+                        let mut value = u32::from(escape - b'0');
+                        for _ in 0..2 {
+                            let Some(&digit @ b'0'..=b'9') = bytes.get(at) else { break };
+                            value = value * 10 + u32::from(digit - b'0');
+                            at += 1;
+                        }
+                        let byte = u8::try_from(value).map_err(|_| LuaError::InvalidEscape(char::from(escape)))?;
+                        out.push(byte);
+                    }
+                    b'u' => {
+                        let character = unicode_escape(bytes, &mut at)?;
+                        out.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+                    }
+                    _ => {
+                        let escape = src.get(at - 1..).and_then(|rest| rest.chars().next()).unwrap_or('\\');
+                        return Err(LuaError::InvalidEscape(escape));
+                    }
+                }
+            }
+            // Every delimiter is ASCII, so the bytes of a multibyte
+            // character are copied through whole.
+            _ => out.push(byte),
+        }
+    }
+    let text = String::from_utf8(out).map_err(|_| LuaError::InvalidUtf8)?;
+    Ok((text, at))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).and_then(|digit| u8::try_from(digit).ok())
+}
+
+/// The `{XXX}` after `\u`. Lua also accepts values past Unicode, up to
+/// 2^31, and encodes them as extended UTF-8; those are not text, so any
+/// value that is not a Unicode scalar is refused.
+fn unicode_escape(bytes: &[u8], at: &mut usize) -> Result<char, LuaError> {
+    let invalid = LuaError::InvalidEscape('u');
+    if bytes.get(*at) != Some(&b'{') {
+        return Err(invalid);
+    }
+    *at += 1;
+    let mut value = 0_u32;
+    let mut digits = 0;
+    while let Some(digit) = bytes.get(*at).copied().and_then(hex_digit) {
+        value = value.checked_mul(16).and_then(|value| value.checked_add(u32::from(digit))).ok_or(invalid)?;
+        digits += 1;
+        *at += 1;
+    }
+    if digits == 0 || bytes.get(*at) != Some(&b'}') {
+        return Err(invalid);
+    }
+    *at += 1;
+    char::from_u32(value).ok_or(invalid)
+}
+
+/// A long bracket string, `[[...]]` or `[==[...]==]`, closed only by a
+/// bracket of the same level. Omarchy's screensaver launcher sends this
+/// spelling, and the level lets a command contain `]]`. Nothing is
+/// escaped inside one; as in Lua, a line break straight after the
+/// opening bracket is skipped and every line break becomes `\n`.
+fn long_bracket(src: &str) -> Result<(String, usize), LuaError> {
+    let bytes = src.as_bytes();
+    let level = bytes.iter().skip(1).take_while(|&&byte| byte == b'=').count();
+    if bytes.get(level + 1) != Some(&b'[') {
+        return Err(LuaError::Unexpected('['));
+    }
+    let open = level + 2;
+    let mut at = open;
+    let mut out = Vec::new();
+    loop {
+        let Some(&byte) = bytes.get(at) else {
+            return Err(LuaError::Unterminated("long string"));
+        };
+        match byte {
+            b']' if bytes.get(at + 1..at + 1 + level).is_some_and(|run| run.iter().all(|&byte| byte == b'='))
+                && bytes.get(at + 1 + level) == Some(&b']') =>
+            {
+                at += level + 2;
+                break;
+            }
+            b'\n' | b'\r' => {
+                let leading = at == open;
+                at += 1;
+                if bytes.get(at).is_some_and(|&next| matches!(next, b'\n' | b'\r') && next != byte) {
+                    at += 1;
+                }
+                if !leading {
+                    out.push(b'\n');
+                }
+            }
+            _ => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    let text = String::from_utf8(out).map_err(|_| LuaError::InvalidUtf8)?;
+    Ok((text, at))
+}
+
+/// Decode classic `dispatch exec` without changing its argv.
+///
+/// `hyprctl`'s wire format has no argument framing: it joins its argv
+/// with spaces and even consumes the conventional `--` before sending.
+/// Shell metacharacters and quotes therefore still mean "one shell
+/// command", while a plain word sequence is safest as direct argv.
+/// The important ambiguous case is a shell with `-c`/`-lc`: the shell
+/// has already removed the quotes around its command argument before
+/// `hyprctl` sees them, so everything after that option must be joined
+/// back into the one argument the shell was asked to evaluate.
+fn classic_exec(rest: &str) -> Outcome {
+    let command = rest.strip_prefix("--").unwrap_or(rest).trim();
+    if command.is_empty() {
+        return Outcome::Unknown("exec with no command".to_string());
+    }
+    if command.chars().any(|ch| {
+        matches!(
+            ch,
+            '\'' | '"' | '$' | '`' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{' | '}'
+        )
+    }) {
+        return Outcome::Run(Action::ExecShell(command.to_string()));
+    }
+
+    let mut argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if argv.is_empty() {
+        return Outcome::Unknown("exec with no command".to_string());
+    }
+    let shell = argv[0].rsplit('/').next().unwrap_or(&argv[0]);
+    let command_option = argv.get(1).is_some_and(|option| {
+        option.starts_with('-')
+            && option.contains('c')
+            && matches!(shell, "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "busybox")
+    });
+    if command_option && argv.len() > 3 {
+        let source = argv.drain(2..).collect::<Vec<_>>().join(" ");
+        argv.push(source);
+    }
+    Outcome::Run(Action::ExecArgv(argv))
+}
+
+/// Reject a workspace index the keyboard could not reach either.
+///
+/// `wm-core`'s `switch_workspace` grows the workspace row on demand up
+/// to its fixed ceiling, so mechanically any index below that ceiling
+/// is reachable. The question is which ones this socket *should* reach,
+/// and the answer comes from the security
+/// argument in [`crate::server`]: this socket is unauthenticated
+/// because it grants nothing the user's own keyboard already grants.
+/// That argument only holds if the two grant the same thing — so the
+/// bound here is the one chonkstep's keybindings use for their own
+/// `workspace <n>` action, and it is deliberately the same number
+/// rather than an independently-chosen one.
+///
+/// Note this is *more* permissive than chonkstep's control socket,
+/// whose `focus-workspace` is documented as "a switch, never a create"
+/// (`docs/control-socket.md` §4.2). The difference is intentional and
+/// is the whole reason this bound is written down. Omarchy's bar draws
+/// buttons for workspaces 1-5 unconditionally
+/// (`plugins/bar/widgets/Workspaces.qml`), so a rule that refused a
+/// switch to a workspace that does not exist yet would leave three of
+/// those five buttons permanently dead while the same key on the
+/// keyboard worked — which is not a compositor that Omarchy's
+/// unmodified shell runs on, and running on it is the point.
+///
+/// The ceiling itself is `hypr_dispatch::MAX_WORKSPACE`, which mirrors
+/// `wm_core::MAX_WORKSPACES` by value rather than by dependency: this
+/// crate stays free of chonkstep's own crates so that every promise it
+/// makes to somebody else's binary can be tested without booting a
+/// window manager (see the crate doc), and `wm_config::MAX_WORKSPACE`
+/// checks the shared value against the core at compile time.
+fn in_range(index: usize) -> Result<usize, String> {
+    if index < MAX_WORKSPACE {
+        return Ok(index);
+    }
+    Err(format!("chonkstep has workspaces 1 to {MAX_WORKSPACE}; {} is past the end", index + 1))
+}
+
+/// What a workspace selector named: a numbered workspace by 0-based
+/// index, or a special workspace by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceSelector {
+    Numbered(usize),
+    Special(String),
+}
+
+/// The move a resolved selector asks for.
+fn move_action(selector: WorkspaceSelector, window: Option<u64>, follow: bool) -> Action {
+    match selector {
+        WorkspaceSelector::Numbered(workspace) => Action::MoveToWorkspace { window, workspace, follow },
+        WorkspaceSelector::Special(name) => Action::MoveToSpecial { window, name, follow },
+    }
+}
+
+/// The name a special workspace selector means, checked against what
+/// the compositor will create.
+///
+/// Accepts `special`, `special:NAME`, a bare `NAME`, and nothing at all
+/// for the default special workspace. The name is untrusted socket
+/// input and is published back out through `workspaces` and the event
+/// stream, so it is bounded and printable before anything is asked to
+/// create it; and a name the session does not have yet is refused once
+/// the session holds [`MAX_SPECIAL_WORKSPACES`] of them, so a script
+/// cannot grow the table without limit.
+fn special_name(selector: &str, snapshot: &Snapshot) -> Result<String, String> {
+    let selector = selector.trim();
+    let name = selector.strip_prefix("special:").map_or(selector, str::trim);
+    let name = if name.is_empty() || name == "special" { "special" } else { name };
+    if name.len() > MAX_SPECIAL_NAME {
+        return Err(format!("a special workspace name is at most {MAX_SPECIAL_NAME} bytes"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("a special workspace name cannot contain control characters".to_string());
+    }
+    if snapshot.special_named(name).is_none() && snapshot.specials.len() >= MAX_SPECIAL_WORKSPACES {
+        return Err(format!(
+            "chonkstep has {MAX_SPECIAL_WORKSPACES} special workspaces already and will not create {name:?}"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Resolve a workspace selector to a numbered workspace's 0-based
+/// index or a special workspace's name.
+fn workspace_selector(target: &str, snapshot: &Snapshot) -> Result<WorkspaceSelector, String> {
+    let target = target.trim();
+    if target == "special" || target.starts_with("special:") {
+        return special_name(target, snapshot).map(WorkspaceSelector::Special);
+    }
+    workspace_target(target, snapshot).map(WorkspaceSelector::Numbered)
+}
+
+/// Resolve a numbered workspace selector to a 0-based chonkstep index.
+/// Special workspaces are named, not numbered, and are resolved by
+/// [`workspace_selector`]; here they are refused, as is any negative
+/// id, which is how Hyprland numbers them on the wire.
+fn workspace_target(target: &str, snapshot: &Snapshot) -> Result<usize, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("workspace with no argument".to_string());
+    }
+    // Relative selectors first. `+1`/`-1` step by index, which grows the
+    // row past its end exactly as the keyboard's `workspace-next` does;
+    // read as integers `+1` would be workspace 1 and `-1` a special
+    // workspace id. `e+1`/`e-1`, what Omarchy binds to SUPER+TAB, are
+    // "the next workspace that exists": only workspaces with windows on
+    // them, plus the current one, wrapping and never creating a new one.
+    if let Some(existing) = target.strip_prefix('e') {
+        let step = (existing.starts_with('+') || existing.starts_with('-'))
+            .then(|| existing.parse::<i64>().ok())
+            .flatten();
+        return match step {
+            Some(step) => occupied_workspace_step(step, snapshot),
+            None => Err(format!("unrecognised workspace selector {target:?}")),
+        };
+    }
+    if let Some(delta) = target.strip_prefix('+').and_then(|d| d.parse::<usize>().ok()) {
+        let current = snapshot.active_workspace().map_or(0, |w| w.index);
+        return in_range(current.saturating_add(delta));
+    }
+    if let Some(delta) = target.strip_prefix('-').and_then(|d| d.parse::<usize>().ok()) {
+        let current = snapshot.active_workspace().map_or(0, |w| w.index);
+        return in_range(current.saturating_sub(delta));
+    }
+    if target == "previous" {
+        return snapshot
+            .previous_workspace
+            .filter(|&index| Some(index) != snapshot.active_workspace().map(|w| w.index))
+            .ok_or_else(|| "no workspace before this one yet".to_string());
+    }
+    if let Ok(id) = target.parse::<i32>() {
+        let index = workspace_index_from_hypr_id(id).ok_or_else(|| format!("chonkstep has no workspace {id}"))?;
+        return in_range(index);
+    }
+    // Named selectors.
+    if target == "special" || target.starts_with("special:") {
+        return Err(format!("{target:?} names a special workspace, which this verb does not take"));
+    }
+    if let Some(name) = target.strip_prefix("name:") {
+        return Err(format!("chonkstep workspaces are numbered, not named ({name:?})"));
+    }
+    Err(format!("unrecognised workspace selector {target:?}"))
+}
+
+/// `e+N` / `e-N`: `step` workspaces along the occupied ones, plus the
+/// current, wrapping. Under separate Spaces only the focused display's
+/// row counts, which is the row the keyboard's own stepping walks. The
+/// current workspace when nothing else is occupied, so the answer is a
+/// switch to where the desktop already is rather than a refusal: the
+/// keyboard stays put in the same case.
+fn occupied_workspace_step(step: i64, snapshot: &Snapshot) -> Result<usize, String> {
+    let current = snapshot.active_workspace().map_or(0, |w| w.index);
+    let row: Vec<usize> = snapshot
+        .workspaces
+        .iter()
+        .filter(|workspace| {
+            !snapshot.separate_spaces
+                || snapshot.focused_monitor().is_none_or(|monitor| workspace.monitor == monitor.name)
+        })
+        .filter(|workspace| workspace.index == current || workspace.windows > 0)
+        .map(|workspace| workspace.index)
+        .collect();
+    let Some(at) = row.iter().position(|&index| index == current) else {
+        return in_range(current);
+    };
+    let count = row.len() as i64;
+    // Reduce before adding: a valid i64 step can overflow when the
+    // current workspace is not the first stop in the row.
+    in_range(row[(at as i64 + step.rem_euclid(count)).rem_euclid(count) as usize])
+}
+
+/// Parse a `focusmonitor` argument, refusing the whole request while the
+/// session is locked: a script must not move focus or the pointer behind
+/// the lock surface, and the host refuses again against its live lock.
+fn focus_monitor(rest: &str, snapshot: &Snapshot) -> Outcome {
+    if snapshot.locked {
+        return Outcome::Unsupported("focusmonitor is refused while the session is locked".to_string());
+    }
+    match monitor_target(rest, snapshot) {
+        Ok(target) => Outcome::Run(Action::FocusMonitor(target)),
+        Err(why) => Outcome::Unsupported(why),
+    }
+}
+
+/// Parse a `movecurrentworkspacetomonitor` argument. On the shared
+/// desktop there is no Space to move, and a fullscreen Space is bound to
+/// its window's display; both are refused by name here rather than
+/// answered `ok` and left undone. The host re-checks both at apply.
+fn move_workspace_to_monitor(rest: &str, snapshot: &Snapshot) -> Outcome {
+    if snapshot.locked {
+        return Outcome::Unsupported("movecurrentworkspacetomonitor is refused while the session is locked".to_string());
+    }
+    if !snapshot.separate_spaces {
+        return Outcome::Unsupported(format!("movecurrentworkspacetomonitor: {SHARED_DESKTOP_SPANS_DISPLAYS}"));
+    }
+    if snapshot.active_workspace().is_some_and(|workspace| workspace.has_fullscreen) {
+        return Outcome::Unsupported(
+            "movecurrentworkspacetomonitor: a fullscreen Space is bound to the display of the window it came from"
+                .to_string(),
+        );
+    }
+    match monitor_target(rest, snapshot) {
+        Ok(target) => Outcome::Run(Action::MoveWorkspaceToMonitor(target)),
+        Err(why) => Outcome::Unsupported(why),
+    }
+}
+
+/// The refusal for a workspace move on the shared desktop, spelled to
+/// match `wm_core::SHARED_DESKTOP_SPANS_DISPLAYS` without depending on it.
+const SHARED_DESKTOP_SPANS_DISPLAYS: &str =
+    "the workspace already spans every display; `interaction_mode = \"spaces\"` with \
+     `[mac] separate_spaces = true` gives each display its own row of Spaces to move";
+
+/// The longest output name a monitor selector may carry: connector names
+/// are a dozen bytes, and the input is a socket's.
+const MAX_MONITOR_NAME: usize = 256;
+
+/// Resolve a monitor selector: `+N` / `-N`, `current`, a direction, a
+/// monitor id, or a name `monitors` reports. Only the name and id are
+/// checked here, because only they can be wrong on their own; a step
+/// wraps and a direction is answered by the host's live geometry.
+fn monitor_target(rest: &str, snapshot: &Snapshot) -> Result<MonitorTarget, String> {
+    let target = rest.trim();
+    if target.is_empty() {
+        return Err("monitor selector with no argument".to_string());
+    }
+    if target.len() > MAX_MONITOR_NAME || target.chars().any(char::is_control) {
+        return Err("monitor selector is not an output name".to_string());
+    }
+    if target.eq_ignore_ascii_case("current") {
+        return Ok(MonitorTarget::Relative(0));
+    }
+    if target.starts_with('+') || target.starts_with('-') {
+        return target.parse::<i32>().map(MonitorTarget::Relative)
+            .map_err(|_| format!("invalid relative monitor selector {target:?}"));
+    }
+    match target.to_ascii_lowercase().as_str() {
+        "l" | "left" => return Ok(MonitorTarget::Direction(Direction::Left)),
+        "r" | "right" => return Ok(MonitorTarget::Direction(Direction::Right)),
+        "u" | "up" => return Ok(MonitorTarget::Direction(Direction::Up)),
+        "d" | "down" => return Ok(MonitorTarget::Direction(Direction::Down)),
+        _ => {}
+    }
+    if let Ok(id) = target.parse::<i32>() {
+        return snapshot
+            .monitors
+            .iter()
+            .find(|monitor| monitor.id == id)
+            .map(|monitor| MonitorTarget::Name(monitor.name.clone()))
+            .ok_or_else(|| format!("no output has id {id}"));
+    }
+    snapshot
+        .monitors
+        .iter()
+        .find(|monitor| monitor.name == target)
+        .map(|monitor| MonitorTarget::Name(monitor.name.clone()))
+        .ok_or_else(|| format!("no output named {target:?}"))
+}
+
+/// Resolve one of Hyprland's window selectors against the snapshot.
+///
+/// Hyprland's regex selectors (`class:^(foo)$`) are matched here as a
+/// plain substring after stripping anchors, which is a *narrowing* of
+/// what Hyprland accepts rather than a widening: a selector we cannot
+/// interpret finds no window and the caller is told so, instead of
+/// finding the wrong one.
+fn resolve_window<'a>(selector: &str, snapshot: &'a Snapshot) -> Option<&'a Window> {
+    let selector = selector.trim().trim_matches('"');
+    if selector.is_empty() || selector == "activewindow" {
+        return snapshot.focused_window();
+    }
+    let (kind, value) = selector.split_once(':')?;
+    let value = value.trim();
+    match kind {
+        "address" => {
+            let hex = value.trim_start_matches("0x");
+            let id = u64::from_str_radix(hex, 16).ok()?;
+            snapshot.windows.iter().find(|window| window.id == id)
+        }
+        "pid" => {
+            let pid = value.parse::<i32>().ok()?;
+            snapshot.windows.iter().find(|window| window.pid == pid)
+        }
+        "class" | "initialclass" => {
+            let needle = unanchor(value);
+            snapshot.windows.iter().find(|window| contains_ignore_case(&window.class, needle))
+        }
+        "title" | "initialtitle" => {
+            let needle = unanchor(value);
+            snapshot.windows.iter().find(|window| contains_ignore_case(&window.title, needle))
+        }
+        _ => None,
+    }
+}
+
+/// Strip the `^(...)$` a Hyprland selector is usually written with.
+fn unanchor(value: &str) -> &str {
+    value.trim_start_matches('^').trim_end_matches('$').trim_start_matches('(').trim_end_matches(')')
+}
+
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_window() -> Snapshot {
+        let window = Window {
+            floating: false,
+            id: 7,
+            title: "~".into(),
+            class: "foot".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            workspace: 0,
+            special: None,
+            monitor: 0,
+            pid: 0,
+            xwayland: false,
+            fullscreen: false,
+            maximized: false,
+            client_fullscreen: false,
+            hidden: false,
+            urgent: false,
+            pinned: false,
+            inhibiting_idle: false,
+            tags: Vec::new(),
+            xdg_tag: String::new(),
+            xdg_description: String::new(),
+            focus_history_id: 0,
+        };
+        Snapshot { windows: vec![window], focused: Some(7), ..Default::default() }
+    }
+
+    /// `set_prop`, in Omarchy's Lua form and the classic spelling its
+    /// transparency toggle falls back to: `opaque` is served in its
+    /// three values, and every other property is refused by name
+    /// rather than answered `ok` for nothing.
+    #[test]
+    fn set_prop_serves_opaque_and_refuses_every_other_property() {
+        let snapshot = one_window();
+        let toggle = Outcome::Run(Action::SetOpaque { window: 7, opaque: None });
+        assert_eq!(
+            parse(r#"hl.dsp.window.set_prop({ window = "address:0x7", prop = "opaque", value = "toggle" })"#, &snapshot),
+            toggle
+        );
+        assert_eq!(
+            parse(r#"hl.dsp.window.set_prop({ prop = "opaque", value = "1" })"#, &snapshot),
+            Outcome::Run(Action::SetOpaque { window: 7, opaque: Some(true) }),
+            "the focused window when none is named"
+        );
+        assert_eq!(
+            parse(r#"hl.dsp.window.set_prop({ window = "address:0x7", prop = "opaque", value = "0" })"#, &snapshot),
+            Outcome::Run(Action::SetOpaque { window: 7, opaque: Some(false) })
+        );
+        assert_eq!(parse("setprop address:0x7 opaque toggle", &snapshot), toggle);
+        assert_eq!(
+            parse("setprop address:0x7 opaque 1", &snapshot),
+            Outcome::Run(Action::SetOpaque { window: 7, opaque: Some(true) })
+        );
+        for wire in [
+            r#"hl.dsp.window.set_prop({ window = "address:0x7", prop = "rounding", value = "8" })"#,
+            r#"hl.dsp.window.set_prop({ window = "address:0x7", prop = "alpha", value = "0.5" })"#,
+            "setprop address:0x7 rounding 8",
+            "setprop address:0x7 alpha 0.5",
+        ] {
+            match parse(wire, &snapshot) {
+                Outcome::Unsupported(why) => assert!(why.contains("not modeled"), "{wire}: {why}"),
+                other => panic!("{wire} must be refused, not {other:?}"),
+            }
+        }
+        for wire in [
+            r#"hl.dsp.window.set_prop({ window = "address:0x7", prop = "opaque", value = "maybe" })"#,
+            "setprop address:0x7 opaque half",
+        ] {
+            assert!(matches!(parse(wire, &snapshot), Outcome::Unsupported(_)), "{wire}");
+        }
+        assert!(
+            matches!(parse("setprop address:0x9 opaque toggle", &snapshot), Outcome::Unsupported(_)),
+            "an unknown window is refused"
+        );
+        // A value a client could not have chosen: the property never
+        // reads anything but the words above, so no number reaches
+        // the compositor from here.
+        assert!(matches!(parse("setprop address:0x7 opaque 0.5", &snapshot), Outcome::Unsupported(_)));
+    }
+
+    /// The verb split has the same shape as the request split, so it
+    /// had the same panic: a multibyte space after the verb put the
+    /// argument slice inside the character.
+    #[test]
+    fn non_ascii_whitespace_after_the_verb_splits_without_panicking() {
+        assert_eq!(split_verb("exec\u{a0}foot"), ("exec".to_string(), "foot"));
+        assert_eq!(
+            parse("exec\u{a0}foot", &Snapshot::default()),
+            Outcome::Run(Action::ExecArgv(vec!["foot".to_string()]))
+        );
+    }
+
+    fn decode(literal: &str) -> Result<String, LuaError> {
+        string_literal(literal).map(|(text, _)| text)
+    }
+
+    #[test]
+    fn lua_short_strings_decode_every_escape_form() {
+        assert_eq!(decode(r#""\n\t\r\a\b\f\v""#), Ok("\n\t\r\u{7}\u{8}\u{c}\u{b}".into()));
+        assert_eq!(decode(r#""\\ \" \'""#), Ok(r#"\ " '"#.into()));
+        assert_eq!(decode(r#"'it\'s "quoted"'"#), Ok(r#"it's "quoted""#.into()));
+        // A backslash before a line break is one newline, whichever
+        // break it is; two breaks of the same kind are two lines.
+        for newline in ["\n", "\r", "\r\n", "\n\r"] {
+            assert_eq!(decode(&format!("\"a\\{newline}b\"")), Ok("a\nb".into()), "{newline:?}");
+        }
+        assert_eq!(decode("\"a\\\n\nb\""), Err(LuaError::Unterminated("string")));
+        assert_eq!(decode("\"one \\z\n\t\u{b}  two\""), Ok("one two".into()));
+        assert_eq!(decode(r#""\x41\x6a""#), Ok("Aj".into()));
+        // At most three digits: `\0067` is byte 6 and then a `7`.
+        assert_eq!(decode(r#""\65\066\0067""#), Ok("AB\u{6}7".into()));
+        assert_eq!(decode(r#""\u{48}\u{1F600}\u{000041}""#), Ok("H\u{1F600}A".into()));
+        // Byte escapes form one character between them.
+        assert_eq!(decode(r#""\228\189\160\xe4\xbd\xa0""#), Ok("你你".into()));
+        assert_eq!(decode("\"日本\""), Ok("日本".into()));
+        // The length ends at the closing quote, not at the end of input.
+        assert_eq!(string_literal(r#""a\"b" , rest"#), Ok((r#"a"b"#.into(), 6)));
+    }
+
+    #[test]
+    fn lua_strings_lua_itself_would_reject_are_errors() {
+        assert_eq!(decode(r#""\q""#), Err(LuaError::InvalidEscape('q')));
+        assert_eq!(decode(r#""\x4""#), Err(LuaError::InvalidEscape('x')));
+        assert_eq!(decode(r#""\256""#), Err(LuaError::InvalidEscape('2')));
+        assert_eq!(decode(r#""\u{}""#), Err(LuaError::InvalidEscape('u')));
+        assert_eq!(decode(r#""\u48""#), Err(LuaError::InvalidEscape('u')));
+        assert_eq!(decode(r#""\u{D800}""#), Err(LuaError::InvalidEscape('u')));
+        assert_eq!(decode(r#""\u{FFFFFFFFF}""#), Err(LuaError::InvalidEscape('u')));
+        assert_eq!(decode(r#""\xff""#), Err(LuaError::InvalidUtf8));
+        assert_eq!(decode(r#""\228\189""#), Err(LuaError::InvalidUtf8));
+        assert_eq!(decode("\"no end"), Err(LuaError::Unterminated("string")));
+        assert_eq!(decode("\"ends in a backslash\\"), Err(LuaError::Unterminated("string")));
+        assert_eq!(decode("'line\nbreak'"), Err(LuaError::Unterminated("string")));
+        assert_eq!(decode("[==[mismatched]=]"), Err(LuaError::Unterminated("long string")));
+    }
+
+    #[test]
+    fn lua_long_brackets_match_their_level_and_read_no_escapes() {
+        assert_eq!(decode("[[x]]"), Ok("x".into()));
+        assert_eq!(decode("[==[x]]y]=]z]==]"), Ok("x]]y]=]z".into()));
+        assert_eq!(decode(r"[[\n is not an escape]]"), Ok(r"\n is not an escape".into()));
+        // The break straight after the opening bracket is not part of
+        // the string; later ones are, each as `\n`.
+        assert_eq!(decode("[[\r\nfirst\r\nsecond\n]]"), Ok("first\nsecond\n".into()));
+        assert_eq!(string_literal("[=[a]=], rest"), Ok(("a".into(), 7)));
+    }
+
+    #[test]
+    fn lua_argument_lists_read_tables_by_key_and_position() {
+        let args = lua_arguments(r#"{ window = "address:0x5", x = -25, relative = true; ["y"] = 1.5e+3, 'loose' }, "second""#);
+        assert_eq!(
+            args,
+            Ok(vec![
+                Literal::Table(vec![
+                    (Some("window".into()), Literal::Str("address:0x5".into())),
+                    (Some("x".into()), Literal::Word("-25".into())),
+                    (Some("relative".into()), Literal::Word("true".into())),
+                    (Some("y".into()), Literal::Word("1.5e+3".into())),
+                    (None, Literal::Str("loose".into())),
+                ]),
+                Literal::Str("second".into()),
+            ])
+        );
+        let args = args.unwrap_or_default();
+        assert_eq!(lua_field(&args, "x").as_deref(), Some("-25"));
+        assert_eq!(lua_string(&args).as_deref(), Some("second"));
+        assert_eq!(lua_arguments("  "), Ok(Vec::new()));
+
+        // Only a table's own keys are fields.
+        let args = lua_arguments(r#"{ cursor = { invisible = true } }, "workspace = 3""#).unwrap_or_default();
+        assert_eq!(lua_field(&args, "invisible"), None);
+        assert_eq!(lua_field(&args, "workspace"), None);
+        assert!(matches!(lua_value(&args, "cursor"), Some(Literal::Table(_))));
+    }
+
+    #[test]
+    fn lua_argument_lists_refuse_what_is_not_a_literal() {
+        assert_eq!(lua_arguments(r#""a" .. "b""#), Err(LuaError::Unexpected('.')));
+        assert_eq!(lua_arguments("{ workspace = "), Err(LuaError::MissingValue));
+        assert_eq!(lua_arguments("{ workspace = 1"), Err(LuaError::Unterminated("table")));
+        assert_eq!(lua_arguments(r#""a","#), Err(LuaError::MissingValue));
+        assert_eq!(lua_arguments("{ a.b = 1 }"), Err(LuaError::Unexpected('=')));
+        assert_eq!(lua_arguments("{ [\"k\" = 1 }"), Err(LuaError::Unexpected('=')));
+        assert_eq!(lua_arguments("os.exit()"), Err(LuaError::Unexpected('(')));
+    }
+
+    #[test]
+    fn lua_table_nesting_is_bounded() {
+        let nested = |depth: usize| format!("{}{}", "{".repeat(depth), "}".repeat(depth));
+        assert!(lua_arguments(&nested(MAX_LUA_DEPTH)).is_ok());
+        assert_eq!(lua_arguments(&nested(MAX_LUA_DEPTH + 1)), Err(LuaError::TooDeep));
+        // A request-sized run of openers stops at the bound rather than
+        // recursing once per brace.
+        assert_eq!(lua_arguments(&"{".repeat(crate::request::MAX_REQUEST)), Err(LuaError::TooDeep));
+    }
+}

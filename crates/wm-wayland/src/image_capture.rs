@@ -1,0 +1,780 @@
+//! ext-image-copy-capture-v1 and its output/toplevel source factories.
+//!
+//! The protocol is deliberately shm-first: the four 32-bit formats the
+//! existing screencopy writer already understands are advertised, while
+//! dmabuf is omitted until the compositor can prove a zero-copy path. Both
+//! outputs and toplevels use the same GLES readback and shm conversion as
+//! `zwlr_screencopy_v1`; the long-lived session adds constraint updates and
+//! source lifetime tracking around that pixel path.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use smithay::output::Output;
+use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::server::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::{
+        self, ExtForeignToplevelImageCaptureSourceManagerV1,
+    },
+    ext_image_capture_source_v1::{self, ExtImageCaptureSourceV1},
+    ext_output_image_capture_source_manager_v1::{self, ExtOutputImageCaptureSourceManagerV1},
+};
+use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::{
+    ext_image_copy_capture_cursor_session_v1::{self, ExtImageCopyCaptureCursorSessionV1},
+    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1, FailureReason},
+    ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1},
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
+};
+use smithay::reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_output, wl_shm};
+use smithay::reexports::wayland_server::{
+    backend::ClientId, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
+    WEnum,
+};
+use smithay::utils::{Clock, Monotonic, Transform};
+use smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle;
+
+use wm_theme_api::{Rect, Size};
+
+use crate::state::{Compositor, WlWindowId};
+
+const VERSION: u32 = 1;
+const MAX_SESSIONS: usize = 256;
+const MAX_PENDING: usize = 256;
+const MAX_EXAMINED: usize = 32;
+const MAX_FRAMES: usize = 4;
+const MAX_PIXELS: u64 = 4 * 1024 * 1024;
+const SERVICE_TIME: Duration = Duration::from_millis(2);
+const SERVICE_PAUSE: Duration = Duration::from_millis(4);
+
+/// Bound each batch, including abandoned or invalid requests. A single
+/// readback cannot be preempted; the first valid frame may exceed the pixel
+/// allowance so large outputs still make progress.
+struct ServiceBudget {
+    started: Instant,
+    examined: usize,
+    frames: usize,
+    pixels: u64,
+}
+
+impl ServiceBudget {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            examined: 0,
+            frames: 0,
+            pixels: 0,
+        }
+    }
+
+    fn examine(&mut self, now: Instant) -> bool {
+        if self.examined == MAX_EXAMINED
+            || self.frames == MAX_FRAMES
+            || (self.examined > 0 && now.duration_since(self.started) >= SERVICE_TIME)
+        {
+            return false;
+        }
+        self.examined += 1;
+        true
+    }
+
+    fn reserve_frame(&mut self, pixels: u64) -> bool {
+        if self.frames > 0 && self.pixels.saturating_add(pixels) > MAX_PIXELS {
+            return false;
+        }
+        self.frames += 1;
+        self.pixels = self.pixels.saturating_add(pixels);
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CaptureTarget {
+    Output(String),
+    Toplevel(WlWindowId),
+}
+
+#[derive(Clone)]
+struct CaptureSourceData(Option<CaptureTarget>);
+
+struct SessionShared {
+    target: Option<CaptureTarget>,
+    paint_cursors: bool,
+    include_overlays: bool,
+    latest_constraints: Mutex<Option<Constraints>>,
+    frame_live: AtomicBool,
+    stopped: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Constraints {
+    size: Size,
+    /// Re-advertise even where the pixel dimensions happen to stay the
+    /// same: scale changes alter the source-to-buffer relationship.
+    scale_bits: u64,
+}
+
+struct SessionInstance {
+    resource: ExtImageCopyCaptureSessionV1,
+    shared: Arc<SessionShared>,
+}
+
+struct FrameState {
+    buffer: Option<WlBuffer>,
+    captured: bool,
+}
+
+struct FrameData {
+    shared: Arc<SessionShared>,
+    state: Mutex<FrameState>,
+}
+
+struct PendingCapture {
+    frame: ExtImageCopyCaptureFrameV1,
+    buffer: WlBuffer,
+    shared: Arc<SessionShared>,
+}
+
+struct CursorSessionData {
+    capture_session_created: AtomicBool,
+}
+
+struct Download {
+    consumer: Option<PendingCapture>,
+    image: crate::capture::PendingImage,
+    constraints: Constraints,
+    locked: bool,
+    stamp: Duration,
+}
+
+pub(crate) struct ImageCapture {
+    sessions: Vec<SessionInstance>,
+    captures: VecDeque<PendingCapture>,
+    download: Option<Download>,
+    service_after: Instant,
+}
+
+impl ImageCapture {
+    fn deadline(&self) -> Option<Instant> {
+        (!self.captures.is_empty() || self.download.is_some()).then_some(self.service_after)
+    }
+}
+
+pub(crate) fn deadline(comp: &Compositor) -> Option<Instant> {
+    comp.image_capture.deadline()
+}
+
+pub(crate) fn init(display: &DisplayHandle) -> ImageCapture {
+    let _copy = display.create_global::<Compositor, ExtImageCopyCaptureManagerV1, ()>(VERSION, ());
+    let _output =
+        display.create_global::<Compositor, ExtOutputImageCaptureSourceManagerV1, ()>(VERSION, ());
+    let _toplevel = display
+        .create_global::<Compositor, ExtForeignToplevelImageCaptureSourceManagerV1, ()>(
+            VERSION,
+            (),
+        );
+    tracing::info!(
+        version = VERSION,
+        "ext image-copy-capture and source managers advertised"
+    );
+    ImageCapture {
+        sessions: Vec::new(),
+        captures: VecDeque::new(),
+        download: None,
+        service_after: Instant::now(),
+    }
+}
+
+/// Re-advertises constraints after resize/modeset, stops dead targets,
+/// then answers capture requests parked during protocol dispatch.
+pub(crate) fn refresh(comp: &mut Compositor) {
+    comp.image_capture
+        .sessions
+        .retain(|session| session.resource.is_alive());
+    for session in &comp.image_capture.sessions {
+        update_constraints(comp, &session.resource, &session.shared);
+    }
+
+    let started = Instant::now();
+    if comp.image_capture.deadline().is_none() || started < comp.image_capture.service_after { return; }
+    if let Some(mut download) = comp.image_capture.download.take() {
+        let failure = download.consumer.as_ref().and_then(|capture| {
+            validate_capture(comp, capture).err().or_else(|| {
+                if download.image.pixels.expired(started) || download.locked != comp.wm.backend().locked {
+                    Some(FailureReason::Unknown)
+                } else if target_constraints(comp, capture.shared.target.as_ref()) != Some(download.constraints) {
+                    Some(FailureReason::BufferConstraints)
+                } else { None }
+            })
+        });
+        if let Some(reason) = failure {
+            if let Some(capture) = download.consumer.take().filter(|capture| capture.frame.is_alive()) {
+                capture.frame.failed(reason);
+            }
+        }
+        if !download.image.pixels.ready() {
+            // A timed-out or destroyed consumer frees no GPU staging slot until
+            // its fence retires. This bounds memory even if the device hangs.
+            if download.image.pixels.expired(started) {
+                for capture in comp.image_capture.captures.drain(..) {
+                    if capture.frame.is_alive() { capture.frame.failed(FailureReason::Unknown); }
+                }
+            }
+            comp.image_capture.service_after = started + if download.consumer.is_some() { SERVICE_PAUSE } else { Duration::from_millis(100) };
+            comp.image_capture.download = Some(download);
+            return;
+        }
+        download.image.pixels.release_scene();
+        if let Some(capture) = download.consumer {
+            let renderer = crate::capture::graphics_renderer(&mut comp.graphics);
+            let size = download.image.size;
+            let result = download.image.pixels.with_pixels(renderer, |pixels| {
+                crate::protocols::write_capture_bytes(&capture.buffer, size, pixels)
+            }).and_then(|result| result);
+            match result {
+                Ok(()) => {
+                    capture.frame.transform(wl_output::Transform::Normal);
+                    capture.frame.damage(0, 0, size.w as i32, size.h as i32);
+                    let stamp = download.stamp;
+                    capture.frame.presentation_time((stamp.as_secs() >> 32) as u32, stamp.as_secs() as u32, stamp.subsec_nanos());
+                    capture.frame.ready();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ext image-copy-capture could not write the client buffer");
+                    capture.frame.failed(FailureReason::Unknown);
+                }
+            }
+        }
+    }
+    let mut budget = ServiceBudget::new(started);
+    while budget.examine(Instant::now()) {
+        let Some(capture) = comp.image_capture.captures.pop_front() else { break; };
+        let constraints = match validate_capture(comp, &capture) {
+            Ok(constraints) => constraints,
+            Err(reason) => {
+                if capture.frame.is_alive() { capture.frame.failed(reason); }
+                continue;
+            }
+        };
+        if !budget.reserve_frame(constraints.size.w as u64 * constraints.size.h as u64) {
+            comp.image_capture.captures.push_front(capture);
+            break;
+        }
+        let image = match capture.shared.target.as_ref() {
+            Some(CaptureTarget::Output(name)) => {
+                let region = comp.outputs.iter().find(|entry| entry.output.name() == *name)
+                    .map(|entry| Rect::new(entry.position, entry.size));
+                region.and_then(|region| crate::protocols::capture_region(
+                    comp, region, Transform::Normal, capture.shared.paint_cursors, capture.shared.include_overlays,
+                ).map_err(|error| tracing::warn!(%error, "ext image-copy-capture could not capture the output")).ok())
+            }
+            Some(CaptureTarget::Toplevel(window)) => crate::capture::capture_window_full(comp, *window, capture.shared.paint_cursors),
+            None => None,
+        };
+        let Some(image) = image else { capture.frame.failed(FailureReason::Unknown); continue; };
+        comp.image_capture.download = Some(Download {
+            consumer: Some(capture), image, constraints, locked: comp.wm.backend().locked,
+            stamp: Duration::from(Clock::<Monotonic>::new().now()),
+        });
+        break;
+    }
+    comp.image_capture.service_after = Instant::now() + SERVICE_PAUSE;
+}
+
+fn validate_capture(comp: &Compositor, capture: &PendingCapture) -> Result<Constraints, FailureReason> {
+    if !capture.frame.is_alive() || !capture.buffer.is_alive() { return Err(FailureReason::Unknown); }
+    if capture.shared.stopped.load(Ordering::Relaxed) { return Err(FailureReason::Stopped); }
+    let Some(constraints) = target_constraints(comp, capture.shared.target.as_ref()) else {
+        stop_session(&capture.shared, None);
+        return Err(FailureReason::Stopped);
+    };
+    if capture.shared.latest_constraints.lock().unwrap().as_ref() != Some(&constraints) {
+        return Err(FailureReason::BufferConstraints);
+    }
+    // Output capture sees the lock scene. Toplevel capture must never bypass it.
+    if matches!(capture.shared.target, Some(CaptureTarget::Toplevel(_))) && comp.wm.backend().locked {
+        return Err(FailureReason::Unknown);
+    }
+    Ok(constraints)
+}
+
+fn target_constraints(comp: &Compositor, target: Option<&CaptureTarget>) -> Option<Constraints> {
+    match target? {
+        CaptureTarget::Output(name) => comp
+            .outputs
+            .iter()
+            .find(|entry| entry.output.name() == *name)
+            .filter(|entry| entry.size.w > 0 && entry.size.h > 0)
+            .map(|entry| Constraints {
+                size: entry.size,
+                scale_bits: entry.scale.to_bits(),
+            }),
+        CaptureTarget::Toplevel(window) => {
+            let backend = comp.wm.backend();
+            let record = backend
+                .windows
+                .get(window)
+                .filter(|record| record.mapped && record.surface.alive())?;
+            (record.content.size.w > 0 && record.content.size.h > 0).then(|| Constraints {
+                size: record.content.size,
+                scale_bits: backend.window_surface_scale(record).to_bits(),
+            })
+        }
+    }
+}
+
+fn update_constraints(
+    comp: &Compositor,
+    resource: &ExtImageCopyCaptureSessionV1,
+    shared: &Arc<SessionShared>,
+) {
+    if shared.stopped.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(constraints) = target_constraints(comp, shared.target.as_ref()) else {
+        stop_session(shared, Some(resource));
+        return;
+    };
+    let mut latest = shared.latest_constraints.lock().unwrap();
+    if latest.as_ref() == Some(&constraints) {
+        return;
+    }
+    *latest = Some(constraints);
+    drop(latest);
+    for format in [
+        wl_shm::Format::Argb8888,
+        wl_shm::Format::Xrgb8888,
+        wl_shm::Format::Abgr8888,
+        wl_shm::Format::Xbgr8888,
+    ] {
+        resource.shm_format(format);
+    }
+    resource.buffer_size(constraints.size.w, constraints.size.h);
+    resource.done();
+}
+
+fn stop_session(shared: &Arc<SessionShared>, resource: Option<&ExtImageCopyCaptureSessionV1>) {
+    if !shared.stopped.swap(true, Ordering::Relaxed) {
+        if let Some(resource) = resource {
+            resource.stopped();
+        }
+    }
+}
+
+fn create_session(
+    state: &mut Compositor,
+    data_init: &mut DataInit<'_, Compositor>,
+    id: New<ExtImageCopyCaptureSessionV1>,
+    target: Option<CaptureTarget>,
+    paint_cursors: bool,
+    include_overlays: bool,
+) {
+    let shared = Arc::new(SessionShared {
+        target,
+        paint_cursors,
+        include_overlays,
+        latest_constraints: Mutex::new(None),
+        frame_live: AtomicBool::new(false),
+        stopped: AtomicBool::new(false),
+    });
+    let resource = data_init.init(id, Arc::clone(&shared));
+    state
+        .image_capture
+        .sessions
+        .retain(|session| session.resource.is_alive());
+    if state.image_capture.sessions.len() >= MAX_SESSIONS {
+        stop_session(&shared, Some(&resource));
+        return;
+    }
+    state
+        .image_capture
+        .sessions
+        .push(SessionInstance { resource, shared });
+}
+
+impl GlobalDispatch<ExtOutputImageCaptureSourceManagerV1, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<ExtOutputImageCaptureSourceManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, _global_data: &()) -> bool {
+        crate::state::privileged_global_visible(&client)
+    }
+}
+
+impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for Compositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &ExtOutputImageCaptureSourceManagerV1,
+        request: ext_output_image_capture_source_manager_v1::Request,
+        _data: &(),
+        _handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            ext_output_image_capture_source_manager_v1::Request::CreateSource {
+                source,
+                output,
+            } => {
+                let target = Output::from_resource(&output)
+                    .map(|output| CaptureTarget::Output(output.name()));
+                data_init.init(source, CaptureSourceData(target));
+            }
+            ext_output_image_capture_source_manager_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl GlobalDispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<ExtForeignToplevelImageCaptureSourceManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, _global_data: &()) -> bool {
+        crate::state::privileged_global_visible(&client)
+    }
+}
+
+impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for Compositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &ExtForeignToplevelImageCaptureSourceManagerV1,
+        request: ext_foreign_toplevel_image_capture_source_manager_v1::Request,
+        _data: &(),
+        _handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            ext_foreign_toplevel_image_capture_source_manager_v1::Request::CreateSource {
+                source,
+                toplevel_handle,
+            } => {
+                let target = ForeignToplevelHandle::from_resource(&toplevel_handle)
+                    .and_then(|handle| handle.user_data().get::<WlWindowId>().copied())
+                    .map(CaptureTarget::Toplevel);
+                data_init.init(source, CaptureSourceData(target));
+            }
+            ext_foreign_toplevel_image_capture_source_manager_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCaptureSourceV1, CaptureSourceData> for Compositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &ExtImageCaptureSourceV1,
+        request: ext_image_capture_source_v1::Request,
+        _data: &CaptureSourceData,
+        _handle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        let _ = request;
+    }
+}
+
+impl GlobalDispatch<ExtImageCopyCaptureManagerV1, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<ExtImageCopyCaptureManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, _global_data: &()) -> bool {
+        crate::state::privileged_global_visible(&client)
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &ExtImageCopyCaptureManagerV1,
+        request: ext_image_copy_capture_manager_v1::Request,
+        _data: &(),
+        _handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            ext_image_copy_capture_manager_v1::Request::CreateSession {
+                session,
+                source,
+                options,
+            } => {
+                let (paint_cursors, valid) = match options {
+                    WEnum::Value(options) => (
+                        options.contains(ext_image_copy_capture_manager_v1::Options::PaintCursors),
+                        true,
+                    ),
+                    WEnum::Unknown(_) => (false, false),
+                };
+                let target = source
+                    .data::<CaptureSourceData>()
+                    .and_then(|data| data.0.clone());
+                create_session(state, data_init, session, target, paint_cursors, crate::state::client_captures_overlays(client));
+                if !valid {
+                    resource.post_error(
+                        ext_image_copy_capture_manager_v1::Error::InvalidOption,
+                        "unknown image-copy-capture option",
+                    );
+                }
+            }
+            ext_image_copy_capture_manager_v1::Request::CreatePointerCursorSession {
+                session,
+                ..
+            } => {
+                data_init.init(
+                    session,
+                    CursorSessionData {
+                        capture_session_created: AtomicBool::new(false),
+                    },
+                );
+            }
+            ext_image_copy_capture_manager_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, Arc<SessionShared>> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &ExtImageCopyCaptureSessionV1,
+        request: ext_image_copy_capture_session_v1::Request,
+        data: &Arc<SessionShared>,
+        _handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            ext_image_copy_capture_session_v1::Request::CreateFrame { frame } => {
+                if data.frame_live.swap(true, Ordering::Relaxed) {
+                    resource.post_error(
+                        ext_image_copy_capture_session_v1::Error::DuplicateFrame,
+                        "the previous capture frame is still alive",
+                    );
+                    return;
+                }
+                data_init.init(
+                    frame,
+                    FrameData {
+                        shared: Arc::clone(data),
+                        state: Mutex::new(FrameState {
+                            buffer: None,
+                            captured: false,
+                        }),
+                    },
+                );
+            }
+            ext_image_copy_capture_session_v1::Request::Destroy => {
+                state
+                    .image_capture
+                    .sessions
+                    .retain(|session| &session.resource != resource);
+            }
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        resource: &ExtImageCopyCaptureSessionV1,
+        _data: &Arc<SessionShared>,
+    ) {
+        state
+            .image_capture
+            .sessions
+            .retain(|session| &session.resource != resource);
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, FrameData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &ExtImageCopyCaptureFrameV1,
+        request: ext_image_copy_capture_frame_v1::Request,
+        data: &FrameData,
+        _handle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        let mut frame = data.state.lock().unwrap();
+        match request {
+            ext_image_copy_capture_frame_v1::Request::Destroy => {
+                // The bounded service loop consumes this dead queue entry.
+                // Avoid scanning the queue once per frame destruction.
+                data.shared.frame_live.store(false, Ordering::Relaxed);
+            }
+            ext_image_copy_capture_frame_v1::Request::AttachBuffer { buffer } => {
+                if frame.captured {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::AlreadyCaptured,
+                        "capture has already been requested for this frame",
+                    );
+                } else {
+                    frame.buffer = Some(buffer);
+                }
+            }
+            ext_image_copy_capture_frame_v1::Request::DamageBuffer {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if frame.captured {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::AlreadyCaptured,
+                        "capture has already been requested for this frame",
+                    );
+                } else if x < 0 || y < 0 || width <= 0 || height <= 0 {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::InvalidBufferDamage,
+                        "buffer damage must have non-negative origin and positive size",
+                    );
+                }
+                // Full-frame readback is intentional, so valid client damage
+                // is accepted but needs no retained region.
+            }
+            ext_image_copy_capture_frame_v1::Request::Capture => {
+                if frame.captured {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::AlreadyCaptured,
+                        "capture has already been requested for this frame",
+                    );
+                    return;
+                }
+                let Some(buffer) = frame.buffer.clone() else {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::NoBuffer,
+                        "capture requires an attached buffer",
+                    );
+                    return;
+                };
+                frame.captured = true;
+                if state.image_capture.captures.len() >= MAX_PENDING {
+                    resource.failed(FailureReason::Unknown);
+                    return;
+                }
+                state.image_capture.captures.push_back(PendingCapture {
+                    frame: resource.clone(),
+                    buffer,
+                    shared: Arc::clone(&data.shared),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        _state: &mut Self,
+        _client: ClientId,
+        _resource: &ExtImageCopyCaptureFrameV1,
+        data: &FrameData,
+    ) {
+        data.shared.frame_live.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureCursorSessionV1, CursorSessionData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &ExtImageCopyCaptureCursorSessionV1,
+        request: ext_image_copy_capture_cursor_session_v1::Request,
+        data: &CursorSessionData,
+        _handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            ext_image_copy_capture_cursor_session_v1::Request::GetCaptureSession { session } => {
+                if data.capture_session_created.swap(true, Ordering::Relaxed) {
+                    resource.post_error(
+                        ext_image_copy_capture_cursor_session_v1::Error::DuplicateSession,
+                        "cursor capture session already created",
+                    );
+                    return;
+                }
+                // Separate cursor-image streams are optional. Create an
+                // immediately stopped base session so clients get a complete
+                // lifecycle instead of an uninitialised object.
+                create_session(state, data_init, session, None, false, false);
+            }
+            ext_image_copy_capture_cursor_session_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_batches_bound_invalid_entries_frames_pixels_and_time() {
+        let now = Instant::now();
+        let mut invalid = ServiceBudget::new(now);
+        for _ in 0..MAX_EXAMINED {
+            assert!(invalid.examine(now));
+        }
+        assert!(!invalid.examine(now), "dead requests must also yield");
+
+        let mut small = ServiceBudget::new(now);
+        for _ in 0..MAX_FRAMES {
+            assert!(small.examine(now));
+            assert!(small.reserve_frame(1));
+        }
+        assert!(
+            !small.examine(now),
+            "tiny requests cannot evade the frame limit"
+        );
+
+        let mut pixels = ServiceBudget::new(now);
+        assert!(pixels.examine(now));
+        assert!(pixels.reserve_frame(MAX_PIXELS));
+        assert!(!pixels.reserve_frame(1));
+
+        let mut slow = ServiceBudget::new(now);
+        assert!(slow.examine(now));
+        assert!(!slow.examine(now + SERVICE_TIME));
+    }
+
+    #[test]
+    fn an_oversized_first_capture_progresses_and_idle_cooldown_never_wakes() {
+        let now = Instant::now();
+        let mut budget = ServiceBudget::new(now);
+        assert!(budget.examine(now));
+        assert!(budget.reserve_frame(MAX_PIXELS * 4));
+        assert!(!budget.reserve_frame(1));
+        let capture = ImageCapture {
+            sessions: Vec::new(),
+            captures: VecDeque::new(),
+            download: None,
+            service_after: now + SERVICE_PAUSE,
+        };
+        assert_eq!(capture.deadline(), None);
+    }
+}

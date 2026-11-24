@@ -1,0 +1,14 @@
+/target
+
+# Agent worktrees and scratch state the Claude Code harness creates in
+# the checkout. Never part of the project.
+/.claude/worktrees/
+__pycache__/
+*.pyc
+
+# The out-of-workspace reproducer builds into its own target directory.
+/examples/layer-role-repro/target/
+/examples/chonk-agents/hook-helper/target/
+/examples/chonk-agents/bin/
+/examples/chonk-agents/adapters/node_modules/
+/dist

@@ -1,0 +1,94 @@
+# The end-to-end harness. Not shipped, not depended on by anything:
+# this crate exists so the regressions the fake-backend unit tests
+# cannot see — real input routing, the real renderer — have somewhere
+# to be asserted. See src/lib.rs for the whole story.
+#
+# The shared scripts/check.sh gate covers this crate with strict Clippy.
+[package]
+name = "chonk-testkit"
+description = "End-to-end test harness: boots a nested compositor, injects input, screenshots, asserts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+gpu-probe = ["dep:wayland-egl", "wayland-client/system"]
+
+[dependencies]
+wm-theme-api = { path = "../wm-theme-api" }
+# PNG decode for screenshot assertions — already in the workspace's
+# dependency graph (winit pulls it), so this adds no new code to vet.
+png = "0.17"
+tempfile = "3"
+# The instrument-panel e2e drives a real dockapp against the nested
+# shell: `src/bin/chonk-panel-probe.rs` is that dockapp, speaking the
+# wire protocol directly through the reference crate rather than
+# through an SDK — the probe is scripted test apparatus, and the fewer
+# layers between the test and the bytes, the more the test says.
+# The layer-shell e2e drives a real bar against the nested shell the
+# same way: `src/bin/chonk-fake-bar.rs` is a wlr-layer-shell client
+# that claims an edge and holds it. Both crates are already in the
+# graph on the server side (smithay's winit backend speaks
+# `wayland-client`; `wm-wayland` implements the wlr protocols), so the
+# client half adds no new code to vet — only the `client` feature.
+wayland-client = "0.31"
+wayland-egl = { version = "0.32", optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# The fullscreen e2e drives a client that asks for states and reports
+# what it was told back: `src/bin/chonk-fullscreen-probe.rs` is an
+# xdg-shell toplevel with a browser's memory of its own requests, and
+# xdg-shell's client half lives in this same crate (the `client`
+# feature below, already taken for the locker).
+#
+# The session-lock e2e drives a locker that is ALSO a layer client —
+# the shape Quickshell takes under Omarchy, and the shape that found
+# the unlock-teardown kill: `src/bin/chonk-lock-probe.rs` holds a bar
+# and the session lock on one connection. ext-session-lock's client
+# half lives in the staging half of the core protocol crate, which the
+# server side (smithay) already pulls; only the `client`+`staging`
+# features are new.
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+# input-method-v2 is intentionally still a misc protocol. The popup
+# ledger abuse probe binds its generated client API directly.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# Client code for chonkstep's two vendored Hyprland protocols is
+# generated from the exact XML the compositor builds against. Keeping
+# the probe and server on one source makes a protocol drift a compile
+# failure instead of a mysterious wire failure.
+wayland-scanner = "0.31"
+# The menu e2e tests aim their clicks with the same pure layout math
+# the shell renders and hit-tests through — asserting against the real
+# geometry instead of hand-tuned magic coordinates that break the day
+# a pad changes. `MenuMetrics` lives in the library so every test
+# shares one copy of that arithmetic, which is why the theme crate is
+# a dependency of the harness itself and not only of its tests.
+wm-theme = { path = "../wm-theme" }
+# The autostart probe is an independent X11 executable; the EWMH and
+# input tests also use this same client library. Already in the workspace.
+x11rb = "0.13"
+# Deadline-bounded writes to the nonblocking FDs the selection protocol lends
+# test clients. Already in the workspace; no unsafe descriptor manipulation.
+rustix = { version = "1.1", features = ["event", "fs", "net"] }
+
+[dev-dependencies]
+chonk-test-support = { path = "../chonk-test-support" }
+# Observe the real browser's DOM via its private loopback DevTools socket.
+# Input still enters through the compositor; no CDP input injection. Reuse a
+# maintained WebSocket client instead of implementing framing in the harness.
+# No TLS or compositor/shipping dependency is added.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The Hyprland IPC connection-storm e2e uses the server's public caps
+# as the contract it drives past; sharing the names keeps the live
+# assertion in lockstep with the documented limit.
+chonk-hyprland-ipc = { path = "../chonk-hyprland-ipc" }
+# The Overview e2e test lays out its expected tiles through the theme
+# API's geometry types.
+wm-theme-api = { path = "../wm-theme-api" }
+# The control-socket e2e is a bar written the way a third party would
+# write one: a `UnixStream` and `serde_json`, nothing from the shell.
+# Already in the graph through `chonk-shell`.
+serde_json = "1"
+# Send SIGTERM to the supervisor process in the session-lifecycle test
+# without spawning a `kill` subprocess (the workspace deliberately
+# keeps test waits explicit and bounded).
+libc = "0.2"

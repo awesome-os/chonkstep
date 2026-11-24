@@ -1,0 +1,605 @@
+//! End-to-end coverage for `zwlr_gamma_control_unstable_v1` — the
+//! protocol `wlsunset`, `gammastep` and `redshift` warm the screen
+//! through, and until it existed the reason nothing on this desktop
+//! could tint a display at all.
+//!
+//! Two of these tests are about behaviors that protect a user's screen
+//! and would be invisible in a unit test, because both are things a
+//! *client* is told over a socket:
+//!
+//! - **Exclusivity.** Only one client at a time may hold an output; the
+//!   second is answered `failed`. Without it two night-light daemons
+//!   fight over one screen and each undoes the other every few seconds.
+//! - **The restore.** A daemon that dies — crashed, killed, or merely
+//!   closed — must leave the screen the colour it found it. This is the
+//!   failure mode users hate most: an orange display with nothing left
+//!   running to explain it.
+//!
+//! The third pins the *nested* backend's honest answer. There is no
+//! crtc inside a window, so a nested session advertises no global and a
+//! night-light tool says so and exits (see `wm-wayland/src/gamma.rs`).
+//! A future change that advertised the global and quietly dropped the
+//! ramps — the one outcome that module rules out, because a tool
+//! reporting success while nothing changes is worse than one that fails
+//! — would fail this test.
+//!
+//! # How a nested session gets a gamma ramp to test with
+//!
+//! `CHONKSTEP_TEST_GAMMA_SIZE` gives the nested backend a stand-in for
+//! the crtc it does not have: the global is advertised, the whole
+//! protocol runs against the real dispatch code, and the ramps are
+//! recorded into the compositor's log rather than scanned out. Test
+//! apparatus in the same shape as `CHONKSTEP_TEST_SOCKET` — inert
+//! unless a test sets it. The first test below runs *without* it, which
+//! is what a person nesting chonkstep actually gets.
+//!
+//! The client is `chonk-gamma-probe`, this crate's own gamma-control
+//! client: it does what `wlsunset` does, in the same order, and prints
+//! each step so a test can assert on it instead of on a colour.
+//!
+//! Same run rules as `e2e.rs`: needs a live Wayland session (or an
+//! `Xvfb`) to nest in, so `#[ignore]`d; run with `scripts/e2e.sh` or
+//! `cargo test -p chonk-testkit -- --ignored --test-threads=1`.
+
+use chonk_testkit::{poll_until, profile_binary, Session, SessionOptions};
+use std::time::Duration;
+
+/// The ramp length the stand-in advertises. 256 is what the crtc
+/// driving this developer's own 4K panel reports, so the tables the
+/// probe builds are the size real hardware here asks for.
+const RAMP: u32 = 256;
+
+/// The nested session's options, with the gamma stand-in turned on.
+fn with_gamma() -> SessionOptions {
+    SessionOptions {
+        scale: Some(1.0),
+        env: vec![("CHONKSTEP_TEST_GAMMA_SIZE".into(), RAMP.to_string())],
+        ..Default::default()
+    }
+}
+
+/// Runs the probe in one of its modes and waits until its own log
+/// carries `checkpoint`, returning everything it printed.
+fn run_probe(session: &mut Session, args: &[&str], checkpoint: &str) -> String {
+    let probe =
+        profile_binary("chonk-gamma-probe").expect("cargo build -p chonk-testkit builds the probe");
+    let probe = probe.to_str().unwrap().to_string();
+    session.launch(&probe, args).expect("the probe launches");
+    poll_until(
+        Duration::from_secs(10),
+        &format!("the probe to report {checkpoint:?}"),
+        || {
+            let log = session.client_log("chonk-gamma-probe");
+            log.contains(checkpoint).then_some(log)
+        },
+    )
+    .expect("the probe should reach its checkpoint")
+}
+
+fn run_ctm_probe(session: &mut Session, args: &[&str], checkpoint: &str) -> String {
+    let probe = profile_binary("chonk-ctm-probe")
+        .expect("cargo build -p chonk-testkit builds the CTM probe");
+    let probe = probe.to_str().unwrap().to_string();
+    session
+        .launch(&probe, args)
+        .expect("the CTM probe launches");
+    poll_until(
+        Duration::from_secs(10),
+        &format!("the CTM probe to report {checkpoint:?}"),
+        || {
+            let log = session.client_log("chonk-ctm-probe");
+            log.contains(checkpoint).then_some(log)
+        },
+    )
+    .expect("the CTM probe should reach its checkpoint")
+}
+
+/// Waits for a compositor log line, so a test asserts on what the
+/// compositor did rather than on when it got round to doing it.
+fn wait_for_log(session: &mut Session, needle: &str) -> String {
+    poll_until(
+        Duration::from_secs(10),
+        &format!("the compositor to log {needle:?}"),
+        || {
+            let log = session.log();
+            log.contains(needle).then_some(log)
+        },
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "the compositor should log {needle:?}; it logged:\n{}",
+            session.log()
+        )
+    })
+}
+
+fn hyprland_signature(session: &Session) -> String {
+    poll_until(
+        Duration::from_secs(10),
+        "the compositor's Hyprland instance signature",
+        || session.hyprland_signature(),
+    )
+    .expect("the IPC server reports its instance signature")
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn a_nested_session_says_it_cannot_tint_rather_than_pretending() {
+    // No stand-in: this is the session a person previewing chonkstep
+    // inside their own desktop gets.
+    let mut session = Session::boot(
+        "gamma-nested",
+        SessionOptions {
+            scale: Some(1.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let report = run_probe(&mut session, &["report"], "**no gamma-control global**");
+    assert!(
+        !report.contains("manager present"),
+        "a window has no crtc, so the nested backend must advertise no gamma-control global at all — \
+         advertising one and dropping the ramps is the dishonest option gamma.rs rules out"
+    );
+    assert!(
+        session
+            .log()
+            .contains("wlr-gamma-control is NOT advertised"),
+        "and the compositor should say so in its log, so the absence is diagnosable"
+    );
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn only_one_night_light_daemon_at_a_time_owns_a_screen() {
+    let mut session = Session::boot("gamma-exclusive", with_gamma()).unwrap();
+
+    let report = run_probe(&mut session, &["exclusive"], "**second claim");
+    assert!(
+        report.contains(&format!("**gamma_size {RAMP}**")),
+        "the first claim must be granted, with the ramp size sent immediately: {report}"
+    );
+    assert!(
+        report.contains("**second claim refused**"),
+        "a second claim on the same output must be answered `failed` — this is the whole point of the \
+         protocol, and without it two night-light daemons undo each other forever: {report}"
+    );
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn a_night_light_daemon_that_dies_does_not_leave_the_screen_orange() {
+    let mut session = Session::boot("gamma-restore", with_gamma()).unwrap();
+
+    // A daemon warms the screen and settles into its steady state.
+    let report = run_probe(&mut session, &["hold", "3000"], "**holding**");
+    assert!(
+        report.contains(&format!("**gamma_size {RAMP}**")),
+        "the claim is granted: {report}"
+    );
+    assert!(
+        report.contains("**set_gamma accepted"),
+        "and the warm table is accepted: {report}"
+    );
+
+    let warm = wait_for_log(&mut session, "gamma ramp programmed");
+    let warm = last_white_point(&warm).expect("the compositor logs the white point it programmed");
+    assert_eq!(warm.0, u16::MAX, "3000K leaves red at full");
+    assert!(
+        warm.2 < warm.0,
+        "and pulls blue down — that is what warming a screen is: {warm:?}"
+    );
+
+    // Now it dies the way a crashing daemon dies: killed, with no
+    // chance to put anything back itself.
+    session.kill_client("chonk-gamma-probe");
+
+    wait_for_log(&mut session, "restoring the original ramp");
+    let restored = poll_until(
+        Duration::from_secs(10),
+        "the restored ramp to be programmed",
+        || {
+            let log = session.log();
+            last_white_point(&log).filter(|white| *white != warm)
+        },
+    )
+    .expect("the compositor should program a ramp back after the owner died");
+    assert_eq!(
+        restored,
+        (u16::MAX, u16::MAX, u16::MAX),
+        "the screen must come back to the neutral white point it had before the daemon claimed it, \
+         not stay at the daemon's {warm:?}"
+    );
+
+    // And the output is free again: exclusivity released with the
+    // client, not held by its ghost.
+    let again = run_probe(&mut session, &["report"], "**gamma_size");
+    assert!(
+        again.contains(&format!("**gamma_size {RAMP}**")),
+        "the next daemon must be able to claim the output the dead one held: {again}"
+    );
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn a_wrongly_sized_gamma_table_is_a_protocol_error_not_a_crash() {
+    let mut session = Session::boot("gamma-hostile", with_gamma()).unwrap();
+
+    // One byte short of a correct table — the shape that makes a
+    // compositor which trusts the length read off the end of its own
+    // buffer.
+    let report = run_probe(&mut session, &["bad-table"], "**bad table");
+    assert!(
+        report.contains("refused"),
+        "a short table must earn the protocol's `invalid_gamma` error: {report}"
+    );
+    assert!(
+        session.compositor_alive(),
+        "and the compositor must survive it — a hostile client may lose its connection, never the session"
+    );
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn hyprland_ctm_is_transactional_exclusive_and_restored_on_client_death() {
+    let mut session = Session::boot("ctm-lifecycle", with_gamma()).unwrap();
+
+    let exclusive = run_ctm_probe(&mut session, &["exclusive"], "**second manager");
+    assert!(
+        exclusive.contains("**second manager blocked**"),
+        "only one CTM manager may own color: {exclusive}"
+    );
+
+    let report = run_ctm_probe(&mut session, &["hold"], "**holding**");
+    assert!(
+        report.contains("**diagonal CTM accepted**"),
+        "hyprsunset's diagonal matrix shape works: {report}"
+    );
+    let warm = wait_for_log(&mut session, "gamma ramp programmed");
+    let warm = last_white_point(&warm).expect("the CTM commit programs a ramp");
+    assert_eq!(warm.0, u16::MAX);
+    assert!(
+        warm.1 < warm.0 && warm.2 < warm.1,
+        "the matrix scales green and blue independently: {warm:?}"
+    );
+
+    // CTM and wlr-gamma-control arbitrate the same hardware.
+    let gamma = run_probe(&mut session, &["report"], "**claim");
+    assert!(
+        gamma.contains("**claim failed**"),
+        "wlr gamma must not steal a CTM-owned output: {gamma}"
+    );
+
+    session.kill_client("chonk-ctm-probe");
+    wait_for_log(
+        &mut session,
+        "CTM manager released; restoring original gamma ramps",
+    );
+    let restored = poll_until(
+        Duration::from_secs(10),
+        "the CTM ramp to be restored",
+        || last_white_point(&session.log()).filter(|white| *white != warm),
+    )
+    .expect("a dead CTM client must restore the display");
+    assert_eq!(restored, (u16::MAX, u16::MAX, u16::MAX));
+}
+
+/// The white point of an untouched, linear ramp.
+const NEUTRAL: (u16, u16, u16) = (u16::MAX, u16::MAX, u16::MAX);
+
+/// Waits for a line in a probe's own log.
+fn wait_for_client(session: &Session, program: &str, checkpoint: &str) {
+    poll_until(
+        Duration::from_secs(10),
+        &format!("{program} to report {checkpoint:?}"),
+        || session.client_log(program).contains(checkpoint).then_some(()),
+    )
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log(program)))
+}
+
+/// Waits until the ramp most recently programmed on output `index`
+/// satisfies `wanted`, returning its white point.
+fn wait_for_white_point_on(
+    session: &Session,
+    index: usize,
+    what: &str,
+    wanted: impl Fn((u16, u16, u16)) -> bool,
+) -> (u16, u16, u16) {
+    poll_until(Duration::from_secs(10), what, || {
+        last_white_point_on(&session.log(), index).filter(|white| wanted(*white))
+    })
+    .unwrap_or_else(|error| panic!("{error}; the compositor logged:\n{}", session.log()))
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn a_night_light_daemon_keeps_its_screen_across_a_monitor_hotplug() {
+    let mut session = Session::boot("gamma-hotplug", with_gamma()).unwrap();
+
+    // A daemon warms the first screen, then re-sends a ramp whenever
+    // the set of outputs changes, alternating 4500K and 3000K.
+    run_probe(&mut session, &["follow", "3000", "4500"], "**holding**");
+    let warm = wait_for_white_point_on(&session, 0, "the warm ramp", |_| true);
+    assert!(warm.2 < warm.0, "3000K pulls blue down: {warm:?}");
+
+    // A monitor is plugged in. The daemon still owns the screen it
+    // chose, so its next ramp must reach the hardware rather than being
+    // dropped without a word.
+    session.door().set_virtual_outputs("split").unwrap();
+    wait_for_client(&session, "chonk-gamma-probe", "**reapplied at 4500K after 1 output change(s)**");
+    let cooler = wait_for_white_point_on(
+        &session,
+        0,
+        "the ramp sent after a monitor was plugged in",
+        |white| white != warm,
+    );
+    assert!(cooler.2 > warm.2, "4500K is cooler than 3000K: {cooler:?} after {warm:?}");
+
+    // And unplugged again.
+    session.door().set_virtual_outputs("single").unwrap();
+    wait_for_client(&session, "chonk-gamma-probe", "**reapplied at 3000K after 2 output change(s)**");
+    wait_for_white_point_on(
+        &session,
+        0,
+        "the ramp sent after a monitor was unplugged",
+        |white| white == warm,
+    );
+
+    // Its exit after both hotplugs still puts the screen back.
+    session.kill_client("chonk-gamma-probe");
+    wait_for_log(&mut session, "restoring the original ramp");
+    wait_for_white_point_on(&session, 0, "the original ramp to come back", |white| white == NEUTRAL);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn a_night_light_daemon_on_an_unplugged_monitor_is_told_its_control_failed() {
+    let mut session = Session::boot("gamma-unplug", with_gamma()).unwrap();
+
+    // The plugged head is the second `wl_output` the probe binds. The
+    // stand-in must give it a ramp too, or this claim is refused.
+    session.door().set_virtual_outputs("split").unwrap();
+    run_probe(&mut session, &["hold", "3000", "1"], "**holding**");
+    wait_for_white_point_on(&session, 1, "the plugged head's warm ramp", |white| white.2 < white.0);
+
+    session.door().set_virtual_outputs("single").unwrap();
+    wait_for_client(&session, "chonk-gamma-probe", "**control failed**");
+    assert_eq!(
+        last_white_point_on(&session.log(), 0),
+        None,
+        "the unplugged head's ramp must never be programmed onto the screen that inherited its position"
+    );
+
+    // The screen that stayed is unaffected, and free to claim.
+    let again = run_probe(&mut session, &["report"], "**gamma_size");
+    assert!(
+        again.contains(&format!("**gamma_size {RAMP}**")),
+        "the remaining output keeps its ramp size: {again}"
+    );
+    assert!(session.compositor_alive());
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn hyprsunset_keeps_colour_ownership_across_a_monitor_hotplug() {
+    let mut session = Session::boot("ctm-hotplug", with_gamma()).unwrap();
+
+    run_ctm_probe(&mut session, &["follow"], "**holding**");
+    let warm = wait_for_white_point_on(&session, 0, "the warm transform", |_| true);
+    assert!(warm.2 < warm.1 && warm.1 < warm.0, "{warm:?}");
+
+    // Plugging a monitor in leaves the manager owning colour: its next
+    // commit reprograms the first screen and sets the new one, which
+    // the commit does not name, to identity.
+    session.door().set_virtual_outputs("split").unwrap();
+    wait_for_client(&session, "chonk-ctm-probe", "**reapplied after 1 output change(s)**");
+    let cooler = wait_for_white_point_on(
+        &session,
+        0,
+        "the transform committed after a monitor was plugged in",
+        |white| white != warm,
+    );
+    assert!(cooler.1 > warm.1 && cooler.2 > warm.2, "{cooler:?} after {warm:?}");
+    wait_for_white_point_on(&session, 1, "the plugged head to be set to identity", |white| white == NEUTRAL);
+
+    session.door().set_virtual_outputs("single").unwrap();
+    wait_for_client(&session, "chonk-ctm-probe", "**reapplied after 2 output change(s)**");
+    wait_for_white_point_on(
+        &session,
+        0,
+        "the transform committed after a monitor was unplugged",
+        |white| white == warm,
+    );
+
+    // The hotplug opened no window for a second colour client.
+    let gamma = run_probe(&mut session, &["report"], "**claim");
+    assert!(
+        gamma.contains("**claim failed**"),
+        "wlr gamma must still not steal a CTM-owned output after a hotplug: {gamma}"
+    );
+
+    session.kill_client("chonk-ctm-probe");
+    wait_for_log(
+        &mut session,
+        "CTM manager released; restoring original gamma ramps",
+    );
+    wait_for_white_point_on(&session, 0, "the CTM ramp to be restored", |white| white == NEUTRAL);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn a_non_diagonal_ctm_is_a_named_protocol_error_not_an_approximation() {
+    let mut session = Session::boot("ctm-hostile", with_gamma()).unwrap();
+    let report = run_ctm_probe(&mut session, &["non-diagonal"], "**non-diagonal CTM");
+    assert!(
+        report.contains("refused"),
+        "the client receives a protocol error: {report}"
+    );
+    assert!(session
+        .log()
+        .contains("CTM refused: non-diagonal or negative matrix"));
+    assert!(
+        session.compositor_alive(),
+        "the hostile client cannot take down the compositor"
+    );
+}
+
+#[test]
+#[ignore = "needs a live Wayland session and the packaged hyprsunset client"]
+fn real_hyprsunset_stays_running_serves_its_ipc_and_restores_on_exit() {
+    if !chonk_testkit::require_client("hyprsunset") || !chonk_testkit::require_client("hyprctl") {
+        return;
+    }
+    let mut session = Session::boot("hyprsunset-real", with_gamma()).unwrap();
+    let signature = hyprland_signature(&session);
+    let socket = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join("hypr").join(&signature).join(".hyprsunset.sock");
+    // Validate before launching upstream 0.4, which uses an unchecked strcpy
+    // for this path. The headless runner must keep runtime and artifacts apart.
+    std::os::unix::net::SocketAddr::from_pathname(&socket)
+        .expect("private runtime leaves room for the hyprsunset Unix socket");
+    session
+        .launch("hyprsunset", &["-t", "3000"])
+        .expect("hyprsunset launches");
+    let warm_log = wait_for_log(&mut session, "gamma ramp programmed");
+    let warm =
+        last_white_point(&warm_log).expect("hyprsunset's CTM reaches the gamma hardware path");
+    assert!(warm.2 < warm.0, "3000K reduces the blue channel: {warm:?}");
+
+    // A programmed CTM precedes initialization of the separate IPC thread.
+    // Observe the actual listener and fail promptly if the daemon exits.
+    poll_until(Duration::from_secs(10), "hyprsunset's IPC listener", || {
+        let log = session.client_log("hyprsunset");
+        match session.client_status("hyprsunset") {
+            Ok(Some(status)) => Some(Err(format!("hyprsunset exited: {status}\n{log}"))),
+            Err(error) => Some(Err(error)),
+            // bind() creates the path before listen(). Neither file existence
+            // nor upstream's optional verbose log proves it accepts clients.
+            Ok(None) => match std::os::unix::net::UnixStream::connect(&socket) {
+                Ok(connection) => { drop(connection); Some(Ok(())) }
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::Interrupted) => None,
+                Err(error) => Some(Err(format!("{}: {error}", socket.display()))),
+            },
+        }
+    }).and_then(|result| result)
+        .unwrap_or_else(|error| panic!("{error}\n{}\n{}", session.client_log("hyprsunset"), session.log()));
+    // Session owns the child even on timeout/panic. Waiting on its exit is
+    // bounded; Command::output could hang the entire integration runner.
+    session.launch("hyprctl", &["hyprsunset", "temperature"]).unwrap();
+    let status = poll_until(Duration::from_secs(10), "hyprctl's temperature answer", || {
+        match session.client_status("hyprctl") {
+            Ok(Some(status)) => Some(Ok(status)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }).and_then(|result| result)
+        .unwrap_or_else(|error| panic!("{error}\n{}\n{}", session.client_log("hyprctl"), session.client_log("hyprsunset")));
+    let output = session.client_log("hyprctl");
+    assert!(
+        status.success(),
+        "hyprctl reaches hyprsunset: status={status} output={output}"
+    );
+    assert_eq!(
+        output.trim(),
+        "3000",
+        "hyprsunset reports the value it applied"
+    );
+    assert!(session.compositor_alive());
+
+    session.kill_client("hyprsunset");
+    wait_for_log(
+        &mut session,
+        "CTM manager released; restoring original gamma ramps",
+    );
+    let restored = poll_until(
+        Duration::from_secs(10),
+        "hyprsunset's transform to be restored",
+        || last_white_point(&session.log()).filter(|white| *white != warm),
+    )
+    .expect("closing hyprsunset restores the display");
+    assert_eq!(restored, (u16::MAX, u16::MAX, u16::MAX));
+}
+
+/// The white point of the most recent `gamma ramp programmed` line: the
+/// last entry of each channel, which is what separates a warm screen
+/// from a neutral one. Parsed out of the compositor's own log rather
+/// than read off the hardware, because there is no hardware behind a
+/// nested output — and because the log line is what a person debugging
+/// "why is my screen orange" reads too.
+fn last_white_point(log: &str) -> Option<(u16, u16, u16)> {
+    let line = log
+        .lines()
+        .rfind(|line| line.contains("gamma ramp programmed"))?;
+    let field = |name: &str| -> Option<u16> {
+        line.split(name)
+            .nth(1)?
+            .trim_start_matches('=')
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()
+    };
+    Some((field("white_r")?, field("white_g")?, field("white_b")?))
+}
+
+/// [`last_white_point`] for one output: the most recent `gamma ramp
+/// programmed` line whose `index` field is `index`.
+fn last_white_point_on(log: &str, index: usize) -> Option<(u16, u16, u16)> {
+    let on_index = |line: &&str| {
+        line.contains("gamma ramp programmed")
+            && line
+                .split("index=")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                == Some(index)
+    };
+    let line = log.lines().rfind(on_index)?;
+    last_white_point(line)
+}
+
+/// One request to the session's Hyprland socket, in `hyprctl`'s shape.
+fn hypr_request(session: &Session, command: &str) -> String {
+    use std::io::{Read, Write};
+    let path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join("hypr")
+        .join(hyprland_signature(session))
+        .join(".socket.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream.write_all(command.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+/// Disabling and re-enabling the *other* output — a laptop lid closing
+/// and opening — must leave a night-light daemon owning the screen it
+/// warmed, exactly as a hotplug does: parking runs the same path.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn a_night_light_daemon_keeps_its_screen_while_another_output_is_disabled_and_enabled() {
+    let mut session = Session::boot("gamma-park", with_gamma()).unwrap();
+    session.door().set_virtual_outputs("split").unwrap();
+
+    run_probe(&mut session, &["follow", "3000", "4500"], "**holding**");
+    let warm = wait_for_white_point_on(&session, 0, "the warm ramp", |_| true);
+    assert!(warm.2 < warm.0, "3000K pulls blue down: {warm:?}");
+
+    assert_eq!(hypr_request(&session, "keyword monitor chonkstep-right,disable").trim(), "ok");
+    wait_for_client(&session, "chonk-gamma-probe", "**reapplied at 4500K after 1 output change(s)**");
+    let cooler = wait_for_white_point_on(&session, 0, "the ramp sent after the other output was disabled", |white| {
+        white != warm
+    });
+    assert!(cooler.2 > warm.2, "4500K is cooler than 3000K: {cooler:?} after {warm:?}");
+
+    assert_eq!(hypr_request(&session, "keyword monitor chonkstep-right,preferred,auto,auto").trim(), "ok");
+    wait_for_client(&session, "chonk-gamma-probe", "**reapplied at 3000K after 2 output change(s)**");
+    wait_for_white_point_on(&session, 0, "the ramp sent after the other output came back", |white| white == warm);
+
+    session.kill_client("chonk-gamma-probe");
+    wait_for_log(&mut session, "restoring the original ramp");
+    wait_for_white_point_on(&session, 0, "the original ramp to come back", |white| white == NEUTRAL);
+}

@@ -1,0 +1,33 @@
+[package]
+name = "chonkstep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A modern NeXTSTEP-style window manager for X11."
+
+[features]
+# Passthrough, so packaging can say `--features lcos` against the binary
+# it actually builds. See chonk-shell's own `lcos` feature.
+lcos = ["chonk-shell/lcos"]
+
+[dependencies]
+chonk-build-info = { path = "../chonk-build-info" }
+# The backend-generic desktop shell — everything the desktop *is*; this
+# binary only wires it to the X11 backend and drives the event loop.
+chonk-shell = { path = "../chonk-shell" }
+wm-core = { path = "../wm-core" }
+# `Theme` (resolve/scale at startup) and `RasterThemeEngine` for
+# `WindowManager::new`.
+wm-theme = { path = "../wm-theme" }
+wm-x11 = { path = "../wm-x11" }
+wm-config = { path = "../wm-config" }
+# Publishes DPI, scaling factor and cursor size to every X client at
+# once, which is the only way an application this session did not launch
+# itself ever learns the desktop's scale.
+chonk-xsettings = { path = "../chonk-xsettings" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x11rb = "0.13"
+# `poll(2)` on the X11 connection fd — the block-until-activity core of
+# the event loop (see `wait_for_x11_activity`).
+libc = "0.2"

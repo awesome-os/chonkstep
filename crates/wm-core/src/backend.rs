@@ -1,0 +1,788 @@
+use wm_theme_api::{DecorationBuffer, DecorationLayout, Point, Rect, ResizeEdge, Size};
+
+use crate::client::MonitorInfo;
+use crate::types::{
+    BackendEvent, DecorationRules, DragHandle, KeyCombo, KeyboardConfig, Modifiers, MouseButton,
+    NetStateSnapshot, ScrollDelta, SizeHints, WindowType, WmClass, WmProtocol,
+};
+
+/// A window's presentation in Overview. Coordinates are physical pixels;
+/// destinations are relative to the Overview output, sources are global.
+/// These transforms never configure or resize the application.
+pub struct OverviewWindow<W, F> {
+    pub window: W,
+    pub frame: Option<F>,
+    pub source: Rect,
+    pub destination: Rect,
+    /// False for a shaded window: Overview shows only its rolled-up
+    /// titlebar strip, never the content hidden under the shade.
+    pub draw_content: bool,
+    pub label: DecorationBuffer,
+}
+
+/// One desktop thumbnail and its optional close control, in panel pixels.
+pub struct OverviewThumbnail<W, F> {
+    pub window: W,
+    pub frame: Option<F>,
+    pub source: Rect,
+    pub draw_content: bool,
+}
+
+/// A desktop thumbnail contains its actual windows in desktop coordinates.
+pub struct OverviewWorkspace<W, F> {
+    pub windows: Vec<OverviewThumbnail<W, F>>,
+    pub rect: Rect,
+    pub label: DecorationBuffer,
+    pub drop_label: DecorationBuffer,
+    pub close: Option<(Rect, DecorationBuffer)>,
+    /// Optional theme-owned workspace-card chrome. The interior remains solid
+    /// geometry; only corner coverage and small labels carry CPU pixels.
+    pub card: Option<wm_theme_api::DecorationSurface>,
+    pub status: Option<DecorationBuffer>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverviewCards {
+    pub metrics: wm_theme_api::OverviewMetrics,
+    pub bounds: Rect,
+    pub background: [u8; 3],
+    pub empty: [u8; 3],
+}
+
+/// Optional flat chrome for native Overview. Colors/metrics are resolved once
+/// by the shell; the renderer retains existing textures and element identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverviewChrome {
+    pub ink: [u8; 3],
+    pub line: u32,
+    pub cards: Option<OverviewCards>,
+}
+
+/// A compositor can present existing client textures directly. Only small text
+/// labels cross the CPU/GPU boundary; no screenshots or full-output raster.
+pub struct OverviewScene<W, F> {
+    pub geometry: Rect,
+    pub windows: Vec<OverviewWindow<W, F>>,
+    pub spaces: Vec<OverviewWorkspace<W, F>>,
+    pub workspace: usize,
+    pub selected: usize,
+    pub gap: u32,
+    pub chrome: Option<OverviewChrome>,
+}
+
+/// Pointer-owned Overview presentation. Updating it only moves existing GPU
+/// content; it never configures the application or changes workspace membership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverviewDrag {
+    pub index: usize,
+    pub destination: Rect,
+    /// A valid destination desktop, excluding the source desktop.
+    pub workspace: Option<usize>,
+}
+
+/// Presentation of a managed drag; policy and membership stay in WindowManager.
+#[derive(Clone, Copy, Debug)]
+pub struct LayoutDrag<Window, Frame> {
+    pub window: Window,
+    pub frame: Option<Frame>,
+    pub source: Rect,
+    pub destination: Rect,
+}
+
+/// Everything the protocol-agnostic core needs from a windowing backend
+/// (X11 today via `wm-x11`, a future Wayland/Smithay backend later).
+/// Deliberately scoped to what a *window manager* needs, not a
+/// compositor: the core never learns about reparenting, XIDs, or atoms —
+/// those are how an X11 backend satisfies these calls, not what the core
+/// conceptually wants.
+///
+/// `WindowId`/`FrameId` are distinct associated types (real distinct
+/// XIDs on X11 — a client's own window vs. its reparented decoration
+/// frame) so the type system rules out passing the wrong handle to the
+/// wrong call.
+pub trait Backend {
+    type WindowId: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type FrameId: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+
+    /// Whether this backend supplies app-aware Mac keyboard delivery.
+    fn supports_mac_interaction(&self) -> bool { false }
+
+    /// Whether a session lock currently covers the desktop. An
+    /// activation received behind the lock must not change which
+    /// workspace the user finds on unlock.
+    fn session_locked(&self) -> bool { false }
+
+    /// A fresh, single-use `xdg_activation_v1` token for a command this
+    /// desktop is about to launch on the user's behalf — an `exec`
+    /// bind, a launcher pick, a menu action. Handed to the child as
+    /// `XDG_ACTIVATION_TOKEN`, it lets an already-running single-instance
+    /// application raise its window when re-launched: the compositor
+    /// minted the token, so the activation is known to be the user's
+    /// own doing and is honoured where a client's self-made token would
+    /// only mark the window urgent. `None` on a backend with no
+    /// activation protocol of its own, in which case the child is
+    /// launched without one, as before.
+    fn create_activation_token(&mut self) -> Option<String> { None }
+
+    /// Establish output clipping before staging final geometry, then animate
+    /// live surfaces from the old frame without intermediate configures.
+    /// `clip` confines managed windows to their output workarea. Backends without native transforms settle
+    /// immediately. This carries presentation only, never layout policy.
+    fn present_layout(
+        &mut self,
+        _window: Self::WindowId,
+        _frame: Option<Self::FrameId>,
+        _source: Rect,
+        _destination: Rect,
+        _clip: Option<Rect>,
+        _animate: bool,
+    ) {
+    }
+
+    /// Input-transparent transient mode caption, rendered by the compositor.
+    fn show_layout_mode(&mut self, _mode: crate::LayoutMode, _label: DecorationBuffer) {}
+
+    /// Whole-cell managed drag target. None is the idempotent cleanup path.
+    fn preview_layout_drop(
+        &mut self,
+        _drag: Option<LayoutDrag<Self::WindowId, Self::FrameId>>,
+        _target: Option<Rect>,
+    ) {
+    }
+
+    // -- lifecycle --------------------------------------------------------
+    fn scan_existing_windows(&mut self) -> Vec<Self::WindowId>;
+    /// One entry per physical output, in a **stable order**: an output
+    /// that stays connected must keep the same index across calls.
+    /// That ordering is load-bearing, not a nicety —
+    /// `WindowManager::set_workareas` addresses monitors positionally,
+    /// so a list that reshuffles would silently hand one monitor's
+    /// reserved strip to another.
+    ///
+    /// Exactly one entry carries `primary: true` where the platform
+    /// names a primary output (RandR's primary, a compositor's
+    /// configured main output). Where the platform names none, every
+    /// entry is `primary: false` and the core treats index 0 as
+    /// primary — so a list is never left without one, and a backend
+    /// never has to invent a primary the platform did not state.
+    ///
+    /// A backend without real multi-monitor support yet reports a
+    /// single primary entry spanning the whole screen.
+    fn monitors(&self) -> Vec<MonitorInfo>;
+    /// Constrain a workarea by native external-panel reservations, if any.
+    /// X11 uses EWMH struts; other adapters can retain the supplied baseline.
+    fn constrain_workarea(&self, area: Rect) -> Rect { area }
+    /// The same stable monitor ledger by reference, for hot read-only
+    /// paths that must not deep-copy every output name merely to inspect
+    /// an index or a rectangle.
+    fn monitors_ref(&self) -> &[MonitorInfo];
+
+    /// Read-only backend-specific state for a live diagnostic request.
+    /// Kept textual so the protocol-agnostic core does not learn a
+    /// compositor's surface vocabulary.
+    fn diagnostic_snapshot(&self) -> String {
+        format!("monitors={} screen={}x{}", self.monitors_ref().len(), self.screen_size().w, self.screen_size().h)
+    }
+
+    /// Changes a safe live diagnostic switch. Backends with no live
+    /// controls refuse explicitly.
+    fn set_diagnostic(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+        let _ = (name, enabled);
+        Err("this backend has no live diagnostic switches".into())
+    }
+
+    /// Replaces the process tracing filter without restarting the
+    /// desktop. The binary must have installed a reload handle.
+    fn set_log_filter(&mut self, directive: &str) -> Result<(), String> {
+        let _ = directive;
+        Err("this backend has no reloadable tracing filter".into())
+    }
+
+    /// The identity of a shell-owned surface — the dock, the Clip, the
+    /// launcher strip, icon tiles, menu popups. The same id space
+    /// `wm_theme_api::PopupHost` uses on this backend, so the desktop
+    /// shell's cascade menus and its other surfaces interoperate.
+    ///
+    /// This surface family is what makes the shell backend-portable:
+    /// `chonk-shell` draws everything through `DecorationBuffer`s
+    /// painted onto these, so an X11 backend maps them to
+    /// override-redirect windows while a Wayland compositor maps them
+    /// to internal scene elements — the shell cannot tell the
+    /// difference, by construction.
+    type ShellId: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+
+    /// Creates an (unmapped) shell surface. `above`: keep it over
+    /// managed clients (docks, menus); `false` sits it at desktop
+    /// level. `None` when the backend cannot create surfaces (a fake
+    /// that doesn't model them).
+    fn create_shell_surface(&mut self, geometry: Rect, background: (u8, u8, u8), above: bool) -> Option<Self::ShellId>;
+    fn map_shell_surface(&mut self, id: Self::ShellId);
+    fn unmap_shell_surface(&mut self, id: Self::ShellId);
+    fn destroy_shell_surface(&mut self, id: Self::ShellId);
+    fn raise_shell_surface(&mut self, id: Self::ShellId);
+    fn configure_shell_surface(&mut self, id: Self::ShellId, geometry: Rect);
+    /// Blits `buffer` onto the surface — the shell's one drawing verb.
+    fn paint_shell_surface(&mut self, id: Self::ShellId, buffer: &DecorationBuffer);
+    /// Releases pixels retained for an unmapped shell surface without
+    /// destroying the surface itself. Long-lived transient panels use this
+    /// between appearances: their stable identity avoids display-server
+    /// churn, while their potentially monitor-sized backing has no value
+    /// until the next repaint.
+    fn release_shell_buffer(&mut self, id: Self::ShellId);
+
+    fn supports_live_overview(&self) -> bool {
+        false
+    }
+    /// The backend has the native screenshot and recording selector.
+    fn supports_native_capture(&self) -> bool { false }
+    /// New windows that ask for more room than the work area has are
+    /// opened at the size that fits, frame included. For backends whose
+    /// clients cannot know the work area and size themselves from the
+    /// screen (wm-darwin: AppKit sees the display, not the dock or the
+    /// frame the compositor will add).
+    fn fits_new_windows_to_workarea(&self) -> bool { false }
+    fn show_live_overview(
+        &mut self,
+        surface: Self::ShellId,
+        scene: OverviewScene<Self::WindowId, Self::FrameId>,
+    ) {
+        let _ = (surface, scene);
+    }
+    fn select_live_overview(&mut self, selected: usize) {
+        let _ = selected;
+    }
+    /// Front-to-back indices into the submitted scene, retained by a live
+    /// backend. Overlapping previews use the same order for pixels and input.
+    fn live_overview_paint_order(&self) -> Option<&[usize]> { None }
+    fn hide_live_overview(&mut self) {}
+
+    /// Set an animated Overview endpoint; `None` reverses the current goal.
+    /// Returns false when the backend needs the shell's immediate fallback.
+    fn transition_live_overview(&mut self, target: Option<bool>) -> bool {
+        let _ = target;
+        false
+    }
+
+    fn drag_live_overview(&mut self, drag: Option<OverviewDrag>) {
+        let _ = drag;
+    }
+
+    /// Paints the desktop background — solid color or a wallpaper
+    /// image. On X11 this is the root window (plus the root-pixmap
+    /// publishing compositors read); a Wayland compositor draws it as
+    /// the scene's bottom layer.
+    fn paint_root_color(&mut self, rgb: (u8, u8, u8));
+    fn paint_root_image(&mut self, buffer: &DecorationBuffer);
+
+    /// Keeps every layer-shell surface declaring `namespace` off the
+    /// screen (`hidden`), or lets it back on. A hidden surface stays a
+    /// healthy client — configured, committed, given its frames — and
+    /// is simply not drawn, not hit-tested, and not allowed to reserve
+    /// an edge, so the space it claimed goes back to the windows and
+    /// the Dock. The shell uses it for Omarchy's bar, which the user
+    /// switches on and off from the root menu. Layer surfaces are a
+    /// Wayland notion, so the default does nothing; X11 has no such
+    /// surface to hide.
+    fn set_layer_surface_hidden(&mut self, _namespace: &str, _hidden: bool) {}
+
+    /// Drains one queued click on a shell surface: `(surface, surface-
+    /// local position, button, pressed)`. Backends queue these from
+    /// their input machinery; the binary's event loop drains and feeds
+    /// them to the shell.
+    fn take_shell_click(&mut self) -> Option<(Self::ShellId, Point, MouseButton, bool)> {
+        None
+    }
+    /// Drains one queued pointer motion over a shell surface.
+    fn take_shell_motion(&mut self) -> Option<(Self::ShellId, Point)> {
+        None
+    }
+    /// Drains one queued scroll over a shell surface: `(surface,
+    /// surface-local position, delta)`. The position is the pointer's,
+    /// in the same surface-local space `take_shell_click` reports, so
+    /// a caller resolves a scroll to a widget with the identical code
+    /// it already uses for clicks.
+    ///
+    /// Queued like clicks, not coalesced like motion, and the
+    /// distinction is load-bearing: for motion only the newest
+    /// position means anything, but every notch is its own command —
+    /// three notches on a volume tile is three steps — so keeping only
+    /// the last would silently swallow input the user gave.
+    ///
+    /// What a caller may rely on:
+    /// * `delta` is never zero. A backend with nothing to report
+    ///   queues nothing.
+    /// * `delta` is a COUNT, not a flag. A backend may fold notches
+    ///   that arrived together into one entry with `up`/`right` beyond
+    ///   +/-1 (a high-resolution wheel spun hard does this), so read it
+    ///   as a number of steps; it must never drop them.
+    /// * Both counts are in the direction the *user* perceives. Any
+    ///   natural-scroll or direction configuration the platform holds
+    ///   is already applied by the time it reaches here.
+    /// * Nothing here is a wheel *button*: `take_shell_click` never
+    ///   reports one, so the two drains cannot double-count the same
+    ///   physical input. (`MouseButton` deliberately stays
+    ///   `{Left, Middle, Right}` — a `MouseButton::WheelUp` would have
+    ///   made "pressed: false" meaningless and forced every existing
+    ///   click site to learn about a button that cannot be held.)
+    fn take_shell_scroll(&mut self) -> Option<(Self::ShellId, Point, ScrollDelta)> {
+        None
+    }
+    /// Drains a pending screen-size change (RandR on X11, output
+    /// reconfiguration on Wayland).
+    fn take_screen_resize(&mut self) -> Option<Size> {
+        None
+    }
+    /// The UI scale changed: rebuild whatever this backend sized from
+    /// the old one.
+    ///
+    /// Defaulted to a no-op because most backends size nothing from the
+    /// UI scale — everything they draw arrives as an already-rasterized
+    /// buffer. The exception is server-side resources a backend builds
+    /// for itself: the X11 backend rasterizes its own pointer cursors
+    /// at the scale it was connected with, and those are the only
+    /// pixels in the session the theme engine does not produce.
+    ///
+    /// `wm-core` calls this and nothing else on a scale change; every
+    /// other consequence reaches the backend as ordinary paint traffic.
+    fn set_ui_scale(&mut self, scale: f32) {
+        let _ = scale;
+    }
+    /// Where the pointer is right now, in root coordinates, asked of
+    /// the display server rather than remembered.
+    ///
+    /// `WindowManager` tracks the last pointer position it was *told
+    /// about*, which is not the same thing: motion over a client's own
+    /// window is delivered to that client, not to the window manager.
+    /// For a window whose client draws its own chrome that is most of
+    /// the window, so by the time such a client asks to be dragged
+    /// (`BackendEvent::MoveRequest`) the remembered position can be
+    /// stale by the whole width of the screen — and the drag would
+    /// begin by teleporting the window by exactly that error.
+    ///
+    /// Defaulted to `None`, which falls back to the remembered
+    /// position; a backend that does deliver motion over client
+    /// surfaces loses nothing by not implementing this.
+    fn pointer_position(&self) -> Option<Point> {
+        None
+    }
+    /// Move the pointer to `to`, in root device coordinates, the way
+    /// hardware motion would: pointer focus, hover and everything the
+    /// window manager derives from the pointer follow it. Requested by
+    /// [`crate::WindowManager::focus_output`], whose bindings have no
+    /// pointer of their own to move.
+    ///
+    /// Defaulted to nothing: a backend that cannot move the pointer
+    /// loses only the warp. The Wayland backend queues it and applies
+    /// it through the same path a script's `movecursor` takes, which
+    /// refuses it while the session is locked or a client holds a
+    /// pointer constraint.
+    fn warp_pointer(&mut self, _to: Point) {}
+    /// The current screen/output size.
+    fn screen_size(&self) -> Size;
+    /// Non-blocking. The event-loop driver calls this in a loop on fd
+    /// readiness until it returns `None`.
+    fn poll_event(&mut self) -> Option<BackendEvent<Self::WindowId, Self::FrameId>>;
+
+    // -- properties (ICCCM reads) ------------------------------------------
+    fn window_title(&self, window: Self::WindowId) -> Option<String>;
+    fn window_class(&self, window: Self::WindowId) -> Option<WmClass>;
+    /// The window's `xdg_toplevel_tag_v1` tag: an application's own
+    /// stable, untranslated name for one of its windows (`main`,
+    /// `preferences`), which is what a `match:xdg_tag` window rule
+    /// reads. `None` for a window that never set one — every X11
+    /// window, since the protocol has no X11 counterpart, which is why
+    /// the default answers for backends that cannot see one.
+    fn window_xdg_tag(&self, _window: Self::WindowId) -> Option<String> {
+        None
+    }
+    /// `_NET_WM_PID` — lets the shell correlate a freshly mapped window
+    /// with the specific process it just spawned (e.g. to apply a
+    /// default size only to *that* window, not any other window of the
+    /// same class that happens to map around the same time). `None` if
+    /// the client never set it — not every app does, so callers need a
+    /// fallback that doesn't depend on it.
+    fn window_pid(&self, window: Self::WindowId) -> Option<u32>;
+    fn size_hints(&self, window: Self::WindowId) -> SizeHints;
+    fn supports_protocol(&self, window: Self::WindowId, protocol: WmProtocol) -> bool;
+    /// The window's own (root-relative) geometry at the time of the
+    /// call — queried once at map time to know how big a fresh client
+    /// wants to be before any decoration exists.
+    fn window_geometry(&self, window: Self::WindowId) -> Rect;
+    /// A snapshot of the window's currently-rendered pixels, at its own
+    /// size — `None` on any failure (the window vanished, an X error,
+    /// a backend that can't support this). Must be called while the
+    /// window is still mapped and viewable: most backends have no way
+    /// to read pixel content back from a window that isn't (X11 doesn't
+    /// retain backing content for unmapped windows without a compositor,
+    /// which this WM doesn't have). Used for the icon preview a
+    /// miniaturized window shows — captured once, right before the
+    /// window unmaps, not continuously refreshed.
+    fn capture_window_image(&self, window: Self::WindowId, size: Size) -> Option<DecorationBuffer>;
+
+    /// Asks the backend to serve `capture_window_image` at (up to)
+    /// `edge` pixels on a window's longest side, `None` to return to
+    /// its own default. The Overview sets this for the life of a
+    /// session: its cards are card-sized, not icon-sized, and a
+    /// backend that keeps throttled snapshots (the compositor) needs
+    /// to know before it takes them. A hint, not a contract — the X11
+    /// backend captures live at full size and ignores it, which is
+    /// the default here.
+    fn set_preview_edge(&mut self, edge: Option<u32>) {
+        let _ = edge;
+    }
+
+    /// A counter that advances when previews taken at the hinted edge
+    /// become available — how a caller that consumed
+    /// `capture_window_image` before the backend could honor
+    /// `set_preview_edge` learns it is worth asking again. Backends
+    /// that answer captures synchronously never advance it (the answer
+    /// was never stale), which is the default.
+    fn preview_generation(&self) -> u64 {
+        0
+    }
+
+    // -- decoration realization ---------------------------------------------
+    fn create_decoration(&mut self, window: Self::WindowId, layout: &DecorationLayout) -> Self::FrameId;
+    fn destroy_decoration(&mut self, frame: Self::FrameId);
+    /// Take `window` back out of `frame` and destroy the frame, leaving
+    /// the client itself alive, mapped, and parented as an unframed
+    /// window — what a client asking to draw its own chrome *after* it
+    /// was already framed requires.
+    ///
+    /// Distinct from [`Self::destroy_decoration`], which is the
+    /// teardown path for a window that is going away and may destroy
+    /// the client along with the frame. On X11 that difference is not
+    /// cosmetic: destroying a parent destroys its children, so a frame
+    /// dropped without reparenting the client to the root first takes
+    /// the application's window with it.
+    ///
+    /// Defaulted to plain destruction for backends where a frame owns
+    /// no client window (the Wayland compositor draws frames into its
+    /// own scene; there is nothing to reparent).
+    fn release_decoration(&mut self, window: Self::WindowId, frame: Self::FrameId) {
+        let _ = window;
+        self.destroy_decoration(frame);
+    }
+    fn paint_decoration(&mut self, frame: Self::FrameId, surface: &wm_theme_api::DecorationSurface);
+    /// Physical scale of the output containing most of `frame`. Backends with
+    /// one global pixel scale keep the default.
+    fn decoration_scale(&self, frame: Rect) -> f32 {
+        let _ = frame;
+        1.0
+    }
+    /// Sets the frame's cursor to indicate a resize is available along
+    /// `edge` — `None` for the plain default cursor. Called on hover
+    /// (see `WindowManager`'s handling of `BackendEvent::PointerMotion`'s
+    /// `surface_local`), not just once at creation, since which edge (if
+    /// any) the pointer is over changes as it moves within the frame.
+    fn set_frame_cursor(&mut self, frame: Self::FrameId, edge: Option<ResizeEdge>);
+
+    // -- geometry / visibility ------------------------------------------------
+    fn set_frame_geometry(&mut self, frame: Self::FrameId, geometry: Rect);
+
+    /// Refresh input-only decoration margins before moving/resizing the frame.
+    /// Backends with shaped native windows also update their input siblings.
+    fn set_decoration_layout(&mut self, _frame: Self::FrameId, _layout: &DecorationLayout) {}
+    /// Resizes an already-decorated client's own window in place (its
+    /// position within the frame, at `DecorationLayout::client_offset`,
+    /// doesn't change from a content resize alone).
+    fn resize_client(&mut self, window: Self::WindowId, size: Size);
+
+    /// Accept pixels a native client has already committed. Backends without
+    /// a separate configure/commit lifecycle use their ordinary resize path.
+    fn accept_client_size(&mut self, window: Self::WindowId, size: Size) {
+        self.resize_client(window, size);
+    }
+    /// Honors a `ConfigureRequest` from a window the WM doesn't manage
+    /// yet (no frame exists) — ICCCM requires acknowledging these even
+    /// before the first `MapRequest`.
+    fn configure_unmanaged(&mut self, window: Self::WindowId, geometry: Rect);
+    fn map_frame(&mut self, frame: Self::FrameId);
+    fn unmap_frame(&mut self, frame: Self::FrameId);
+    /// Show a *managed* window that has no frame — one whose client
+    /// draws its own chrome (see [`ClientChrome`]). The frame verbs
+    /// above cannot serve: there is no frame to map.
+    ///
+    /// Deliberately not [`Self::map_unmanaged`], which means something
+    /// else. That verb is for windows the core does not track at all
+    /// (docks, menus, tooltips), and at least one backend records the
+    /// window as unmanaged when it is called — which is right for a
+    /// tooltip and wrong for a browser, since the two then differ in
+    /// how they are rendered, hit-tested and focused. A window can be
+    /// frameless and fully managed at the same time, and this is the
+    /// verb for that.
+    ///
+    /// [`ClientChrome`]: crate::ClientChrome
+    fn map_frameless(&mut self, window: Self::WindowId) {
+        self.map_unmanaged(window);
+    }
+    /// Hide a managed frameless window again — the workspace-switch and
+    /// miniaturize path for one, where a framed window would have its
+    /// frame unmapped.
+    ///
+    /// Defaulted to nothing, which is a visible degradation rather than
+    /// a silent one: a backend that has not implemented it leaves such
+    /// windows on screen across a workspace switch. That is preferable
+    /// to guessing at a mechanism the backend may not have, and it is
+    /// obvious the first time anyone tries it.
+    fn unmap_frameless(&mut self, window: Self::WindowId) {
+        let _ = window;
+    }
+    /// Shows/hides the client's own content window in place, independent
+    /// of the frame — used for "shading" (rolling a window up to just
+    /// its titlebar): the frame stays mapped and visible at its
+    /// (shrunk) shaded height, only the content underneath disappears.
+    /// A backend must not report this as the client unmapping/
+    /// withdrawing (see `wm-x11`'s implementation, which suppresses the
+    /// resulting `UnmapNotify`) — from `wm-core`'s perspective the
+    /// client is still fully managed the whole time.
+    fn set_client_mapped(&mut self, window: Self::WindowId, mapped: bool);
+
+    // -- stacking ---------------------------------------------------------------
+    fn raise(&mut self, frame: Self::FrameId);
+    /// Raise a managed window that has no frame to raise.
+    ///
+    /// Without this a client-decorated window is stuck at whatever
+    /// depth it mapped at, for the rest of its life: every raise in
+    /// this crate names a `FrameId`, and such a window has none. The
+    /// symptom is precise and maddening — clicking the window focuses
+    /// it and does not bring it forward — and it would have shipped
+    /// invisibly, because the only applications affected are the ones
+    /// that draw their own titlebars.
+    fn raise_frameless(&mut self, window: Self::WindowId) {
+        let _ = window;
+    }
+    fn restack(&mut self, order_back_to_front: &[Self::FrameId]);
+
+    // -- focus / close ------------------------------------------------------------
+    fn set_input_focus(&mut self, window: Self::WindowId);
+    /// `WM_DELETE_WINDOW` if the client supports it, force-kill otherwise.
+    fn send_close(&mut self, window: Self::WindowId);
+    /// Polite application quit; a compositor may finish clipboard handoff first.
+    fn send_quit(&mut self, window: Self::WindowId) { self.send_close(window); }
+
+    /// Force-kills the client owning `window` (X11: `XKillClient`) —
+    /// the escalation for an application that no longer answers
+    /// `send_close`'s polite `WM_DELETE_WINDOW`. Defaulted no-op so
+    /// backends without a kill concept still compile.
+    fn kill_client(&mut self, window: Self::WindowId) {
+        let _ = window;
+    }
+
+    // -- input grabs --------------------------------------------------------------
+    fn grab_pointer_for_drag(&mut self) -> DragHandle;
+    fn ungrab_pointer(&mut self, handle: DragHandle);
+    fn grab_key(&mut self, combo: KeyCombo);
+    fn ungrab_key(&mut self, combo: KeyCombo);
+    /// Marks behavioral variants of an already-grabbed combo. Backends
+    /// without phase/lock/repeat routing may leave these as no-ops;
+    /// the ordinary grab is still installed separately.
+    fn set_key_release(&mut self, _combo: KeyCombo, _enabled: bool) {}
+    fn set_key_locked(&mut self, _combo: KeyCombo, _enabled: bool) {}
+    fn set_key_repeating(&mut self, _combo: KeyCombo, _enabled: bool) {}
+    /// Exclusive keyboard grab for a modal interaction (the Alt-Tab
+    /// switcher): every key press and release reaches the WM until
+    /// `ungrab_keyboard`, letting it see the plain Tab repeats and the
+    /// Alt release no passive grab covers. Defaulted to a no-op so
+    /// backends (and test fakes) without modal input needs compile
+    /// unchanged.
+    fn grab_keyboard(&mut self) {}
+    fn ungrab_keyboard(&mut self) {}
+    /// Asks a client to repaint its entire content (a synthetic
+    /// full-window Expose on X11) — used after remapping a window whose
+    /// pixels the server did not retain (unshade, deminiaturize), where
+    /// some clients otherwise leave stale buffer garbage visible until
+    /// their next incidental redraw. Defaulted to a no-op.
+    fn refresh_client(&mut self, _window: Self::WindowId, _size: Size) {}
+
+    // -- EWMH ---------------------------------------------------------------
+    // All defaulted to no-ops: a backend without a concept of EWMH (the
+    // test fake) compiles unchanged, and `wm-core` calls these
+    // unconditionally at the state-change sites without caring.
+
+    /// Publish the thickness of the chrome drawn around `window`, in
+    /// EWMH's `_NET_FRAME_EXTENTS` order: left, right, top, bottom.
+    ///
+    /// This is how a client learns how much bigger than its content the
+    /// thing on screen actually is — which it needs to place its own
+    /// dialogs and menus correctly, to save and restore its geometry
+    /// across sessions, and to reason about the screen edges. A window
+    /// manager that never publishes it leaves every client guessing,
+    /// and the guesses are wrong by exactly a titlebar.
+    ///
+    /// All four are zero for a window with no frame — one whose client
+    /// draws its own chrome, or one that is fullscreen. That is not a
+    /// degenerate case to skip: publishing the zeros is what tells a
+    /// client its frame has *gone*.
+    fn publish_frame_extents(&mut self, window: Self::WindowId, left: u32, right: u32, top: u32, bottom: u32) {
+        let _ = (window, left, right, top, bottom);
+    }
+
+    /// The window's advertised `_NET_WM_WINDOW_TYPE`, read at manage
+    /// time to pick a decoration policy.
+    fn window_type(&self, _window: Self::WindowId) -> WindowType {
+        WindowType::Normal
+    }
+    /// Maps a window this WM has decided not to manage (see
+    /// `WindowType::Unmanaged`) exactly as the client created it.
+    fn map_unmanaged(&mut self, _window: Self::WindowId) {}
+    /// The window this one is a transient child of — its dialog parent:
+    /// `xdg_toplevel.set_parent` on Wayland, `WM_TRANSIENT_FOR` on X11.
+    ///
+    /// Asked fresh rather than cached at map time, because a client is
+    /// free to state it late and several do: LibreOffice maps its
+    /// "Welcome" dialog and only then parents it to the document window
+    /// it belongs to.
+    ///
+    /// Defaulted to `None` for a backend that cannot report it; such a
+    /// backend simply gets flat stacking, which is what every backend
+    /// had before this existed.
+    fn window_parent(&self, _window: Self::WindowId) -> Option<Self::WindowId> {
+        None
+    }
+    /// Whether this transient currently blocks interaction with its
+    /// parent (`xdg_dialog_v1.set_modal` / `_NET_WM_STATE_MODAL`).
+    fn window_is_modal(&self, _window: Self::WindowId) -> bool {
+        false
+    }
+    /// Installs (or removes) the passive pointer grabs the move/resize
+    /// modifier-drag needs on one managed client's own window.
+    ///
+    /// Only a backend that does not already see every input event needs
+    /// this. The compositor sees them all and does nothing here; an X11
+    /// window manager sees a click on a client's own window only if it
+    /// has grabbed it, and the whole point of this gesture is to work
+    /// over a client's content — including a focused client's, which is
+    /// not passively grabbed for focus.
+    ///
+    /// `None` removes the grabs. Called when a window is managed and
+    /// whenever the configured modifier changes.
+    fn set_drag_gesture_grab(&mut self, _window: Self::WindowId, _modifier: Option<Modifiers>) {}
+    /// Hands the backend the user's decoration overrides, so
+    /// [`Self::client_chrome`] can consult them.
+    ///
+    /// On the backend rather than in `wm-core` because the rules have
+    /// to reach further than the framing decision: both decoration
+    /// protocols answer clients on the wire, and a rule that changed
+    /// the frame without changing the answer would tell a client
+    /// "decorate yourself" and then decorate it anyway.
+    ///
+    /// Defaulted to a no-op for a backend with no decoration protocol
+    /// to override.
+    fn set_decoration_rules(&mut self, _rules: DecorationRules) {}
+    /// Installs the keyboard configuration a reload just resolved.
+    ///
+    /// Defaulted to a no-op: a backend with no keymap of its own (the
+    /// X11 session, where the X server owns the layout) has nothing to
+    /// do here. The Wayland session rebuilds the seat's keymap and
+    /// repeat timing from it, which is what makes `hyprctl reload`
+    /// after an `input { kb_layout = … }` edit mean something. Before
+    /// this verb existed the reload path answered `ok` and changed
+    /// nothing.
+    fn set_keyboard_config(&mut self, _config: KeyboardConfig) {}
+    /// The shortcut-inhibit policy: whether a focused client may take
+    /// every chord, and the chord that takes them back. Defaulted to a
+    /// no-op because only the Wayland session implements the inhibit
+    /// protocol; X11 has its own grab semantics and no such request.
+    fn set_shortcut_inhibit_policy(&mut self, _policy: crate::ShortcutInhibitPolicy) {}
+    /// Applies libinput-owned pointer settings where the backend owns
+    /// those devices. X11 leaves them to its display server.
+    fn set_pointer_config(&mut self, _config: crate::PointerConfig) {}
+    /// Which chrome this window should wear, from what its client has
+    /// told the backend and the decoration rules above that: a full frame,
+    /// edges around a titlebar the client draws itself, or nothing. See
+    /// [`crate::ClientChrome`] for why this is not derivable from
+    /// [`Self::window_type`].
+    ///
+    /// Read at map time and again whenever the backend reports the
+    /// answer may have changed (`BackendEvent::ChromeChanged`) — X11
+    /// clients are entitled to change their mind by rewriting
+    /// `_MOTIF_WM_HINTS` on a mapped window, and several real ones do.
+    ///
+    /// Defaulted to [`crate::ClientChrome::Full`]: a backend that cannot
+    /// ask keeps the historic behaviour of framing everything it manages.
+    fn client_chrome(&self, window: Self::WindowId) -> crate::ClientChrome {
+        let _ = window;
+        crate::ClientChrome::Full
+    }
+    /// Tells the backend the chrome `wm-core` settled on for a managed
+    /// window: at map, before its frame is created or it is shown, and
+    /// again on every change.
+    ///
+    /// For a backend that can tell a client how it is framed. The Wayland
+    /// session tells an edge-framed toplevel it is tiled on all four
+    /// sides, which is what makes a header-bar client stop drawing the
+    /// shadow and resize band it would otherwise put outside its window:
+    /// pixels that would lie over this desktop's borders, around handles
+    /// nobody could reach. Defaulted to a no-op.
+    fn set_window_chrome(&mut self, _window: Self::WindowId, _chrome: crate::ClientChrome) {}
+    /// Tells the backend the opacity rule a managed window mapped
+    /// under, and whether `dim_inactive` must leave it alone. Both
+    /// come from configuration only: no client request reaches this.
+    /// Defaulted to a no-op for a backend that draws every window
+    /// opaque.
+    fn set_window_opacity(
+        &mut self,
+        _window: Self::WindowId,
+        _opacity: Option<crate::OpacityRule>,
+        _no_dim: bool,
+    ) {
+    }
+    /// Tells the backend whether a managed window mapped under a
+    /// `no_screen_share` rule, in which case every capture the backend
+    /// renders (a portal screen share, a recording, a screenshot)
+    /// shows an opaque rectangle in its place while the screen itself
+    /// shows the window as usual. Configuration only: no client
+    /// request reaches this, so a client cannot clear it. Defaulted to
+    /// a no-op for a backend that captures nothing.
+    fn set_capture_redacted(&mut self, _window: Self::WindowId, _redacted: bool) {}
+    /// Forces a window opaque for the rest of the session, or lets its
+    /// rule apply again: `Some(true)`, `Some(false)`, or `None` to
+    /// toggle. Answers whether the backend models the state at all,
+    /// so a request can be refused rather than answered `ok` for
+    /// nothing.
+    fn set_window_opaque(&mut self, _window: Self::WindowId, _opaque: Option<bool>) -> bool {
+        false
+    }
+    /// Moves the client window within its frame. Reparenting fixes the
+    /// client at the theme's chrome offset and normal reflows never
+    /// change it, so this only matters when the offset itself changes:
+    /// entering fullscreen (content at 0,0, no chrome) and leaving it
+    /// (back to the theme's offset).
+    fn position_client(&mut self, _window: Self::WindowId, _pos: Point) {}
+    /// Publishes `_NET_CLIENT_LIST` (managed clients, oldest first).
+    fn publish_client_list(&mut self, _clients: &[Self::WindowId]) {}
+    /// Publishes `_NET_ACTIVE_WINDOW` (`None` = no window focused).
+    fn publish_active_window(&mut self, _window: Option<Self::WindowId>) {}
+    /// Publishes `_NET_NUMBER_OF_DESKTOPS` and `_NET_CURRENT_DESKTOP`.
+    fn publish_workspaces(&mut self, _count: usize, _current: usize) {}
+
+    /// Restrict a managed window and its popups to this display in separate
+    /// Spaces mode. None restores the ordinary spanning-window policy.
+    fn set_window_space_output(&mut self, _window: Self::WindowId, _output: Option<&str>) {}
+    /// Publishes `_NET_WORKAREA` — the same rectangle for every
+    /// desktop, since the dock reserves the same strip on all of them.
+    /// `area` is the *union* of the per-monitor workareas, not any one
+    /// monitor's: the property's format is one rect per desktop with no
+    /// per-monitor dimension at all (EWMH predates multi-head), so the
+    /// bounding box is the only rect a multi-monitor session can state
+    /// without lying about some output. Clients that need real
+    /// per-monitor reserved space read the panels' own
+    /// `_NET_WM_STRUT_PARTIAL`. See `WindowManager::set_workareas`.
+    fn publish_workarea(&mut self, _area: Rect, _workspace_count: usize) {}
+    /// Publishes a client's `_NET_WM_STATE` property from the WM's own
+    /// authoritative flags.
+    fn publish_net_state(&mut self, _window: Self::WindowId, _state: NetStateSnapshot) {
+    }
+    /// Publishes a client's `_NET_WM_DESKTOP` property — which
+    /// workspace the window lives on, for pagers and taskbars.
+    fn publish_window_desktop(&mut self, _window: Self::WindowId, _desktop: usize) {}
+    /// Passive per-window button grab so the WM sees the first click on
+    /// an unfocused window (click-to-focus) without stealing later
+    /// clicks from the app. The one honest X11-ism on this trait — a
+    /// no-op on backends (a future Wayland one) whose compositor already
+    /// sees every click unconditionally.
+    fn grab_button_passive(&mut self, window: Self::WindowId, button: MouseButton);
+    fn ungrab_button_passive(&mut self, window: Self::WindowId, button: MouseButton);
+    fn replay_pointer(&mut self);
+}

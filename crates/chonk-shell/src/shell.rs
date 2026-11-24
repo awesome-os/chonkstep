@@ -1,0 +1,3945 @@
+//! The shell orchestrator: one backend-generic [`Shell`] both binaries
+//! (the X11 `chonkstep` and the Wayland compositor) drive, extracted
+//! whole from the X11 binary's original event loop so the desktop
+//! behaves identically on either stack by construction. The split
+//! follows one rule: everything that decides what the desktop *does*
+//! (menu routing, launcher clicks, icon drags, spawning, widget
+//! ticking) lives here; everything about how events physically arrive
+//! (polling, `PointerMotion` coalescing) or what only a process can do
+//! (exit, re-exec in place) stays in the binary. The seam between the
+//! two is [`ShellOutcome`]: the shell reports the process-level act an
+//! event calls for, the binary performs it.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use wm_config::Action;
+use wm_core::{
+    Backend, BackendEvent, ClientFlags, ClientId, KeyCombo, Lifecycle, MaximizeDirections, MonitorInfo, MouseButton,
+    Notification, WindowManager,
+};
+use wm_theme::cascade::MenuKey;
+use wm_theme::{FontState, Theme};
+use wm_theme_api::{DecorationBuffer, Point, PopupHost, Rect, Size};
+
+use crate::apps::{self, AppEntry};
+use crate::control::{self, ControlSocket};
+use crate::desktop::{
+    Desktop, EdgeReservation, MenuAction, RootMenuAction, WindowMenuAction, WindowMenuContext,
+};
+use crate::overview::{OverviewHit, OverviewItem, OverviewRelease};
+use crate::session_layout::{
+    relative_to_monitor, restored_geometry, restored_on_monitor, RelaunchPlan, SessionLayout,
+    HomeGeometryRecord, SpatialRecord, WindowRecord,
+};
+use crate::startup::SessionState;
+use crate::{spawn, theme_select, wallpaper};
+
+/// What the binary's event loop must do after handing an event to the
+/// shell. The shell never exits or re-execs the process itself — those
+/// are process-level acts, and how a hot-restart actually happens is a
+/// per-binary affair (the X11 binary re-execs its on-disk image and
+/// relies on the SaveSet to keep clients alive; a Wayland compositor
+/// has its own story) — so the two non-`Continue` outcomes name the
+/// act for the binary to carry out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellOutcome {
+    /// The native backend owns the capture pixels and modal interaction.
+    Capture(wm_config::CaptureMode),
+    /// Nothing process-level to do; keep looping.
+    Continue,
+    /// The user asked to end the session (the root menu's Exit item).
+    Exit,
+    /// The process must re-exec its on-disk image.
+    ///
+    /// This used to mean "apply a change that touches every surface at
+    /// once", and a theme pick raised it. It no longer does: a theme,
+    /// a UI scale and every config-file setting are applied in place by
+    /// [`Shell::apply_session_state`], and the only thing left that a
+    /// running process genuinely cannot do to itself is *become a
+    /// different build*. So this is now raised by exactly one gesture,
+    /// the `restart` keybinding, and means what `scripts/update.sh`
+    /// needs it to mean.
+    Restart,
+}
+
+/// `foot`'s own default size is already reasonable, and it relayouts
+/// its content to match a real resize — so this needs no default-size
+/// workaround at all; just a legible font and a roomy geometry passed
+/// directly at launch. (alacritty was tried before urxvt, see the git
+/// history around this line for the resize saga; foot is not that
+/// terminal and negotiates xdg-shell configures properly.)
+//
+// foot rather than urxvt because this desktop runs as a Wayland
+// compositor: urxvt is an X11 client and every terminal the shell
+// spawned had to detour through XWayland. foot is Wayland-native, so
+// the terminal is a first-class `xdg_toplevel` on the same protocol as
+// the rest of the session.
+//
+// Fallback chain for glyphs the primary font's own Nerd Font icon patch
+// doesn't cover (some file-type icons in `ls`/`eza`-style aliases
+// rendered as an empty tofu box otherwise) — foot's `--font` list is
+// consulted in order for whatever glyph the first font is missing, the
+// same way urxvt's `-fn` list was. Unlike urxvt (a classic Xft
+// terminal with no color-glyph path, which corrupted nearby rendering
+// when handed `Noto Color Emoji`), foot does render color emoji from
+// its own fontconfig fallback, so nothing needs to be excluded here.
+//
+// The 16-color ANSI palette (`regular0`..`regular7`, `bright0`..
+// `bright7`) plus fg/bg/cursor match the theme this desktop's apps
+// already use elsewhere rather than foot's own stock scheme. foot
+// takes them as `--override` config keys, and its color values are
+// bare RRGGBB with no `#` prefix.
+//
+// `colors-dark`, not the bare `colors` section: foot 1.27 deprecates
+// the latter ("[colors]: deprecated; use [colors-dark] instead") and
+// warns once per key, which at twenty keys is twenty lines of noise in
+// the session log on every terminal launch. Pinning
+// `initial-color-theme=dark` alongside it is what makes the choice
+// safe — foot picks `colors-dark` by default, but a user's own
+// foot.ini setting `initial-color-theme=light` would otherwise send it
+// to a `colors-light` section this desktop never populates, leaving a
+// themed terminal wearing foot's stock palette.
+// Font and geometry are deliberately *not* per-theme: every theme keeps
+// the same terminal font, only its colors change. The size comes from
+// the config's `terminal_font_px` (1x pixels) and tracks CHONKSTEP_SCALE
+// the same way the WM's own chrome does.
+//
+// The window opens at the terminal world's one universal default —
+// 80 columns by 24 rows, the shape every terminal since the VT100
+// agrees on — asked for in cells (`--window-size-chars`), so foot's
+// own font metrics make it exact. Cells are only safe while they fit:
+// the font size is a user setting with a ceiling of 96px, at which 80
+// columns is wider than any screen, and this file once carried a
+// hand-tuned "92x26" that marched off the edge for exactly that
+// reason. So the standard shape is requested when a conservative
+// estimate says it fits the workarea, and everything below is the
+// fallback for the pathological font/screen pairing: a fraction of
+// the actual head, which fits by construction.
+const TERMINAL_STANDARD_CELLS: (u32, u32) = (80, 24);
+// Cell-size estimate per font pixel for the fits-check, deliberately
+// generous (JetBrains Mono's advance is 0.6em, line height ~1.25):
+// overestimating the footprint only makes the fallback a little
+// eager, while underestimating would overhang the screen.
+const TERMINAL_CELL_ESTIMATE: (f32, f32) = (0.65, 1.4);
+const TERMINAL_SCREEN_FRACTION: (f32, f32) = (0.70, 0.78);
+// Floor for that fraction, so a small or oddly-shaped head still gets a
+// usable terminal rather than a proportionally tiny one.
+const TERMINAL_MIN_SIZE: (u32, u32) = (640, 400);
+
+/// foot argument list for the active theme's terminal palette —
+/// foreground/background/cursor plus the full 16-slot ANSI set, so
+/// every theme restyles terminals along with the chrome. The scale for
+/// the font size is recovered from the already-scaled theme (titlebar
+/// font is 12px at 1x) rather than re-reading the environment.
+///
+/// Both the font size and the window size are given to the terminal in
+/// *its* pixels, which on the Wayland session are logical ones: the
+/// compositor tells it the output scale and it renders itself at that,
+/// so handing it pre-multiplied numbers would double the scale. The
+/// division is by the same factor the theme was scaled by, recovered
+/// the same way, so a 1x session divides by one and nothing moves.
+fn terminal_args(theme: &Theme, font_px: f32, screen: Size, client_scale: f32) -> Vec<String> {
+    let ui_scale = theme.titlebar.font.size / 12.0;
+    let px = (font_px * ui_scale * (client_scale / ui_scale.max(0.01))).round().max(8.0) as u32;
+    let divisor = (ui_scale / client_scale.max(0.01)).max(1.0);
+    let logical_screen =
+        Size::new(((screen.w as f32 / divisor) as u32).max(1), ((screen.h as f32 / divisor) as u32).max(1));
+    let size_args = if standard_cells_fit(px as f32 / client_scale.max(0.01), theme, logical_screen) {
+        let (cols, rows) = TERMINAL_STANDARD_CELLS;
+        ("--window-size-chars".to_string(), format!("{cols}x{rows}"))
+    } else {
+        let (window_w, window_h) = terminal_window_size(theme, logical_screen);
+        ("--window-size-pixels".to_string(), format!("{window_w}x{window_h}"))
+    };
+    let mut args = vec![
+        "--font".to_string(),
+        format!("JetBrainsMono Nerd Font:pixelsize={px},Noto Sans Symbols 2:pixelsize={px}"),
+        size_args.0,
+        size_args.1,
+        // Which of the two populated sections the terminal starts in —
+        // the appearance the resolved theme is wearing right now.
+        "--override".to_string(),
+        format!("initial-color-theme={}", theme.appearance.name()),
+    ];
+    // BOTH of foot's color sections are populated — this rendition's
+    // palette in its own section and the counterpart rendition's in
+    // the other — so a running terminal can follow a live appearance
+    // switch: foot swaps sections on SIGUSR1 (dark) / SIGUSR2 (light),
+    // which `Shell::retint_terminals` sends on every switch. A
+    // terminal spawned in one mood and switched to the other is
+    // indistinguishable from one spawned there.
+    let counterpart = wm_theme::default_theme::theme_variant(&theme.id, theme.appearance.toggled())
+        .map(|other| other.terminal)
+        // A theme this build cannot name in the other mood (nothing
+        // built-in today) keeps its one palette in both sections: the
+        // switch then changes nothing, rather than half of something.
+        .unwrap_or_else(|| theme.terminal.clone());
+    let (dark, light) = match theme.appearance {
+        wm_theme::Appearance::Dark => (&theme.terminal, &counterpart),
+        wm_theme::Appearance::Light => (&counterpart, &theme.terminal),
+    };
+    push_palette_args(&mut args, "colors-dark", dark);
+    push_palette_args(&mut args, "colors-light", light);
+    args
+}
+
+/// Appends one `TerminalPalette` as foot `--override`s for one of its
+/// color sections (`colors-dark` / `colors-light`).
+fn push_palette_args(args: &mut Vec<String>, section: &str, palette: &wm_theme::model::TerminalPalette) {
+    // foot wants bare RRGGBB, not the `#rrggbb` urxvt took.
+    let hex = |c: wm_theme::model::Color| format!("{:02x}{:02x}{:02x}", c.r, c.g, c.b);
+    args.push("--override".to_string());
+    args.push(format!("{section}.foreground={}", hex(palette.fg)));
+    args.push("--override".to_string());
+    args.push(format!("{section}.background={}", hex(palette.bg)));
+    // `cursor` is a *pair*: the text color drawn inside the cursor
+    // block, then the block itself. urxvt's `-cr` set only the
+    // block, so the background goes in the text slot to keep the
+    // classic reversed look the themes were written against.
+    args.push("--override".to_string());
+    args.push(format!("{section}.cursor={} {}", hex(palette.bg), hex(palette.cursor)));
+    // The theme's glass, applied by the terminal itself rather than by
+    // a compositor opacity rule. On X11 that rule is what produces
+    // translucency (`add_opacity_rule("URxvt", ..)` in the X11
+    // binary's main), and client-side alpha was deliberately avoided
+    // there because urxvt's 32-bit-visual path left stale framebuffer
+    // garbage on scroll/resize. Neither constraint survives the move:
+    // there is no per-app opacity rule on the Wayland side at all, so
+    // without this the themes' `opacity` would simply do nothing, and
+    // foot's own alpha is a clean premultiplied surface the compositor
+    // composites correctly. Alpha is a per-section key, so each
+    // rendition carries its own glass — pale glass spends less
+    // contrast on the wallpaper, so light renditions run more opaque.
+    if let Some(opacity) = palette.opacity {
+        args.push("--override".to_string());
+        args.push(format!("{section}.alpha={:.3}", f32::from(opacity) / 100.0));
+    }
+    for (index, color) in palette.ansi.iter().enumerate() {
+        // 0-7 are the regular ANSI slots, 8-15 the bright ones; the
+        // theme stores them as one flat 16-slot array.
+        let key =
+            if index < 8 { format!("{section}.regular{index}") } else { format!("{section}.bright{}", index - 8) };
+        args.push("--override".to_string());
+        args.push(format!("{key}={}", hex(*color)));
+    }
+}
+
+/// The head a freshly launched terminal has to fit — the primary
+/// monitor, the same rectangle every other piece of shell chrome hangs
+/// on.
+fn terminal_screen<B: Backend + PopupHost<PopupId = B::ShellId>>(shell: &Shell<B>) -> Size {
+    shell.desktop.primary_workarea().size
+}
+
+/// Whether the standard 80x24 opens comfortably on this head: the
+/// estimated cell footprint plus the frame's chrome inside the
+/// (logical) workarea. `font_px` is the font size in the same logical
+/// units as `screen`.
+fn standard_cells_fit(font_px: f32, theme: &Theme, screen: Size) -> bool {
+    let (cols, rows) = TERMINAL_STANDARD_CELLS;
+    let (cw, ch) = TERMINAL_CELL_ESTIMATE;
+    let chrome_h =
+        f32::from(theme.titlebar.height) + f32::from(theme.resize_bar.height) + 2.0 * f32::from(theme.border.width);
+    let need_w = cols as f32 * font_px * cw;
+    let need_h = rows as f32 * font_px * ch + chrome_h;
+    need_w <= screen.w as f32 && need_h <= screen.h as f32
+}
+
+/// The fallback launch size, in pixels, for a head the standard cell
+/// shape cannot fit.
+///
+/// foot's `--window-size-pixels` sizes the terminal's *own* surface,
+/// but what has to fit the screen is the decorated frame — so the
+/// chrome the WM is about to wrap around it (titlebar, resizebar, both
+/// borders) comes off the height first. Without that subtraction the
+/// frame overhangs the bottom of the head by exactly one titlebar,
+/// which is the sort of thing nobody notices until the screen is small.
+fn terminal_window_size(theme: &Theme, screen: Size) -> (u32, u32) {
+    let chrome_h =
+        u32::from(theme.titlebar.height) + u32::from(theme.resize_bar.height) + 2 * u32::from(theme.border.width);
+    let width = ((screen.w as f32 * TERMINAL_SCREEN_FRACTION.0) as u32).max(TERMINAL_MIN_SIZE.0).min(screen.w.max(1));
+    let height = ((screen.h as f32 * TERMINAL_SCREEN_FRACTION.1) as u32)
+        .max(TERMINAL_MIN_SIZE.1)
+        .min(screen.h.saturating_sub(chrome_h).max(1));
+    (width, height)
+}
+
+/// Launches the theme-styled terminal — the one path shared by the root
+/// menu's Terminal item and the `spawn-terminal` keybinding, so the two
+/// gestures can never drift apart on font, geometry, or palette.
+///
+/// The returned handle is how a live appearance switch reaches this
+/// terminal later (`Shell::retint_terminals` signals it); a caller
+/// that drops it launches a terminal that simply keeps its palette.
+///
+/// `configured` is the user's `terminal` setting. When it is set the
+/// desktop steps out of the way entirely: that argv is launched as
+/// written, with no geometry, font or palette arguments bolted on. It
+/// has to be that way — those arguments are foot's command-line
+/// spelling of the theme, and there is no portable spelling to
+/// translate them into. So a configured terminal keeps its own colors
+/// and its own idea of how big it should be, and an appearance switch
+/// leaves it alone.
+///
+/// That is a real loss of integration, and it is the right trade: a
+/// session that can only ever run one terminal cannot host a desktop
+/// that ships four of them and picks between them with
+/// `xdg-terminal-exec`.
+#[must_use]
+fn spawn_terminal(
+    configured: Option<&[String]>,
+    theme: &Theme,
+    font_px: f32,
+    screen: Size,
+) -> Option<spawn::SpawnedChild> {
+    let scale = theme.titlebar.font.size / 12.0;
+    if let Some(argv) = configured {
+        return spawn_configured_terminal(argv, &[], scale);
+    }
+    spawn_foot(terminal_args(theme, font_px, screen, terminal_client_scale(theme)), scale)
+}
+
+/// Launches a user-configured terminal, optionally running `command`
+/// inside it.
+///
+/// The separator is `-e`, which is the one terminal-launching
+/// convention old enough to be everywhere: xterm, alacritty, ghostty,
+/// kitty, foot and wezterm all accept it. It is a guess, but it is the
+/// guess with the best odds, and a terminal that wants a different flag
+/// can be named with the flag already in its argv.
+///
+/// Detached, never supervised, and so never in `Shell::terminals`:
+/// that list exists to be signalled SIGUSR1/SIGUSR2 on an appearance
+/// switch, which is foot's colour-theme swap and, for a terminal that
+/// does not handle those signals (alacritty does not), the default
+/// action — termination. A configured terminal keeps its own colours,
+/// as the doc above says, and an appearance switch must leave it alone
+/// in the most literal sense. Always `None` for that reason.
+#[must_use]
+fn spawn_configured_terminal(argv: &[String], command: &[String], scale: f32) -> Option<spawn::SpawnedChild> {
+    let Some((program, args)) = argv.split_first() else {
+        tracing::warn!("configured terminal has an empty argument list; not launching");
+        return None;
+    };
+    let mut owned: Vec<String> = args.to_vec();
+    if !command.is_empty() {
+        owned.push("-e".to_string());
+        owned.extend(command.iter().cloned());
+    }
+    let arg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let env: Vec<(String, String)> = crate::startup::xcursor_size_env(scale).into_iter().collect();
+    if spawn::spawn_detached_with_env(program, &arg_refs, &env, &[]).is_none() {
+        tracing::warn!(program = %program, "configured terminal failed to start");
+    }
+    None
+}
+
+/// The factor the terminal will scale itself by, which is what
+/// `terminal_args`'s `client_scale` means. Under the Wayland
+/// compositor the outputs advertise the session's scale and foot — a
+/// native Wayland client — renders at it, so the terminal gets logical
+/// numbers (client_scale 1) and the division in `terminal_args` maps
+/// the physical screen and the theme-scaled font back down; handing it
+/// pre-multiplied numbers there would double the scale, exactly as
+/// that function's own contract warns. On the X11 stack foot can only
+/// be talking to some *other* Wayland display (a dev session nesting
+/// the X11 desktop), which advertises nothing about this session's
+/// scale — so there the theme's factor rides along as it always has.
+fn terminal_client_scale(theme: &Theme) -> f32 {
+    match spawn::current_display_stack() {
+        spawn::DisplayStack::Wayland => 1.0,
+        spawn::DisplayStack::X11 => theme.titlebar.font.size / 12.0,
+    }
+}
+
+/// The single foot spawn step: [`spawn_terminal`] passes the themed
+/// args alone, [`launch_app`] appends `-e` plus a `.desktop` entry's
+/// command line for `Terminal=true` apps. Factored so the two callers
+/// can never drift on how the arg list actually reaches the process.
+///
+/// `scale` feeds the per-child `XCURSOR_SIZE` — passed explicitly
+/// rather than inherited, because the inherited process value is the
+/// X11-flavored pre-multiplied one and foot, a native Wayland client,
+/// multiplies whatever it reads by the output scale on its own. The
+/// terminal was the client this shipped visibly wrong on: a scale-2
+/// session's pointer doubled to 96px the moment it crossed onto a
+/// terminal. See `startup::xcursor_size_env` for the per-stack rule.
+/// Supervised rather than fire-and-forget (`spawn_supervised`, not
+/// `spawn_detached_with_env`) so the shell can hold a handle to every
+/// terminal it launched: a live appearance switch retints running
+/// terminals by signal (foot's SIGUSR1/SIGUSR2 color-theme switch),
+/// and a signal needs a pid that is provably still the terminal's —
+/// which the supervised reaper guarantees (see `SpawnedChild::signal`).
+fn spawn_foot(args: Vec<String>, scale: f32) -> Option<spawn::SpawnedChild> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env: Vec<(String, String)> = crate::startup::xcursor_size_env(scale).into_iter().collect();
+    spawn::spawn_supervised("foot", &arg_refs, &env, &[])
+}
+
+/// Runs a `[commands]` entry — the target of every `exec` bind. The
+/// activation token, when the backend mints one, rides along in the
+/// environment so that a single-instance application launched a second
+/// time can raise the window it already has (see
+/// `spawn::activation_env`).
+fn run_named_command(name: &str, argv: &[String], scale: f32, activation_token: Option<String>) {
+    let Some((program, args)) = argv.split_first() else {
+        // `argv_from_value` rejects empty command lines, so reaching
+        // here means the invariant broke upstream rather than that the
+        // user typed something odd. Say so and carry on.
+        tracing::warn!(command = %name, "command has an empty argument list; not running it");
+        return;
+    };
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut env: Vec<(String, String)> = crate::startup::xcursor_size_env(scale).into_iter().collect();
+    env.extend(spawn::activation_env(activation_token));
+    match spawn::spawn_detached_with_env(program, &arg_refs, &env, &[]) {
+        Some(pid) => tracing::info!(command = %name, program = %program, pid, "ran command"),
+        None => tracing::warn!(command = %name, program = %program, "command failed to start"),
+    }
+}
+
+fn launch_app(
+    configured_terminal: Option<&[String]>,
+    entry: &AppEntry,
+    theme: &Theme,
+    font_px: f32,
+    screen: Size,
+    activation_token: Option<String>,
+) -> Option<spawn::SpawnedChild> {
+    // Scale recovered from the already-scaled theme (titlebar font is
+    // 12px at 1x) — the same trick `terminal_args` uses, so launch
+    // fixups need no separate scale plumbing.
+    let scale = theme.titlebar.font.size / 12.0;
+    let Some((program, args)) = entry.exec.split_first() else {
+        tracing::warn!(app = %entry.id, "desktop entry has an empty command line; not launching");
+        return None;
+    };
+    if entry.terminal {
+        // A `Terminal=true` entry has to run in whichever terminal the
+        // session actually uses, or the desktop would be launching TUI
+        // apps into a terminal the user replaced.
+        if let Some(argv) = configured_terminal {
+            return spawn_configured_terminal(argv, &entry.exec, scale);
+        }
+        let mut argv = terminal_args(theme, font_px, screen, terminal_client_scale(theme));
+        argv.push("-e".to_string());
+        argv.extend(entry.exec.iter().cloned());
+        return spawn_foot(argv, scale);
+    }
+    // External GUI launches get the environment/argument fixups the
+    // old dedicated browser launcher carried, now applied generically:
+    // every app is told the desktop's scale through the Qt env vars —
+    // GTK clients get theirs from `chonk_xsettings::XSettingsManager`
+    // instead (see `gtk_qt_scale_env`'s doc comment for why the two
+    // can't both hand a GTK client the scale) — and the Chromium family
+    // additionally gets its own scale flag plus `--password-store=basic`
+    // — without which Chromium blocks ~25s at startup on a D-Bus secrets
+    // service this session doesn't provide (the whole story lives on the
+    // spawn.rs helpers). Confirmed live: the first .desktop-launched
+    // Chromium hung exactly that way.
+    //
+    // The ozone platform is the one fixup that differs between the two
+    // stacks, and it is asked for as a question about the session
+    // rather than decided here: this function is as backend-blind as
+    // the rest of the shell, and `spawn::current_display_stack` is the
+    // single place that is allowed to know the answer and says at
+    // length why it can be trusted.
+    let mut argv: Vec<String> = args.to_vec();
+    let base = program.rsplit('/').next().unwrap_or(program);
+    // `starts_with`, not `==`, for Edge: every Edge desktop entry on a
+    // real installation execs `/usr/bin/microsoft-edge-stable` (the
+    // beta and dev channels install `-beta` and `-dev` alongside it),
+    // and an exact match on `microsoft-edge` therefore matched no
+    // launch this desktop has ever performed. Edge was silently
+    // receiving none of these fixups — not the scale flag, not the
+    // secrets-service workaround, not the ozone platform — which is a
+    // large part of why it behaved worse here than any other browser.
+    // Every scale fixup below exists to tell a client something the
+    // display server could not. Under the Wayland compositor the server
+    // now *can*: `wl_output` carries the scale and toolkits act on it
+    // (a GTK client answers `wl_output.scale(2)` with
+    // `set_buffer_scale(2)` on its own — see `state.rs`'s
+    // `advertise_scale` in `wm-wayland`). Applying these there as well
+    // would have the client scale itself twice — `QT_SCALE_FACTOR=2`
+    // *multiplies onto* the platform scale an output already declared,
+    // and Chromium's `--force-device-scale-factor` likewise — so on
+    // that stack the desktop says nothing and lets the protocol do it.
+    //
+    // The X11 session keeps every one of them. There is no output scale
+    // in X11 for a client to read, which is the whole reason this
+    // machinery was written.
+    //
+    // This withholding has flip-flopped once, so the history is worth
+    // keeping: it was first withheld on exactly the reasoning above,
+    // back when the compositor did not yet advertise a scale — which
+    // left every launched client at 1x, and the withholding was
+    // reverted. The outputs advertise for real now, verified end to
+    // end under `WAYLAND_DEBUG`, so the reasoning has finally caught
+    // up with the code it was written for. Withheld means *absent*,
+    // not "passed as 1": every one of these is an override, and an
+    // explicit 1 would pin to 1x exactly the client the output is
+    // telling to draw at 2x.
+    let stack = spawn::current_display_stack();
+    let scale_fixups = matches!(stack, spawn::DisplayStack::X11);
+    if base.contains("chrom")
+        || base.contains("chrome")
+        || base.starts_with("microsoft-edge")
+        || base.starts_with("brave")
+    {
+        if scale_fixups {
+            argv.extend(spawn::chromium_scale_args(scale));
+        }
+        argv.extend(spawn::chromium_avoid_secrets_service_hang_args());
+        argv.extend(spawn::chromium_platform_args(stack));
+    }
+    let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut env = launch_env(&theme.id, crate::appearance::load_published(), scale);
+    env.extend(spawn::activation_env(activation_token));
+    spawn::spawn_detached_with_env(program, &arg_refs, &env, &[]);
+    None
+}
+
+/// The Omarchy submenu's source for a session state: `None` when the
+/// key is off or no Omarchy menu is installed. A fresh handle each
+/// time — the read is two small files, and a fresh handle is what
+/// makes "reload" mean re-read.
+fn omarchy_menu_for(state: &SessionState) -> Option<crate::omarchy_menu::OmarchyMenu> {
+    if !state.omarchy_menu {
+        return None;
+    }
+    let menu = crate::omarchy_menu::OmarchyMenu::discover();
+    if menu.is_none() {
+        tracing::info!("no Omarchy menu definition installed; the root menu carries no Omarchy submenu");
+    }
+    menu
+}
+
+pub(crate) fn launch_env(
+    theme_id: &str,
+    appearance: Option<wm_theme::Appearance>,
+    scale: f32,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("CHONKSTEP_THEME".to_string(), theme_id.to_string()),
+        ("CHONKSTEP_SCALE".to_string(), format!("{scale:.4}")),
+    ];
+    if let Some(appearance) = appearance {
+        env.push(("CHONKSTEP_APPEARANCE".to_string(), appearance.name().to_string()));
+    }
+    let scale_fixups = matches!(spawn::current_display_stack(), spawn::DisplayStack::X11);
+    if scale_fixups {
+        env.extend(spawn::gtk_qt_scale_env(scale));
+    }
+    env.extend(crate::startup::xcursor_size_env(scale));
+    env
+}
+
+/// Runs one Omarchy menu command exactly as `omarchy-shell` does —
+/// `bash -lc <command>`, detached, never waited on — with the same
+/// launch environment every other GUI the shell starts gets, since
+/// most Omarchy actions end in a window (a webapp, a floating
+/// terminal, a picker).
+/// How long a menu-launched Omarchy theme pick stays armed for
+/// adoption. Long enough to browse the picker at leisure; short enough
+/// that an abandoned pick cannot re-dress the desk much later.
+const ADOPTION_ARM_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
+
+fn run_omarchy_command(command: &str, theme: &Theme, activation_token: Option<String>) {
+    let scale = theme.titlebar.font.size / 12.0;
+    let (program, args) = crate::omarchy_menu::action_argv(command);
+    tracing::info!(command, "running omarchy menu command");
+    let mut env = launch_env(&theme.id, crate::appearance::load_published(), scale);
+    env.extend(spawn::activation_env(activation_token));
+    spawn::spawn_detached_with_env(program, &args, &env, &[]);
+}
+
+/// Starts Omarchy's shell if this session is one that should host it
+/// (`crate::omarchy_shell` owns the rule), through the exact launch
+/// path an Omarchy menu action takes — `bash -lc`, detached, with the
+/// desktop's launch environment — running the launcher by the path the
+/// verdict resolved. Every outcome is logged once, so the session log
+/// answers "why is there no bar".
+fn host_omarchy_shell(
+    verdict: &crate::omarchy_shell::Verdict,
+    theme_id: &str,
+    appearance: wm_theme::Appearance,
+    scale: f32,
+) {
+    use crate::omarchy_shell::{self, Verdict};
+    match verdict {
+        Verdict::Launch(paths) => {
+            if let Some(target) = crate::omarchy_export::default_target() {
+                match crate::omarchy_export::install_missing(&target) {
+                    Ok(written) if !written.is_empty() => tracing::info!(count = written.len(), "registered ChonkStep themes in Omarchy"),
+                    Ok(_) => {},
+                    Err(error) => tracing::warn!(%error, path = %target.display(), "could not register ChonkStep themes in Omarchy"),
+                }
+            }
+            let command = omarchy_shell::launch_command(paths);
+            let (program, args) = crate::omarchy_menu::action_argv(&command);
+            match spawn::spawn_detached_with_env(program, &args, &launch_env(theme_id, Some(appearance), scale), &[]) {
+                Some(pid) => {
+                    tracing::info!(pid, launcher = %paths.launcher.display(), "hosting Omarchy's shell")
+                }
+                None => {
+                    tracing::warn!(launcher = %paths.launcher.display(), "Omarchy's shell launcher failed to start")
+                }
+            }
+        }
+        Verdict::Disabled => tracing::info!("not hosting Omarchy's shell: omarchy_shell = false"),
+        Verdict::NotWayland => {
+            tracing::debug!("not hosting Omarchy's shell: not a Wayland session")
+        }
+        Verdict::NotInstalled => tracing::info!("no Omarchy shell installed; nothing to host"),
+    }
+}
+
+/// Path to the `chonk-about` demo binary — resolved relative to the
+/// shell binary's own running image (`chonk-about` always builds into
+/// the same output directory, debug or release), not the process's
+/// current working directory. A real xsession launched by a display
+/// manager has no reason for `cwd` to be sitting inside this project's
+/// checkout — the previous relative-path version only ever worked by
+/// coincidence, when run from a dev shell already `cd`'d there, and
+/// would silently fail to launch anywhere else (a real
+/// `scripts/xsession.sh` session included).
+fn about_binary_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("chonk-about")))
+        .filter(|p| p.exists())
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "chonk-about".to_string())
+}
+
+/// Combo -> action lookup for [`Shell::keymap_action`]. Built once: the
+/// config is immutable for the life of the process — editing the file
+/// and hot-restarting re-execs a fresh process that re-reads it, the
+/// same hot-reload path everything else uses. Should a combo somehow
+/// appear twice, the later binding wins (plain insertion order),
+/// matching the intuition that the line further down the file is the
+/// correction.
+/// Which passive key grabs to release and which to take, moving from
+/// the combos currently held to the combos a config now asks for.
+///
+/// Pure, and separated from the calls it implies, for the reason every
+/// resolver in [`crate::startup`] is: the interesting part is the rule,
+/// the rule is easy to get subtly wrong (a combo present in both lists
+/// must be left alone, not dropped and re-taken), and a test for it
+/// should not need a display server.
+///
+/// A combo bound twice in one config yields one grab: the keymap
+/// resolves duplicates by last-one-wins, and grabbing the same combo
+/// twice would leave the second grab held after the first is released.
+fn grab_delta(previous: &[KeyCombo], next: &[(KeyCombo, Action)]) -> (Vec<KeyCombo>, Vec<KeyCombo>) {
+    let mut wanted: Vec<KeyCombo> = next.iter().map(|(combo, _)| *combo).collect();
+    wanted.sort_by_key(|combo| (combo.keysym, combo.modifiers.bits()));
+    wanted.dedup();
+    let to_ungrab = previous.iter().filter(|combo| !wanted.contains(combo)).copied().collect();
+    let to_grab = wanted.iter().filter(|combo| !previous.contains(combo)).copied().collect();
+    (to_ungrab, to_grab)
+}
+
+fn build_keymap(bindings: &[(KeyCombo, Action)]) -> HashMap<KeyCombo, Action> {
+    bindings.iter().cloned().collect()
+}
+
+fn bindings_for_grabs(state: &SessionState) -> Vec<(KeyCombo, Action)> {
+    let mut bindings = state.keybindings.clone();
+    for binding in &state.bindings {
+        if !bindings.iter().any(|(combo, _)| *combo == binding.combo) {
+            bindings.push((binding.combo, binding.action.clone()));
+        }
+    }
+    bindings
+}
+
+fn apply_binding_behaviors<B: Backend>(backend: &mut B, previous: &[wm_config::Binding], next: &[wm_config::Binding]) {
+    for binding in previous {
+        if binding.release || matches!(&binding.action, Action::GlobalShortcut(_)) {
+            backend.set_key_release(binding.combo, false);
+        }
+        if binding.locked {
+            backend.set_key_locked(binding.combo, false);
+        }
+        if binding.repeating {
+            backend.set_key_repeating(binding.combo, false);
+        }
+    }
+    for binding in next {
+        if binding.release || matches!(&binding.action, Action::GlobalShortcut(_)) {
+            backend.set_key_release(binding.combo, true);
+        }
+        if binding.locked {
+            backend.set_key_locked(binding.combo, true);
+        }
+        if binding.repeating {
+            backend.set_key_repeating(binding.combo, true);
+        }
+    }
+}
+
+// The keysyms the modal Overview owns, spelled as the X11 values both
+// backends deliver (the same table `wm_config::parse_key` speaks).
+const XK_LEFT: u32 = 0xff51;
+const XK_UP: u32 = 0xff52;
+const XK_RIGHT: u32 = 0xff53;
+const XK_DOWN: u32 = 0xff54;
+const XK_RETURN: u32 = 0xff0d;
+const XK_KP_ENTER: u32 = 0xff8d;
+
+/// What one key press means inside an open Overview session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverviewIntent {
+    /// Step the selection one card in `(dx, dy)`.
+    Move(i32, i32),
+    /// Focus + raise the selected card and leave.
+    Commit,
+    /// Leave without committing.
+    Dismiss,
+}
+
+/// Resolves a key pressed while the Overview holds the keyboard.
+/// Bare arrows move, bare Return (either Enter) commits, and
+/// *everything else* dismisses — Escape by convention, and any other
+/// key because a modal panel that silently eats typing is worse than
+/// one that steps aside (the Alt-Tab switcher treats a stray key the
+/// same way, for the same reason). Modified arrows dismiss rather
+/// than move so a workspace chord like alt+ctrl+right pressed out of
+/// habit closes the panel instead of invisibly rebinding itself to
+/// selection movement. The toggle binding itself is resolved by the
+/// caller against the keymap before this is consulted, so a
+/// super+up-style binding closes the panel rather than reading as a
+/// modified arrow.
+fn overview_intent(combo: &KeyCombo) -> OverviewIntent {
+    if !combo.modifiers.is_empty() {
+        return OverviewIntent::Dismiss;
+    }
+    match combo.keysym {
+        XK_LEFT => OverviewIntent::Move(-1, 0),
+        XK_RIGHT => OverviewIntent::Move(1, 0),
+        XK_UP => OverviewIntent::Move(0, -1),
+        XK_DOWN => OverviewIntent::Move(0, 1),
+        XK_RETURN | XK_KP_ENTER => OverviewIntent::Commit,
+        _ => OverviewIntent::Dismiss,
+    }
+}
+
+/// The outcome half of a root-menu pick, split from the side effects in
+/// `run_root_menu_action` so the contract the binary's control flow
+/// hangs on — Exit ends the session, SetTheme demands a restart,
+/// everything else continues — is pinned by unit test without a
+/// backend. Deliberately exhaustive: a new `RootMenuAction` variant
+/// fails compilation here instead of silently continuing.
+fn root_action_outcome(action: &RootMenuAction) -> ShellOutcome {
+    match action {
+        RootMenuAction::Exit => ShellOutcome::Exit,
+        // A theme redresses every surface at once, and used to need a
+        // fresh process to do it. `run_root_menu_action` now applies it
+        // in place, so there is nothing left for the binary to carry
+        // out.
+        RootMenuAction::SetTheme(_) => ShellOutcome::Continue,
+        RootMenuAction::LaunchTerminal
+        | RootMenuAction::LaunchAbout
+        | RootMenuAction::Help
+        | RootMenuAction::LaunchApp { .. }
+        | RootMenuAction::OmarchyCommand { .. }
+        | RootMenuAction::ToggleOmarchyBar
+        | RootMenuAction::SetWallpaper(_) => ShellOutcome::Continue,
+    }
+}
+
+/// The live client set as session-layout records — what the layout
+/// store debounces and persists (see `crate::session_layout`). Windows
+/// with no class are skipped: there is nothing to relaunch them by and
+/// nothing to match them back to, so a record would only ever expire.
+/// A maximized window records its *pre-maximize* geometry (the flag
+/// re-derives the maximize against the next session's workarea), which
+/// also keeps restore-then-unmaximize exact.
+fn layout_snapshot<B: Backend>(wm: &WindowManager<B>, apps: &[AppEntry]) -> Vec<WindowRecord> {
+    wm.iter_clients()
+        .filter(|(_, client)| !client.class.is_empty())
+        .map(|(id, client)| {
+            let maximized = client
+                .flags
+                .intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V);
+            let root_geometry = client.placement.freeform
+                .or_else(|| maximized.then_some(client.restore_geometry).flatten())
+                .or(wm.fullscreen_restore_geometry(id))
+                .unwrap_or(client.geometry);
+            let (geometry, monitor_identity) = layout_record_geometry(wm, root_geometry);
+            let floating = floating_record_geometry(wm, id);
+            WindowRecord {
+                spatial: Some(SpatialRecord {
+                    fullscreen_origin: wm.mac_fullscreen_origin(id),
+                    home_geometry: wm.space_home_geometry(id).map(HomeGeometryRecord::from),
+                    floating: client.placement.floating,
+                    order: wm
+                        .layout_order(client.workspace)
+                        .iter()
+                        .position(|&i| i == id)
+                        .unwrap_or(0),
+                    flow_width: client.placement.flow_width,
+                    mosaic_weight: client.placement.mosaic_weight,
+                    output: client.placement.output.clone(),
+                    focused: wm.focused_client() == Some(id),
+                    floating_geometry: floating.map(|(rect, _)| {
+                        [
+                            rect.pos.x as i64,
+                            rect.pos.y as i64,
+                            rect.size.w as i64,
+                            rect.size.h as i64,
+                        ]
+                    }),
+                    floating_monitor: floating.and_then(|(_, monitor)| monitor.map(str::to_owned)),
+                }),
+                class: client.class.clone(),
+                app: apps::match_window_class(apps, &client.class).map(|index| apps[index].id.clone()),
+                geometry,
+                monitor_identity: monitor_identity.map(str::to_owned),
+                workspace: client.workspace,
+                maximized,
+                shaded: client.flags.contains(ClientFlags::SHADED),
+                miniaturized: client.lifecycle == Lifecycle::Miniaturized,
+            }
+        })
+        .collect()
+}
+
+fn layout_record_geometry<B: Backend>(wm: &WindowManager<B>, geometry: Rect) -> (Rect, Option<&str>) {
+    let half_width = (geometry.size.w / 2).min(i32::MAX as u32) as i32;
+    let half_height = (geometry.size.h / 2).min(i32::MAX as u32) as i32;
+    let center = Point::new(
+        geometry.pos.x.saturating_add(half_width),
+        geometry.pos.y.saturating_add(half_height),
+    );
+    let monitor = wm.monitors_ref().get(wm.monitor_index_at(center));
+    if wm.separate_spaces() {
+        if let Some(monitor) = monitor {
+            let mut local = geometry;
+            local.pos.x = local.pos.x.saturating_sub(monitor.geometry.pos.x);
+            local.pos.y = local.pos.y.saturating_sub(monitor.geometry.pos.y);
+            return (local, Some(monitor.identity.as_deref().unwrap_or(&monitor.name)));
+        }
+    }
+    relative_to_monitor(monitor, geometry)
+}
+
+fn floating_record_geometry<B: Backend>(
+    wm: &WindowManager<B>,
+    id: ClientId,
+) -> Option<(Rect, Option<&str>)> {
+    let client = wm.client(id)?;
+    (client.placement.floating && client.placement.freeform.is_some())
+        .then(|| layout_record_geometry(wm, client.geometry))
+}
+
+/// Whether `records` still describe the live client set exactly,
+/// without cloning a class name or consulting the application index.
+///
+/// This is the steady-state counterpart to [`layout_snapshot`]. The
+/// compositor ticks even on an otherwise idle desktop so timers can
+/// mature; rebuilding the owned snapshot on every one of those ticks
+/// used to clone every class and perform `windows × applications`
+/// identity comparisons only to have `SessionLayout` discover that
+/// the resulting vector equalled the one it already held. The fields
+/// below deliberately mirror `layout_snapshot` one for one (except
+/// `app`, which is a pure function of the unchanged class and the
+/// immutable startup index). A future persisted field therefore has
+/// one obvious second site that the compiler review must update.
+fn layout_matches_clients<B: Backend>(wm: &WindowManager<B>, records: &[WindowRecord]) -> bool {
+    let mut clients = wm.iter_clients().filter(|(_, client)| !client.class.is_empty());
+    for record in records {
+        let Some((id, client)) = clients.next() else {
+            return false;
+        };
+        let maximized = client
+            .flags
+            .intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V);
+        let root_geometry = client.placement.freeform
+            .or_else(|| maximized.then_some(client.restore_geometry).flatten())
+            .or(wm.fullscreen_restore_geometry(id))
+            .unwrap_or(client.geometry);
+        let (geometry, monitor_identity) = layout_record_geometry(wm, root_geometry);
+        let placement = &client.placement;
+        let floating = floating_record_geometry(wm, id);
+        let spatial_matches = record.spatial.as_ref().is_some_and(|r| {
+            (match (&r.home_geometry, wm.space_home_geometry(id)) {
+                (Some(record), Some(saved)) => record.matches(saved),
+                (None, None) => true,
+                _ => false,
+            }) && r.fullscreen_origin == wm.mac_fullscreen_origin(id)
+                && r.floating == placement.floating
+                && r.flow_width == placement.flow_width
+                && r.mosaic_weight == placement.mosaic_weight
+                && r.output == placement.output
+                && r.focused == (wm.focused_client() == Some(id))
+                && r.order
+                    == wm
+                        .layout_order(client.workspace)
+                        .iter()
+                        .position(|&i| i == id)
+                        .unwrap_or(0)
+                && r.floating_geometry
+                    == floating.map(|(rect, _)| {
+                        [
+                            rect.pos.x as i64,
+                            rect.pos.y as i64,
+                            rect.size.w as i64,
+                            rect.size.h as i64,
+                        ]
+                    })
+                && r.floating_monitor.as_deref() == floating.and_then(|(_, monitor)| monitor)
+        });
+        if !spatial_matches
+            || record.class != client.class
+            || record.geometry != geometry
+            || record.monitor_identity.as_deref() != monitor_identity
+            || record.workspace != client.workspace
+            || record.maximized != maximized
+            || record.shaded != client.flags.contains(ClientFlags::SHADED)
+            || record.miniaturized != (client.lifecycle == Lifecycle::Miniaturized)
+        {
+            return false;
+        }
+    }
+    clients.next().is_none()
+}
+
+const MAX_IDLE_HOUSEKEEPING: Duration = crate::startup::SESSION_REQUEST_POLL_INTERVAL;
+
+fn bounded_housekeeping_wait(now: Instant, deadline: Option<Instant>) -> Duration {
+    deadline.map(|at| at.saturating_duration_since(now)).unwrap_or(MAX_IDLE_HOUSEKEEPING).min(MAX_IDLE_HOUSEKEEPING)
+}
+
+/// What servicing control-socket requests has cost, for the opt-in
+/// Wayland test door. Counting passes and their peak is what lets a
+/// test prove a flood was paced rather than merely answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlLoad {
+    /// Servicing passes that returned at least one command.
+    pub passes: u64,
+    /// Most commands any one pass returned.
+    pub peak: usize,
+    /// Diagnostic dumps built for `debug` requests.
+    pub dumps: u64,
+}
+
+impl ControlLoad {
+    fn note_pass(&mut self, commands: usize) {
+        if commands > 0 {
+            self.passes = self.passes.wrapping_add(1);
+            self.peak = self.peak.max(commands);
+        }
+    }
+}
+
+/// Moves the focused client to `workspace` and follows it there — the
+/// keyboard "carry" gesture — move to the next or previous workspace
+/// with the window in hand. The refocus at the end is load-bearing:
+/// `move_client_to_workspace` drops focus the instant the client leaves
+/// the active workspace, and without re-focusing after arriving, the
+/// second carry press in a row would find nothing focused and silently
+/// do nothing — the whole point of the gesture is carrying one window
+/// across several workspaces in repeated presses. The refocus rides the
+/// public `ActivateRequested` path (the same one a pager's
+/// `_NET_ACTIVE_WINDOW` message takes), so it also re-raises — correct
+/// here, since the carried window was the focused one to begin with. A
+/// no-op with nothing focused.
+/// The primary monitor's rect — where every piece of shell chrome
+/// hangs. The `primary` flag decides it, the first entry stands in
+/// where the platform named none (matching `Backend::monitors`' own
+/// contract), and an origin-anchored rect of the whole screen is the
+/// last resort for a backend reporting no monitors at all — which is
+/// exactly the single-screen assumption the shell made before it was
+/// monitor-aware, so nothing regresses on a backend that never reports
+/// one.
+fn primary_rect(monitors: &[MonitorInfo], screen: Size) -> Rect {
+    monitors
+        .iter()
+        .find(|m| m.primary)
+        .or_else(|| monitors.first())
+        .map(|m| m.geometry)
+        .unwrap_or(Rect { pos: Point::new(0, 0), size: screen })
+}
+
+pub enum KeyResolution {
+    Action(Action),
+    Menu(MenuKey),
+    Consumed,
+}
+
+pub struct Shell<B: Backend + PopupHost<PopupId = B::ShellId>> {
+    desktop: Desktop<B>,
+    miniwindows: crate::miniwindows::Miniwindows<B>,
+    help: crate::help::HelpPanel<B>,
+    help_key: Option<KeyCombo>,
+    /// Keeps the desktop's application index current: a directory poll
+    /// from `tick` and a walk on its own thread when one moves, so an
+    /// app installed during the session reaches the Applications
+    /// submenu without a restart — and no `.desktop` file is ever read
+    /// on this thread after startup. The index itself lives in
+    /// `Desktop`, the one place a pick is resolved.
+    app_rescan: apps::Rescanner,
+    /// Everything a live change can alter, as resolved — the source
+    /// `theme` below is derived from, and the base every later
+    /// [`Shell::apply_session_state`] diffs against.
+    state: SessionState,
+    /// `state.theme()`, cached: the scaled theme every surface is drawn
+    /// from, recomputed only when the state it comes from changes.
+    /// `Theme::scaled` clones and re-rounds every metric in the theme,
+    /// which is not something to do on the paint path.
+    theme: Theme,
+    /// The font database the decoration engine rasterizes with, held so
+    /// a restyle can build the replacement engine around the *same*
+    /// one — see [`FontState`], and `RasterThemeEngine::with_fonts`.
+    fonts: FontState,
+    /// The config-file key combos this shell currently holds passive
+    /// grabs for. Owned here rather than by the binaries because a
+    /// reload has to release what the user unbound, which means
+    /// knowing what was bound before — and two binaries tracking that
+    /// separately is two chances to leak a grab.
+    grabbed: Vec<KeyCombo>,
+    keymap: HashMap<KeyCombo, Action>,
+    release_keymap: HashMap<KeyCombo, Action>,
+    layer_keymap: HashMap<KeyCombo, Action>,
+    active_layer_namespaces: std::collections::BTreeMap<String, usize>,
+    scoped_grabbed: Vec<KeyCombo>,
+    /// The session-layout store: records the live window arrangement
+    /// (debounced, from `tick`) and holds the previous session's
+    /// records while a restore is matching mapped windows against
+    /// them. See `crate::session_layout` for all the rules.
+    layout: SessionLayout,
+    restore_focus: Option<ClientId>,
+    /// Owned identities last reconciled into the launcher strip's
+    /// running lamps. Most ticks prove these still match through
+    /// borrowed comparisons and avoid allocating/cloning them again.
+    /// The key press an open Overview session intercepted, parked
+    /// between the two halves of the binaries' key protocol:
+    /// [`Shell::keymap_action`] resolves a combo, [`Shell::run_action`]
+    /// runs the resolved action, and the action type
+    /// (`wm_config::Action`) deliberately stays a closed set of config
+    /// verbs with one `Overview` entry rather than growing internal
+    /// move/commit variants no config file may name. So while the
+    /// Overview is modal, `keymap_action` answers `Overview` for every
+    /// key and parks the combo here for `run_action` to route. The two
+    /// calls are adjacent in both binaries' loops by construction;
+    /// `run_action` `take()`s, so a stale combo cannot leak into a
+    /// later session.
+    overview_key: Option<KeyCombo>,
+    overview_application: Option<ClientId>,
+    overview_output: Option<String>,
+    overview_spaces: Vec<String>,
+    overview_revision: u64,
+    /// Armed on press, invalidated whenever Overview's entry set changes.
+    overview_close_pressed: Option<usize>,
+    /// Every terminal this shell launched that has not been observed
+    /// to exit — the retint list for live appearance switches. foot
+    /// swaps its color sections on SIGUSR1/SIGUSR2, and these handles
+    /// are the only pids the shell can prove are still its terminals
+    /// (their reaper threads keep the pids from being recycled — see
+    /// `spawn::SpawnedChild`). Pruned on every switch; a terminal the
+    /// user opened by hand is not in here and simply keeps its colors,
+    /// which `docs/appearance.md` says out loud.
+    terminals: Vec<spawn::SpawnedChild>,
+    /// The pointer's last known root-relative position, recorded by
+    /// every [`Shell::on_motion`] call. Shell button events carry only
+    /// surface-local coordinates, but the launcher strip's release/pin
+    /// decisions need a root position — and the most recent motion is
+    /// exact for them in practice, since a drag's release is always
+    /// preceded by the motion that put the pointer wherever it is
+    /// released. Lives on the struct because the release drains from
+    /// `take_shell_click` on a later loop iteration than the motion
+    /// that preceded it.
+    pointer_root: Point,
+    /// The control socket third-party bars read the desktop through
+    /// (`docs/control-socket.md`). Serviced in [`Shell::tick`]; costs
+    /// nothing while no bar is connected.
+    control: ControlSocket,
+    /// Advances when the shell-owned style fields represented by a
+    /// control snapshot change. `WindowManager` owns the other semantic
+    /// revision; keeping the two separate makes a quiet tick a handful
+    /// of integer comparisons instead of a deep snapshot diff.
+    control_theme_revision: u64,
+    /// Monotonic diagnostic count of full control snapshots constructed.
+    /// Exposed through the opt-in Wayland test door so the E2E suite can
+    /// distinguish a cheap quiet pass from an allocated diff that emitted
+    /// nothing.
+    control_snapshot_builds: u64,
+    /// How much the control socket's requests have cost, for the same
+    /// door: proof that a flooding client is paced, not merely answered.
+    control_load: ControlLoad,
+    /// What the event loop recorded for the control descriptors since
+    /// the last pass, handed in by [`Shell::note_control_readable`].
+    /// `None` on a loop that keeps no such record (X11), where the
+    /// socket asks the kernel itself.
+    control_readable: Option<bool>,
+    /// Cached-path, cadence-bounded reader for the public
+    /// `appearance-request` marker. Client traffic may wake the shell
+    /// far faster than a human-visible control needs filesystem probes.
+    appearance_requests: crate::appearance::RequestPoller,
+    /// Set by [`Shell::keymap_action`] when a transient-dismiss Escape
+    /// lands, consumed by [`Shell::tick`]. Parked rather than acted on
+    /// inline because `keymap_action` has no `WindowManager` to close
+    /// the panel with — the same two-phase shape the Overview's parked
+    /// combo uses, and `tick` runs later in the very same loop
+    /// iteration, so the dismissal is never a frame behind.
+    transient_escape: bool,
+    config_reloaded: bool,
+    /// Set by an explicit reload alone — `hyprctl reload`, the reload
+    /// marker, a bound `reload` key — and drained by the compositor,
+    /// which then reconciles the session's monitor rules against the
+    /// outputs it drives. The one-second file watch and Omarchy theme
+    /// following re-resolve through [`Shell::reresolve`] without setting
+    /// it: re-applying a monitor rule can be a modeset, and a save of an
+    /// unrelated key must never move an output.
+    monitor_rules_pending: bool,
+    /// Notices Omarchy switching its theme underneath a session that
+    /// follows it (`SessionState::following`); asked once a second from
+    /// [`Shell::tick`] while following — and while an adoption is
+    /// armed (below), so a pick can be noticed before following began.
+    omarchy: crate::omarchy_follow::Watch,
+    /// Set when the user launches Omarchy's own theme flow from this
+    /// desktop's menu while wearing a built-in theme. Their intent —
+    /// "give me that theme" — is expressed at launch, but honored only
+    /// when Omarchy's current theme actually changes on disk: the
+    /// picker cancelled is a desk unchanged. Expires rather than
+    /// lingering, so a pick abandoned this morning cannot re-dress the
+    /// desk this afternoon.
+    omarchy_adoption_armed: Option<std::time::Instant>,
+    /// Watches the user's *own* Hyprland configuration — their
+    /// bindings, window rules and autostart — so an edit made through
+    /// Omarchy's menu takes effect without a restart.
+    ///
+    /// The sibling of [`Self::omarchy`] beside it, at the same one-hertz
+    /// cadence and for a stronger version of the same reason: those
+    /// files are written by `rename`-over rather than in place, which
+    /// an inotify watch has to re-arm for and a signature comparison
+    /// simply sees. `None` on a session that does not read anybody
+    /// else's configuration, which is most of them — see
+    /// `wm_config::hyprland::wanted`.
+    hyprland_config: Option<(wm_config::hyprland::Roots, wm_config::hyprland::Watch)>,
+    /// The reload guard's live switch — `hl.config({ misc = {
+    /// disable_autoreload = BOOL } })`, `keyword misc:disable_autoreload`
+    /// — standing over the configuration's own
+    /// `SessionState::disable_autoreload`. `None` until the IPC says
+    /// either way, so until then a reload that changes the file's line
+    /// is followed; after that the live word holds for the session. It
+    /// is written nowhere, so a package transaction killed between
+    /// Omarchy's pause and resume hooks leaves the watch paused only
+    /// until logout — see [`Shell::set_autoreload_paused`].
+    autoreload_live: Option<bool>,
+    /// The per-workspace layout rules the last pass installed, so the
+    /// next pass applies only what changed — see
+    /// [`apply_workspace_layouts`].
+    applied_workspace_layouts: std::collections::BTreeMap<usize, wm_core::LayoutMode>,
+}
+
+/// Installs the workspace styles the configuration names:
+/// `default_layout` as the window manager's default, and each
+/// per-workspace rule through the same `set_workspace_layout` a toggle
+/// or an IPC request takes.
+///
+/// `applied` is the rule set from the last pass. The one-hertz watch
+/// over the Hyprland configuration fires on *any* file in the tree, so
+/// a re-read must not undo a live choice: only a rule whose value
+/// changed since the last pass is applied, and the default reaches
+/// only workspaces that never had a style chosen for them — `wm-core`
+/// keeps that distinction. A rule that disappeared leaves its
+/// workspace as it is; nothing in the file says what it should become,
+/// and the user's live desk is the better answer.
+///
+/// Precedence, highest first: a restored session's own modes (applied
+/// after this, in `tick`, when restore is on), then the per-workspace
+/// rule, then the default, then Freeform.
+fn apply_workspace_layouts<B: Backend>(
+    wm: &mut WindowManager<B>,
+    applied: &mut std::collections::BTreeMap<usize, wm_core::LayoutMode>,
+    default: Option<wm_core::LayoutMode>,
+    rules: &std::collections::BTreeMap<usize, wm_core::LayoutMode>,
+) {
+    wm.set_default_workspace_layout(default.unwrap_or_default());
+    for (&workspace, &mode) in rules {
+        if applied.get(&workspace) != Some(&mode) {
+            wm.set_workspace_layout(workspace, mode);
+        }
+    }
+    *applied = rules.clone();
+}
+
+/// The watch over the user's own Hyprland configuration, for a session
+/// that reads one.
+///
+/// Returns `None` — and so costs a session that reads nobody else's
+/// files exactly one `Option` check per frame and no disk access at
+/// all — when the posture does not call for it, or when there is no
+/// `$HOME` to find a configuration under.
+///
+/// The initial read here is a second read of files `wm_config::parse`
+/// has already been through, and that is deliberate: it is what the
+/// watch's baseline is taken over, so the *set of files* being watched
+/// is the set that was actually opened rather than a guess at which
+/// ones a configuration might use. It happens once, at startup,
+/// against about forty small files.
+fn hyprland_watch(state: &SessionState) -> Option<(wm_config::hyprland::Roots, wm_config::hyprland::Watch)> {
+    if !state.reads_hyprland_config {
+        return None;
+    }
+    let roots = wm_config::hyprland::Roots::of_this_machine()?;
+    let reading = wm_config::hyprland::read(&roots);
+    let watch = wm_config::hyprland::Watch::new(&roots, &reading);
+    tracing::info!(files = reading.files.len(), "watching the desktop's Hyprland configuration for changes");
+    Some((roots, watch))
+}
+
+/// Whether the tick should re-read the desktop's Hyprland configuration
+/// now. While auto-reload is paused the watch is not consulted at all —
+/// no `stat`, and no advance of its baseline — so the first look after
+/// the pause lifts compares against the signature from before it and
+/// re-reads once if anything moved in between. The pause only removes
+/// filesystem work from the compositor thread; it never adds any.
+fn hyprland_config_due(paused: bool, watch: &mut wm_config::hyprland::Watch, now: Instant) -> bool {
+    !paused && watch.changed(now)
+}
+
+/// A bound `Action::Resize` on one window: a layout-managed window
+/// moves its shared boundary or its Flow width, and any other window
+/// resizes its content.
+///
+/// The delta is in logical pixels, the unit Omarchy writes its chords in
+/// and `hyprctl dispatch resizeactive` takes, while both resize paths
+/// work in the device pixels of the window's output. It is converted
+/// once, here, by that output's scale, so a chord on a 2x panel moves as
+/// far as the same IPC request instead of half as far.
+fn resize_by_logical_delta<B: Backend>(wm: &mut WindowManager<B>, id: ClientId, delta: Point) {
+    let scale = wm.client_output_scale(id);
+    // A delta from a config file is untrusted. `as` saturates at the
+    // bounds of `i32`, so a wild delta times the scale cannot wrap, and
+    // the size clamp below still holds.
+    let physical = |length: i32| (f64::from(length) * scale).round() as i32;
+    let delta = Point::new(physical(delta.x), physical(delta.y));
+    if !wm.resize_layout_window(id, delta) {
+        if let Some(c) = wm.client(id) {
+            let size = wm_core::Size::new(
+                (c.geometry.size.w as i64 + delta.x as i64).clamp(1, 65536) as u32,
+                (c.geometry.size.h as i64 + delta.y as i64).clamp(1, 65536) as u32,
+            );
+            wm.resize_client_content(id, size);
+        }
+    }
+}
+
+impl<B: Backend + PopupHost<PopupId = B::ShellId>> Shell<B> {
+    /// Inspect the shared font/glyph cache without clearing it. Explicit
+    /// diagnostics only: this walks cache entries and must not run per frame.
+    pub fn font_cache_statistics(&self) -> wm_theme::FontCacheStatistics {
+        self.fonts.cache_statistics()
+    }
+
+    pub fn new(backend: &mut B, state: &SessionState, fonts: FontState) -> Self {
+        let theme = state.theme();
+        let scale = state.scale;
+        let screen = backend.screen_size();
+        // Chrome hangs on the primary monitor, not on the screen: the
+        // screen spans every output at once, so its own corners are
+        // wherever the outermost heads happen to be.
+        let primary = primary_rect(&backend.monitors(), screen);
+
+        let now = Instant::now();
+        // The startup walk is the one synchronous read of the
+        // application directories: it runs before the first frame, and
+        // session restore below needs the index in hand to plan its
+        // relaunches. Every later walk is the rescanner's, off-thread.
+        let scan = apps::scan_applications();
+        tracing::info!(count = scan.entries().len(), "application entries scanned");
+        let app_rescan = apps::Rescanner::new(&scan, now);
+        let apps = scan.into_index();
+
+        // Both chrome owners get handles to the caller's font state —
+        // the one `FontSystem` this session ever builds. They used to
+        // construct their own, which cost two more full font scans at
+        // boot for databases identical to the one already in hand.
+        let mut desktop =
+            Desktop::new(backend, screen, primary, scale, &theme, state.appearance, apps.clone(), fonts.clone());
+        desktop.set_chrome(backend, &theme, state.decoration_style, state.scale);
+        desktop.set_omarchy_menu(omarchy_menu_for(state));
+        let control = ControlSocket::new(&control::current_display());
+
+        // Session-layout restore, opt-in and only for a genuinely new
+        // session: a hot restart on the X11 stack keeps every client
+        // alive through the SaveSet, and relaunching the recorded
+        // layout into that session would duplicate every window on
+        // the screen — `session_continues` is that continuation's
+        // marker. Launches ride the exact paths the menus use
+        // (`spawn_terminal`, `launch_app`), so a restored application
+        // gets the same scale/platform fixups a hand-launched one
+        // would; the windows are then matched and re-placed as they
+        // map, in `on_notification`.
+        let restore = state.restore_session && !crate::startup::session_continues();
+        let (layout, relaunch) = SessionLayout::start(restore, apps.entries(), now);
+        let mut terminals = Vec::new();
+        for plan in relaunch {
+            let terminal = match plan {
+                RelaunchPlan::Terminal => {
+                    spawn_terminal(state.terminal.as_deref(), &theme, state.terminal_font_px, primary.size)
+                }
+                // No activation token: a restore re-creates the
+                // previous desk, it is not the user asking for one
+                // application to be raised over the others.
+                RelaunchPlan::App(entry) => {
+                    launch_app(state.terminal.as_deref(), &entry, &theme, state.terminal_font_px, primary.size, None)
+                }
+            };
+            terminals.extend(terminal);
+        }
+
+        // Autostart, skipped only on an X11 hot restart — the one case
+        // where the previous session's clients are still alive (through
+        // the SaveSet) and re-running the list would leave the user
+        // with two of everything they asked to start once. A Wayland
+        // re-exec kills every client, so there the list runs again;
+        // `startup::autostart_runs` owns the rule.
+        //
+        // Ordered and detached. The order is the file's, because a list
+        // that starts a shell and then a thing that talks to that shell
+        // has an order that matters; detached because these are the
+        // user's processes to own, exactly as `[commands]` entries are.
+        // Nothing waits and nothing is retried: an autostart entry that
+        // fails costs the user that entry, never the session.
+        if crate::startup::autostart_runs(crate::startup::session_continues(), spawn::current_display_stack()) {
+            // No activation token: nobody asked for any one of these to
+            // be raised over the rest, and a session starting up has
+            // no focus worth guarding yet.
+            for argv in &state.autostart {
+                run_named_command("autostart", argv, state.scale, None);
+            }
+        }
+
+        // Omarchy's shell, where Hyprland's `autostart.lua` would start
+        // it. Wayland-only, so the gate above is moot for it: a Wayland
+        // re-exec kills the shell with the display it was drawing on,
+        // and a continuation has none until it starts one — see
+        // `crate::omarchy_shell`.
+        // The bar's visibility is settled *before* the launch, so the
+        // compositor already knows to keep the bar off the screen when
+        // its surface arrives a few hundred milliseconds later.
+        let verdict = crate::omarchy_shell::decide(state.omarchy_shell);
+        let hosted = matches!(verdict, crate::omarchy_shell::Verdict::Launch(_));
+        desktop
+            .set_omarchy_bar(backend, hosted.then(|| crate::omarchy_shell::BarVisibility::resolve(state.omarchy_bar)));
+        host_omarchy_shell(&verdict, &theme.id, state.appearance, state.scale);
+
+        crate::appearance::publish(state.appearance);
+        // Header bars take their window buttons from GSettings, where the
+        // stock layout is Close alone; see `appearance::button_layout`.
+        crate::appearance::publish_button_layout();
+
+        // Take the configured grabs through the same delta the applier
+        // uses, from an empty starting set: one implementation, so a
+        // fresh session and a reloaded one cannot end up holding
+        // different grabs for the same config file.
+        let grab_bindings = bindings_for_grabs(state);
+        let (_, to_grab) = grab_delta(&[], &grab_bindings);
+        for combo in &to_grab {
+            backend.grab_key(*combo);
+        }
+        apply_binding_behaviors(backend, &[], &state.bindings);
+
+        Self {
+            desktop,
+            miniwindows: crate::miniwindows::Miniwindows::default(),
+            help: crate::help::HelpPanel::default(),
+            help_key: None,
+            app_rescan,
+            keymap: build_keymap(&state.keybindings),
+            release_keymap: state
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    binding.release || matches!(&binding.action, Action::GlobalShortcut(_))
+                })
+                .map(|binding| (binding.combo, binding.action.clone()))
+                .collect(),
+            layer_keymap: HashMap::new(),
+            active_layer_namespaces: std::collections::BTreeMap::new(),
+            scoped_grabbed: Vec::new(),
+            overview_key: None,
+            overview_application: None,
+            overview_output: None,
+            overview_spaces: Vec::new(),
+            overview_revision: 0,
+            overview_close_pressed: None,
+            grabbed: to_grab,
+            layout,
+            restore_focus: None,
+            terminals,
+            state: state.clone(),
+            theme,
+            fonts,
+            pointer_root: Point::new(0, 0),
+            control,
+            control_theme_revision: 0,
+            control_snapshot_builds: 0,
+            control_load: ControlLoad::default(),
+            control_readable: None,
+            appearance_requests: crate::appearance::RequestPoller::new(now),
+            transient_escape: false,
+            config_reloaded: false,
+            monitor_rules_pending: false,
+            omarchy: crate::omarchy_follow::Watch::new(),
+            omarchy_adoption_armed: None,
+            // Armed only for a session that actually reads somebody
+            // else's configuration; on every other session this is
+            // `None` and the poll in `tick` never touches the disk.
+            hyprland_config: hyprland_watch(state),
+            autoreload_live: None,
+            applied_workspace_layouts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn apply_session_state(&mut self, wm: &mut WindowManager<B>, next: SessionState) {
+        self.apply_session_state_inner(wm, next, true);
+    }
+
+    /// Installs policy into the newly constructed window manager. The shell
+    /// already owns the resolved startup look and menu from [`Self::new`]; use
+    /// the same policy applier without rereading that menu a second time.
+    /// Live reloads must use [`Self::apply_session_state`] instead.
+    pub fn initialize_window_manager(&mut self, wm: &mut WindowManager<B>) {
+        self.apply_session_state_inner(wm, self.state.clone(), false);
+    }
+
+    fn apply_session_state_inner(&mut self, wm: &mut WindowManager<B>, mut next: SessionState, reload_menu: bool) {
+        self.dismiss_help(wm);
+        self.miniwindows.invalidate(wm.backend_mut());
+        next.decoration_style = next.base_theme.resolve_style(next.decoration_style_policy);
+        if (next.interaction.spaces_mode() || next.interaction.mac_keyboard()) && !wm.backend().supports_mac_interaction() {
+            tracing::warn!("Spaces and Mac keyboard profiles require chonkstep-wayland (including XWayland apps); retaining working configuration");
+            return;
+        }
+        if next.overview_style != self.state.overview_style && self.desktop.overview_visible() {
+            self.close_overview(wm);
+        }
+        // 1. Policy.
+        wm.set_focus_policy(next.focus);
+        wm.set_raise_on_focus(next.autoraise);
+        wm.set_hide_special_on_workspace_change(next.hide_special_on_workspace_change);
+        wm.set_focus_on_activate(next.focus_on_activate);
+        wm.set_placement_policy(next.placement);
+        wm.set_snap_threshold(next.edge_resistance);
+        wm.set_drag_modifier(next.drag_modifier);
+        wm.set_interaction_config(next.interaction.clone());
+        // Read by every transition on its next frame, so a reload that
+        // turns motion off lands the scenes in flight on their targets.
+        wm.set_motion_policy(next.motion);
+        // The scale belongs in this list rather than in the metrics
+        // step below: `wm-core` re-lays-out nothing on it — every pixel
+        // it draws comes pre-scaled from the theme engine step 3 swaps
+        // in — and wants it only to size the handful of measurements
+        // written into that crate as *logical* numbers (today, the
+        // fixed size Omarchy's own windows float at).
+        wm.set_ui_scale(next.scale);
+        // Straight through to the backend, which is what answers the
+        // decoration protocols and decides who gets a frame...
+        wm.backend_mut().set_decoration_rules(next.decorations.clone());
+        // Whether a focused client may take every chord, and the chord
+        // that takes them back. The backend answers the inhibit
+        // protocol and filters the keys, so it is the one to tell.
+        wm.backend_mut().set_shortcut_inhibit_policy(next.shortcut_inhibit.clone());
+        // The user's own window rules, read live out of their Hyprland
+        // configuration. Pushed through the same pass as the
+        // decoration rules beside it, so a `windowrule` edited through
+        // Omarchy's menu reaches the next window that maps without a
+        // restart — see `wm_config::hyprland`.
+        wm.set_float_policy(next.float_policy.clone());
+        // The workspace styles that same read names — Omarchy's
+        // `general.layout` and the per-workspace files its SUPER+L
+        // saves — through the one applier that knows what a re-read may
+        // and may not touch.
+        apply_workspace_layouts(wm, &mut self.applied_workspace_layouts, next.default_layout, &next.workspace_layouts);
+        // The keyboard half of `input`. Staged on the backend and
+        // installed on its next pass; a backend whose keymap is not
+        // its own (the X11 session, where the server owns the layout)
+        // defaults this to a no-op. Before this, every reload path
+        // answered `ok` and left the keymap and repeat timing exactly
+        // as the session had started with.
+        wm.backend_mut().set_keyboard_config(wm_core::KeyboardConfig {
+            rules: next.input.rules.clone(),
+            model: next.input.model.clone(),
+            layout: next.input.layout.clone(),
+            variant: next.input.variant.clone(),
+            options: next.input.options.clone(),
+            repeat_rate: next.input.repeat_rate,
+            repeat_delay: next.input.repeat_delay,
+            numlock_by_default: next.input.numlock_by_default,
+        });
+        wm.backend_mut().set_pointer_config(wm_core::PointerConfig {
+            sensitivity: next.input.sensitivity,
+            pointer: wm_core::ScrollClass {
+                natural_scroll: next.input.natural_scroll,
+                scroll_factor: next.input.scroll_factor,
+                scroll_method: next.input.scroll_method,
+                scroll_button: next.input.scroll_button,
+                middle_button_emulation: next.input.middle_button_emulation,
+            },
+            touchpad: wm_core::ScrollClass {
+                natural_scroll: next.input.touchpad_natural_scroll,
+                scroll_factor: next.input.touchpad_scroll_factor,
+                scroll_method: next.input.touchpad_scroll_method,
+                scroll_button: next.input.touchpad_scroll_button,
+                middle_button_emulation: next.input.touchpad_middle_button_emulation,
+            },
+            cursor: next.input.cursor.clone(),
+            tap_to_click: next.input.tap_to_click,
+            disable_while_typing: next.input.disable_while_typing,
+            clickfinger_behavior: next.input.clickfinger_behavior,
+            left_handed: next.input.left_handed,
+            accel_profile: next.input.accel_profile.clone(),
+            tap_and_drag: next.input.tap_and_drag,
+            drag_lock: next.input.drag_lock,
+            tap_button_map: next.input.tap_button_map,
+            drag_3fg: next.input.drag_3fg,
+            touch_output: next.input.touch_output.clone(),
+            tablet_output: next.input.tablet_output.clone(),
+            devices: next.input.devices.clone(),
+        });
+        // ...and then re-ask for every window already on the desk. A
+        // rule that only reached windows opened after it was written
+        // would mean closing and reopening the very window whose chrome
+        // the user is trying to fix.
+        wm.refresh_all_client_chrome();
+        self.keymap = build_keymap(&next.keybindings);
+        self.release_keymap = next
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.release || matches!(&binding.action, Action::GlobalShortcut(_))
+            })
+            .map(|binding| (binding.combo, binding.action.clone()))
+            .collect();
+        let grab_bindings = bindings_for_grabs(&next);
+        let (to_ungrab, to_grab) = grab_delta(&self.grabbed, &grab_bindings);
+        apply_binding_behaviors(wm.backend_mut(), &self.state.bindings, &next.bindings);
+        for combo in &to_ungrab {
+            wm.ungrab_key(*combo);
+        }
+        for combo in &to_grab {
+            wm.grab_key(*combo);
+        }
+        self.grabbed.retain(|combo| !to_ungrab.contains(combo));
+        self.grabbed.extend(to_grab);
+        self.rebuild_layer_keymap(wm.backend_mut(), &next.layer_bindings);
+        // The Omarchy submenu is policy too: re-resolved from the key
+        // on every pass, which also re-reads the definition files —
+        // a reload is the user's way of saying "look again".
+        if reload_menu {
+            self.desktop.set_omarchy_menu(omarchy_menu_for(&next));
+            // The application index gets the same "look again": the
+            // walk runs on the rescanner's thread and lands in `tick`,
+            // so the reload itself stays as quick as it was.
+            self.app_rescan.request();
+        }
+
+        // 2. Metrics.
+        let theme = next.theme();
+        let scale_changed = self.desktop.set_scale(next.scale);
+        let theme_changed = theme != self.theme;
+        let style_changed = next.decoration_style != self.state.decoration_style;
+        let appearance_changed = next.appearance != self.state.appearance;
+        let following_changed = next.following != self.state.following;
+        if scale_changed || theme_changed || style_changed || appearance_changed || following_changed {
+            self.control_theme_revision = self.control_theme_revision.wrapping_add(1);
+        }
+        if self.state.base_theme.id != next.base_theme.id {
+            self.desktop.follow_theme_wallpaper(&self.state.base_theme.wallpaper, &next.base_theme.wallpaper);
+        }
+        self.state = next;
+        if !scale_changed && !theme_changed && !style_changed {
+            // Nothing that is drawn has moved. Repainting anyway would
+            // be a visible flash on a reload that only rebound a key.
+            return;
+        }
+        self.theme = theme;
+        self.desktop.set_theme_id(self.theme.id.clone());
+        self.desktop.set_chrome(wm.backend_mut(), &self.theme, self.state.decoration_style, self.state.scale);
+        if appearance_changed {
+            self.desktop.set_appearance(self.state.appearance);
+            crate::appearance::publish(self.state.appearance);
+            // Running terminals follow by signal, everything foreign
+            // follows through GSettings/the portal — both are fire-and
+            // -forget from here; the desktop's own repaint is not
+            // gated on any other process noticing.
+            self.retint_terminals();
+            crate::appearance::propagate_to_applications(self.state.appearance);
+        }
+        tracing::info!(
+            theme = %self.theme.id,
+            appearance = %self.state.appearance.name(),
+            scale = self.state.scale,
+            scale_changed,
+            theme_changed,
+            decoration_style = self.state.decoration_style.name(),
+            style_changed,
+            "applying a new look in place"
+        );
+
+        // 3. The decoration engine, and with it every client's chrome.
+        wm.set_theme_engine(Box::new(self.state.decoration_engine(self.fonts.clone())));
+        if scale_changed {
+            // The only pixels in the session the theme engine does not
+            // produce: the backend's own pointer cursors.
+            wm.backend_mut().set_ui_scale(self.state.scale);
+        }
+
+        // Rebuild transient navigation on demand after a style change.
+        self.desktop.relayout(wm.backend_mut());
+        self.apply_workareas(wm);
+    }
+
+    /// Dresses the session in a built-in theme, keeping every other
+    /// piece of session state as it is. The theme menu's whole job.
+    /// Picking a built-in is also how a session stops following Omarchy
+    /// — the choice is now a theme, not "whatever Omarchy says".
+    fn apply_theme(&mut self, wm: &mut WindowManager<B>, base: Theme) {
+        let mut next = self.state.clone();
+        next.base_theme = base;
+        next.following = None;
+        self.apply_session_state(wm, next);
+    }
+
+    /// Re-resolves the whole session from the config file and applies
+    /// it — what a reload does, and what following Omarchy does when
+    /// Omarchy's theme changes. One function so the two cannot resolve
+    /// by different rules.
+    ///
+    /// `Err` is a file that could not be read at all (unreadable, or
+    /// not TOML): the working configuration stays, and the rejection
+    /// is recorded where `hyprctl configerrors` reads so the edit that
+    /// did not apply is not answered with the diagnostics of the one
+    /// before it. A file that parses applies whatever it could and is
+    /// `Ok` — its per-item refusals travel in the new state.
+    fn reresolve(&mut self, wm: &mut WindowManager<B>) -> Result<(), String> {
+        match self.resolve_live_config() {
+            Ok(next) => {
+                self.apply_session_state(wm, next);
+                Ok(())
+            }
+            Err(error) => {
+                self.apply_session_state(wm, self.state.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Resolve a live configuration edit without forgetting the
+    /// output scale already in force. Startup owns automatic monitor
+    /// detection; after that, the running primary scale is the correct
+    /// fallback whenever neither `CHONKSTEP_SCALE` nor `scale` is an
+    /// explicit override. This also retains a scale selected through
+    /// Omarchy's monitor UI across its subsequent theme-file rewrite.
+    ///
+    /// The running interaction settings go in for the same reason the
+    /// scale does: a refused `interaction_mode` or `keyboard_mode`
+    /// keeps the mode in force rather than the default, so one typo in
+    /// that key cannot drop a Spaces session to desktop mode
+    /// (`wm_config::parse_in_session`).
+    ///
+    /// On `Err` the rejection is recorded into the working state's
+    /// diagnostics — replacing any earlier one, so repeated failed
+    /// reloads do not pile up — and the caller keeps that state. The
+    /// next successful resolve rebuilds the list from the file.
+    fn resolve_live_config(&mut self) -> Result<SessionState, String> {
+        match wm_config::inspect_in_session(None, Some(&self.state.interaction)) {
+            Ok(config) => Ok(SessionState::resolve_with_scale_default(&config, self.state.scale)),
+            Err(error) => {
+                tracing::warn!(%error, "config reload rejected; retaining working configuration");
+                record_reload_rejection(&mut self.state.config_diagnostics, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-read the complete configuration and remember that IPC
+    /// clients need a `configreloaded` event after the apply settles.
+    ///
+    /// `Err` means the file could not be read and nothing was applied;
+    /// the IPC's `reload` answers with a refusal rather than `ok`, and
+    /// `configerrors` carries the reason. The `configreloaded` event
+    /// still goes out: the diagnostics a bar may be showing changed.
+    pub fn reload_config(&mut self, wm: &mut WindowManager<B>) -> Result<(), String> {
+        let outcome = self.reresolve(wm);
+        // The read just applied is the one the watch is measured
+        // against from here, exactly as the tick re-points it after
+        // its own re-read. It matters most for a reload issued while
+        // auto-reload is paused — Omarchy's resume hook reloads and
+        // then lifts the pause — which must not be followed by a
+        // second re-read of the same files the moment the watch is
+        // consulted again. A rejected reload applied nothing, so the
+        // watch keeps measuring against what is in force.
+        if outcome.is_ok() {
+            if let Some((roots, watch)) = &mut self.hyprland_config {
+                watch.follow(&wm_config::hyprland::read(roots));
+            }
+        }
+        self.config_reloaded = true;
+        self.monitor_rules_pending = true;
+        outcome
+    }
+
+    /// Whether the one-second watch over the desktop's Hyprland
+    /// configuration is paused: the live IPC word if one was given,
+    /// else what the configuration says. An explicit reload re-reads
+    /// regardless. What `getoption misc.disable_autoreload` answers.
+    pub fn autoreload_paused(&self) -> bool {
+        self.autoreload_live.unwrap_or(self.state.disable_autoreload)
+    }
+
+    /// `misc:disable_autoreload` from the IPC — Omarchy's reload guard
+    /// pauses around every `omarchy-settings` upgrade so a tree that
+    /// is half replaced is never read, and resumes after one explicit
+    /// reload. Session-local and not persisted, which is why the
+    /// transition is logged and `systeminfo` reports it: a user whose
+    /// edits stopped landing can see why.
+    pub fn set_autoreload_paused(&mut self, paused: bool) {
+        if self.autoreload_paused() != paused {
+            if paused {
+                tracing::info!("Hyprland configuration auto-reload paused; edits wait for an explicit reload");
+            } else {
+                tracing::info!("Hyprland configuration auto-reload resumed");
+            }
+        }
+        self.autoreload_live = Some(paused);
+    }
+
+    pub fn take_config_reloaded(&mut self) -> bool {
+        std::mem::take(&mut self.config_reloaded)
+    }
+
+    /// Whether an explicit reload has happened since the compositor last
+    /// reconciled its outputs against the session's monitor rules. Drained
+    /// once; see [`Shell::monitor_rules_pending`].
+    pub fn take_monitor_rules_pending(&mut self) -> bool {
+        std::mem::take(&mut self.monitor_rules_pending)
+    }
+
+    /// Moves the session to the other side of the light/dark axis (or
+    /// to an explicitly named side): the current theme re-resolves in
+    /// its `mode` rendition and applies through the exact path a theme
+    /// pick takes. A no-op when the session is already there.
+    pub fn set_appearance(&mut self, wm: &mut WindowManager<B>, mode: crate::appearance::Appearance) {
+        if mode == self.state.appearance {
+            return;
+        }
+        if self.state.following.is_some() {
+            tracing::warn!(
+                requested = mode.name(),
+                current = self.state.appearance.name(),
+                "appearance request ignored: this session follows Omarchy, whose theme decides the mode"
+            );
+            return;
+        }
+        let mut next = self.state.clone();
+        next.appearance = mode;
+        match wm_theme::default_theme::theme_variant(&next.base_theme.id, mode) {
+            Some(base) => next.base_theme = base,
+            // A theme with no rendition on that side (nothing built-in
+            // today): the mode still flips — published file, terminals,
+            // GSettings — and the chrome keeps the one dress it has.
+            None => tracing::warn!(
+                theme = %next.base_theme.id,
+                mode = mode.name(),
+                "theme has no rendition for this appearance; switching the mode around it"
+            ),
+        }
+        self.apply_session_state(wm, next);
+    }
+
+    /// The side of the light/dark axis this session is currently on.
+    pub fn appearance(&self) -> crate::appearance::Appearance {
+        self.state.appearance
+    }
+
+    /// `Some("omarchy")` while the session's theme choice is to follow
+    /// Omarchy's current theme, `None` while it wears a built-in — see
+    /// `SessionState::following`. What the control socket's `theme`
+    /// event reports as `following`.
+    pub fn following(&self) -> Option<&'static str> {
+        self.state.following
+    }
+
+    /// The whole resolved session state, read-only — for the pieces a
+    /// binary still publishes itself (the X11 binary's XSETTINGS).
+    pub fn session_state(&self) -> &SessionState {
+        &self.state
+    }
+
+    /// Number of full native-control snapshots built in this session.
+    /// This is diagnostic only; protocol behavior never depends on it.
+    pub fn control_snapshot_builds(&self) -> u64 {
+        self.control_snapshot_builds
+    }
+
+    /// What servicing control-socket requests has cost so far. Diagnostic
+    /// only, like [`Self::control_snapshot_builds`].
+    pub fn control_load(&self) -> ControlLoad {
+        self.control_load
+    }
+
+    /// Records whether the event loop saw any control descriptor become
+    /// readable since the last tick. Called by a loop that watches those
+    /// descriptors itself (the Wayland compositor's calloop sources), so
+    /// a quiet tick costs the socket no per-client `poll`; a loop that
+    /// never calls it gets the kernel asked instead.
+    pub fn note_control_readable(&mut self, readable: bool) {
+        self.control_readable = Some(readable);
+    }
+
+    /// Signals every terminal this shell launched to swap to the color
+    /// section matching the current appearance — foot's documented
+    /// SIGUSR1 (dark) / SIGUSR2 (light) color-theme switch, against
+    /// the `colors-dark`/`colors-light` sections `terminal_args`
+    /// populated at spawn. Exited terminals are pruned first, so a
+    /// recycled pid can never be signaled.
+    fn retint_terminals(&mut self) {
+        self.terminals.retain(|terminal| terminal.exited().is_none());
+        let signal = match self.state.appearance {
+            crate::appearance::Appearance::Dark => libc::SIGUSR1,
+            crate::appearance::Appearance::Light => libc::SIGUSR2,
+        };
+        for terminal in &self.terminals {
+            terminal.signal(signal);
+        }
+        if !self.terminals.is_empty() {
+            tracing::info!(
+                count = self.terminals.len(),
+                appearance = self.state.appearance.name(),
+                "retinted running terminals"
+            );
+        }
+    }
+
+    /// The theme every surface (the shell's own chrome included) is
+    /// dressed in — the binary reads it back for the pieces it still
+    /// owns (the theme engine, per-app compositor rules).
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// The rectangle managed windows may occupy on the *primary*
+    /// monitor — the single-rect form for `WindowManager::set_workarea`,
+    /// which means exactly that.
+    ///
+    /// `_screen` is vestigial: the desktop tracks real monitor geometry
+    /// itself now, and on a multi-head session the screen's own size
+    /// spans every output at once, which is never the answer to "where
+    /// may a window on the primary go". The parameter stays so the
+    /// single-monitor callers that pass it keep working unchanged;
+    /// anything holding a live `WindowManager` should call
+    /// [`Shell::apply_workareas`] instead, which pushes one rect per
+    /// monitor.
+    pub fn workarea(&self, _screen: Size) -> Rect {
+        self.desktop.primary_workarea()
+    }
+
+    /// Pushes one workarea per monitor into the WM — the multi-monitor
+    /// form of [`Shell::workarea`], and what a backend binary should
+    /// call at startup and on every output change. Reads the monitor
+    /// list straight from the WM so the rects land in the same
+    /// positional order `set_workareas` indexes; a backend reporting no
+    /// monitors gets the primary's single rect, which is the whole
+    /// screen on such a backend.
+    pub fn apply_workareas(&self, wm: &mut WindowManager<B>) {
+        let monitors: Vec<Rect> = wm.monitors().into_iter().map(|m| m.geometry).collect();
+        let areas =
+            if monitors.is_empty() { vec![self.desktop.primary_workarea()] } else { self.desktop.workareas(&monitors) };
+        wm.set_workareas(areas);
+    }
+
+    pub fn set_edge_reservation(&mut self, _wm: &mut WindowManager<B>, reserved: EdgeReservation) -> bool {
+        self.desktop.set_reservation(reserved)
+    }
+
+    /// Resolves a configured key combo to its action, for the binary's
+    /// key interception. A miss MUST leave the event flowing through to
+    /// `wm-core` unchanged — during a modal Alt+Tab session the
+    /// switcher grabs the whole keyboard, and Tab/Escape/any-other-key
+    /// arrive as ordinary `KeyPress` events that appear in no keymap;
+    /// swallowing them would wedge the switcher open.
+    ///
+    /// Capture bindings remain available over modal UI. Other keys belong
+    /// to the shell's own modal session: while the
+    /// Overview is open it holds the keyboard the same way the
+    /// switcher does, and *every* press resolves to
+    /// [`Action::Overview`] (the combo parked in `overview_key` for
+    /// `run_action` to route — arrows move, Return commits, anything
+    /// else dismisses). Nothing may flow through to `wm-core` then:
+    /// an Alt+Tab leaking past an open Overview would start a second
+    /// modal session on top of the first, and the two would fight over
+    /// one keyboard grab. No Alt+Tab session can be live at that
+    /// moment for the miss rule above to serve — the Overview declines
+    /// to open during one (see `run_action`) and its grab intercepts
+    /// the keys that would start one.
+    pub fn keymap_action(&mut self, combo: &KeyCombo) -> Option<KeyResolution> {
+        let configured = self.layer_keymap.get(combo).or_else(|| self.keymap.get(combo)).cloned();
+        if configured.as_ref().is_some_and(|action| self.capture_mode_for_action(action).is_some()) {
+            return configured.map(KeyResolution::Action);
+        }
+        if self.help.visible() {
+            self.help_key = Some(*combo);
+            return Some(KeyResolution::Action(Action::Help));
+        }
+        if self.desktop.overview_visible() {
+            // A chord arrives as modifier-down, then its actual key. Dismissing
+            // on Super-down would reverse again when the O in Super+O arrives.
+            if matches!(combo.keysym, 0xffe1..=0xffee | 0xff7e | 0xff7f | 0xfe03 | 0xfe11)
+                && self.keymap.get(combo) != Some(&Action::Overview) {
+                return Some(KeyResolution::Consumed);
+            }
+            self.overview_key = Some(*combo);
+            return Some(KeyResolution::Action(Action::Overview));
+        }
+        // An open menu owns the keyboard as completely as Overview.
+        // Recognized navigation is returned for immediate dispatch;
+        // every other non-capture key is consumed so typing cannot leak into
+        // the client behind a modal menu.
+        if self.desktop.menu_visible() {
+            if combo.modifiers.is_empty() {
+                let key = match combo.keysym {
+                    XK_UP => Some(MenuKey::Up),
+                    XK_DOWN => Some(MenuKey::Down),
+                    XK_LEFT => Some(MenuKey::Left),
+                    XK_RIGHT => Some(MenuKey::Right),
+                    XK_RETURN | XK_KP_ENTER => Some(MenuKey::Enter),
+                    0x20 => Some(MenuKey::Space),
+                    crate::desktop::MENU_DISMISS_KEYSYM => {
+                        self.transient_escape = true;
+                        None
+                    }
+                    _ => None,
+                };
+                return Some(key.map_or(KeyResolution::Consumed, KeyResolution::Menu));
+            }
+            return Some(KeyResolution::Consumed);
+        }
+        // Escape belongs to the open transient before it belongs to a
+        // configured binding or the focused client. The shared grab is
+        // held only while a menu or instrument panel is visible, and
+        // `Consumed` makes that ownership explicit to both event loops.
+        if self.desktop.menu_visible()
+            && combo.modifiers.is_empty()
+            && combo.keysym == crate::desktop::MENU_DISMISS_KEYSYM
+        {
+            self.transient_escape = true;
+            return Some(KeyResolution::Consumed);
+        }
+        configured.map(KeyResolution::Action)
+    }
+
+    /// Recognize the configured capture verb, including Omarchy's standard
+    /// Print command, without sending selection keys to an underlying menu.
+    pub fn capture_mode_for_combo(&self, combo: &KeyCombo) -> Option<wm_config::CaptureMode> {
+        self.layer_keymap.get(combo).or_else(|| self.keymap.get(combo))
+            .and_then(|action| self.capture_mode_for_action(action))
+    }
+
+    fn capture_mode_for_action(&self, action: &Action) -> Option<wm_config::CaptureMode> {
+        match action {
+            Action::Capture(mode) => Some(*mode),
+            Action::Run(name) if self.state.commands.get(name)
+                .is_some_and(|argv| argv.as_slice() == ["omarchy-capture-screenshot"]) => Some(wm_config::CaptureMode::Area),
+            _ => None,
+        }
+    }
+
+    /// Install or remove the bindings scoped to a live layer-shell
+    /// namespace. A namespace may have one surface per monitor, so the
+    /// count—not a boolean—owns the lifetime.
+    pub fn set_layer_namespace_active(&mut self, backend: &mut B, namespace: &str, active: bool) {
+        if active {
+            *self.active_layer_namespaces.entry(namespace.to_string()).or_default() += 1;
+        } else if let Some(count) = self.active_layer_namespaces.get_mut(namespace) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.active_layer_namespaces.remove(namespace);
+            }
+        }
+        let definitions = self.state.layer_bindings.clone();
+        self.rebuild_layer_keymap(backend, &definitions);
+    }
+
+    fn rebuild_layer_keymap(
+        &mut self,
+        backend: &mut B,
+        definitions: &std::collections::BTreeMap<String, Vec<wm_config::Binding>>,
+    ) {
+        let mut keymap = HashMap::new();
+        for namespace in self.active_layer_namespaces.keys() {
+            if let Some(bindings) = definitions.get(namespace) {
+                for binding in bindings.iter().filter(|binding| !binding.release) {
+                    keymap.insert(binding.combo, binding.action.clone());
+                }
+            }
+        }
+        let mut wanted: Vec<KeyCombo> = keymap.keys().copied().filter(|combo| !self.grabbed.contains(combo)).collect();
+        wanted.sort_by_key(|combo| (combo.keysym, combo.modifiers.bits()));
+        wanted.dedup();
+        for combo in self.scoped_grabbed.iter().filter(|combo| !wanted.contains(combo) && !self.grabbed.contains(combo)) {
+            backend.ungrab_key(*combo);
+        }
+        for combo in wanted.iter().filter(|combo| !self.scoped_grabbed.contains(combo)) {
+            backend.grab_key(*combo);
+        }
+        self.scoped_grabbed = wanted;
+        self.layer_keymap = keymap;
+    }
+
+    /// Resolves the release half of a `bindr`/`release = true` pair.
+    pub fn keymap_release_action(&self, combo: &KeyCombo) -> Option<Action> {
+        if self.help.visible() { return None; }
+        self.release_keymap.get(combo).cloned()
+    }
+
+    /// The actions a hardware switch toggle runs, in configuration
+    /// order. While the session is locked only `locked` bindings answer,
+    /// as for keys.
+    pub fn switch_actions(&self, device: &str, on: bool, locked: bool) -> Vec<Action> {
+        self.state
+            .switch_bindings
+            .iter()
+            .filter(|binding| binding.runs(device, on, locked))
+            .map(|binding| binding.action.clone())
+            .collect()
+    }
+
+    pub fn run_action(&mut self, wm: &mut WindowManager<B>, action: &Action) -> ShellOutcome {
+        match action {
+            Action::Help => {
+                if let Some(combo) = self.help_key.take() {
+                    self.help.key(wm.backend_mut(), &self.theme, &self.fonts, combo);
+                } else { self.open_help(wm); }
+            }
+            Action::Capture(mode) => return ShellOutcome::Capture(*mode),
+            Action::SpawnTerminal => {
+                let terminal = spawn_terminal(
+                    self.state.terminal.as_deref(),
+                    &self.theme,
+                    self.state.terminal_font_px,
+                    terminal_screen(self),
+                );
+                self.terminals.extend(terminal);
+            }
+            Action::Close => {
+                if let Some(id) = wm.focused_client() {
+                    wm.close_client(id);
+                }
+            }
+            Action::ToggleMaximize => {
+                if let Some(id) = wm.focused_client() {
+                    wm.toggle_maximize_full(id);
+                }
+            }
+            Action::ToggleShade => {
+                if let Some(id) = wm.focused_client() {
+                    wm.toggle_shade(id);
+                }
+            }
+            Action::Miniaturize => {
+                if let Some(id) = wm.focused_client() {
+                    wm.miniaturize(id);
+                }
+            }
+            Action::ToggleSpecial(name) => {
+                wm.toggle_special(name);
+            }
+            Action::SendToSpecial { name, follow } => {
+                if let Some(id) = wm.focused_client() {
+                    wm.move_client_to_special(id, name, *follow);
+                }
+            }
+            Action::ToggleFullscreen => {
+                if let Some(id) = wm.focused_client() {
+                    wm.toggle_fullscreen(id);
+                }
+            }
+            Action::FullscreenState { internal, client } => {
+                if let Some(id) = wm.focused_client() {
+                    wm.toggle_fullscreen_state(id, *internal, *client);
+                }
+            }
+            Action::Focus(direction) => {
+                wm.focus_direction(*direction);
+            }
+            // The window commands menu, from the keyboard. The whole
+            // point is the window that has no titlebar to right-click:
+            // a client that draws its own chrome gets no frame from us,
+            // and before this verb the only route to its commands was
+            // the Overview. `wm-core` reports the request through the
+            // same `WindowMenuRequested` notification a titlebar
+            // right-click raises, so the menu, its items and its
+            // dispatch are shared verbatim.
+            Action::Layout(mode) => wm.set_workspace_layout(wm.current_workspace(), *mode),
+            Action::ToggleLayout => wm.toggle_workspace_layout(),
+            Action::ToggleOpaque => {
+                if let Some(id) = wm.focused_client() {
+                    wm.set_client_opaque(id, None);
+                }
+            }
+            Action::TogglePin => {
+                if let Some(id) = wm.focused_client() {
+                    let pinned = wm.client(id).is_some_and(|client| client.flags.contains(wm_core::ClientFlags::STICKY));
+                    wm.set_client_pinned(id, !pinned);
+                }
+            }
+            Action::Center => {
+                if let Some(id) = wm.focused_client() {
+                    wm.center_client(id);
+                }
+            }
+            Action::Floating(value) => {
+                if let Some(id) = wm.focused_client() {
+                    if let Some(value) = value {
+                        wm.set_floating(id, *value);
+                    } else {
+                        wm.toggle_floating(id);
+                    }
+                }
+            }
+            Action::Move(direction) => {
+                if let Some(id) = wm.focused_client() {
+                    wm.move_layout_window(id, *direction);
+                }
+            }
+            Action::Resize(delta) => {
+                if let Some(id) = wm.focused_client() {
+                    resize_by_logical_delta(wm, id, *delta);
+                }
+            }
+            Action::LayoutNoop => {}
+            Action::WindowMenu => wm.request_window_menu_for_focused(),
+            Action::RootMenu => {
+                let at = wm
+                    .focused_client()
+                    .and_then(|id| wm.client(id))
+                    .map(|client| client.geometry.pos)
+                    .or_else(|| {
+                        wm.monitors()
+                            .into_iter()
+                            .find(|monitor| monitor.primary)
+                            .map(|monitor| monitor.geometry.pos)
+                    })
+                    .unwrap_or(Point::new(0, 0));
+                self.desktop
+                    .open_root_menu(wm.backend_mut(), &self.theme, at);
+            }
+            // The Wayland compositor intercepts this variant and sends
+            // the matching protocol object. The X11 frontend has no
+            // such registry; keeping it a quiet no-op lets one shared
+            // Hyprland config remain usable on both backends.
+            Action::GlobalShortcut(_) => {}
+            Action::CycleApplications(direction) => wm.cycle_applications(*direction),
+            Action::CycleAppWindows(direction) => wm.cycle_application_windows(*direction),
+            Action::QuitApplication => wm.quit_application(),
+            Action::ForceQuitApplications => {
+                wm.cancel_keyboard_cycle();
+                if self.desktop.overview_visible() { self.close_overview(wm); }
+                let applications = wm.running_applications();
+                self.desktop.open_force_quit_menu(wm.backend_mut(), &self.theme, applications);
+            }
+            Action::ApplicationOverview => {
+                if self.desktop.overview_visible() { self.dismiss_overview(wm, None); }
+                else if wm.cycle_state().is_none() {
+                    self.overview_application = wm.focused_client();
+                    self.open_overview(wm);
+                }
+            }
+            Action::HideApplication => wm.hide_application(false),
+            Action::HideOtherApplications => wm.hide_application(true),
+            Action::MiniaturizeApplication => wm.miniaturize_application(),
+            Action::ShowDesktop => wm.toggle_show_desktop(),
+            Action::WorkspaceNext | Action::WorkspacePrev => {
+                let direction = if matches!(action, Action::WorkspaceNext) { 1 } else { -1 };
+                if let Some(next) = wm.neighboring_workspace(wm.current_workspace(), direction) {
+                    wm.switch_workspace(next);
+                } else if !wm.spaces_mode() && direction > 0 {
+                    wm.switch_workspace(wm.current_workspace() + 1);
+                }
+            }
+            // Hyprland's `e+1` / `e-1`: only workspaces with windows on
+            // them, wrapping, and never a new one. Nothing else occupied
+            // means stay put.
+            Action::WorkspaceNextOccupied | Action::WorkspacePrevOccupied => {
+                let direction = if matches!(action, Action::WorkspaceNextOccupied) { 1 } else { -1 };
+                if let Some(next) = wm.occupied_workspace_step(direction) {
+                    wm.switch_workspace(next);
+                }
+            }
+            Action::WorkspacePrevious => {
+                wm.switch_to_previous_workspace();
+            }
+            // The verb resolves its target now, not when the binding
+            // was read: an output named then can have been unplugged.
+            Action::FocusMonitor(target) => {
+                if let Some(index) = wm.resolve_output_target(target) {
+                    wm.focus_output(index);
+                } else {
+                    tracing::info!(?target, "focus-monitor names no connected output");
+                }
+            }
+            Action::MoveWorkspaceToMonitor(target) => match wm.resolve_output_target(target) {
+                Some(index) => {
+                    if let Err(why) = wm.move_workspace_to_output(index) {
+                        tracing::info!(?target, why, "move-workspace-to-monitor refused");
+                    }
+                }
+                None => tracing::info!(?target, "move-workspace-to-monitor names no connected output"),
+            },
+            // The same two verbs by number. No left-edge guard and no
+            // right-edge guard: the index arrived from the parser
+            // already range-checked and already converted out of the
+            // config file's 1-based counting, so what reaches here is
+            // an index `switch_workspace` can always honour — growing
+            // the row on demand exactly as `workspace-next` does one
+            // step at a time.
+            Action::Workspace(index) => wm.switch_workspace(*index),
+            Action::WorkspaceSend(index) => {
+                if let Some(id) = wm.focused_client() {
+                    wm.move_client_to_workspace(id, *index);
+                }
+            }
+            Action::WorkspaceCarry(index) => wm.carry_focused_to_workspace(*index),
+            // The modal Overview. Closed: open it (declined during a
+            // live Alt+Tab session — two modal keyboard owners cannot
+            // share one grab). Open: route the parked key press. The
+            // toggle's own combo is recognized through the keymap
+            // rather than hardcoded, so however the user rebinds
+            // `overview`, a second press of that binding closes it.
+            Action::Overview => {
+                let key = self.overview_key.take();
+                if !self.desktop.overview_visible() {
+                    if wm.cycle_state().is_none() {
+                        self.overview_application = None;
+                        self.open_overview(wm);
+                    }
+                } else {
+                    let rebound_toggle =
+                        key.as_ref().is_some_and(|combo| self.keymap.get(combo) == Some(&Action::Overview));
+                    if self.desktop.overview_pointer_pending() && !rebound_toggle {
+                        // Escape cancels the drag first; the panel remains for
+                        // another attempt. Other keys cannot activate a card or
+                        // start a second modal operation under a held pointer.
+                        if key.is_some_and(|combo| combo.keysym == crate::desktop::MENU_DISMISS_KEYSYM)
+                            && !self.desktop.cancel_overview_pointer(wm.backend_mut(), &self.theme) {
+                            self.close_overview(wm);
+                        }
+                        return ShellOutcome::Continue;
+                    }
+                    match key {
+                        Some(combo) if !rebound_toggle && wm.mac_keyboard()
+                            && combo.modifiers == wm_core::Modifiers::CONTROL
+                            && matches!(combo.keysym, XK_LEFT | XK_RIGHT) => {
+                            let output = self.overview_output.as_ref().and_then(|name| wm.monitors_ref().iter().position(|m| &m.name == name))
+                                .unwrap_or(wm.active_output_index());
+                            let current = wm.active_workspace_on_output(output);
+                            if let Some(next) = wm.neighboring_workspace(current, if combo.keysym == XK_LEFT { -1 } else { 1 }) {
+                                wm.switch_workspace(next);
+                                self.populate_overview(wm);
+                            }
+                        }
+                        Some(combo) if !rebound_toggle => match overview_intent(&combo) {
+                            OverviewIntent::Move(dx, dy) => {
+                                self.desktop.move_overview_selection(wm.backend_mut(), &self.theme, dx, dy)
+                            }
+                            OverviewIntent::Commit => self.commit_overview(wm),
+                            OverviewIntent::Dismiss => self.dismiss_overview(wm, Some(false)),
+                        },
+                        // The rebound toggle, or (defensively) no
+                        // parked key at all: close. A missing key can
+                        // only mean a caller ran the action without
+                        // resolving a combo first, and "the toggle
+                        // toggles" is the only safe reading.
+                        _ => self.dismiss_overview(wm, None),
+                    }
+                }
+            }
+            Action::WorkspaceCarryNext | Action::WorkspaceCarryPrev => {
+                let direction = if matches!(action, Action::WorkspaceCarryNext) { 1 } else { -1 };
+                if let Some(next) = wm.neighboring_workspace(wm.current_workspace(), direction) {
+                    wm.carry_focused_to_workspace(next);
+                } else if !wm.spaces_mode() && direction > 0 {
+                    wm.carry_focused_to_workspace(wm.current_workspace() + 1);
+                }
+            }
+            // A key has nobody to answer: the resolve logs and records
+            // a rejection itself, where `configerrors` reads.
+            Action::Reload => {
+                let _ = self.reresolve(wm);
+            }
+            // Re-exec the on-disk binary. Since `Action::Reload` exists
+            // this is no longer the config hot-reload gesture; it is
+            // how a session picks up a *new build* of itself, which is
+            // the one thing it cannot do without exec.
+            Action::Restart => return ShellOutcome::Restart,
+            // Named argv from `[commands]`. The lookup cannot normally
+            // miss — `wm_config::parse` drops any binding naming a
+            // command it did not find — but the keymap and the command
+            // table are two pieces of state that a reload replaces, and
+            // a miss here is a warning rather than an assumption. The
+            // desktop stays up either way; that is the whole contract
+            // this crate's config layer is written to.
+            Action::Run(name) => match self.state.commands.get(name) {
+                Some(argv) => {
+                    // The unmodified Omarchy Print binding reaches our selector
+                    // on Wayland. Custom argv and the X11 session keep their
+                    // normal command behavior; this is not a name-only override.
+                    if wm.backend().supports_native_capture() && argv.as_slice() == ["omarchy-capture-screenshot"] {
+                        return ShellOutcome::Capture(wm_config::CaptureMode::Area);
+                    }
+                    run_named_command(name, argv, self.state.scale, wm.backend_mut().create_activation_token());
+                }
+                None => tracing::warn!(
+                    command = %name,
+                    "no such command in [commands]; nothing to run"
+                ),
+            },
+        }
+        ShellOutcome::Continue
+    }
+
+    pub fn run_menu_key(&mut self, wm: &mut WindowManager<B>, key: MenuKey) -> ShellOutcome {
+        match self.desktop.key_menu(wm.backend_mut(), &self.theme, key) {
+            Some(action) => self.run_menu_action(wm, action),
+            None => ShellOutcome::Continue,
+        }
+    }
+
+    fn run_menu_action(&mut self, wm: &mut WindowManager<B>, action: MenuAction) -> ShellOutcome {
+        match action {
+            MenuAction::ForceQuitApplication(client) => {
+                wm.force_quit_application(client);
+                ShellOutcome::Continue
+            }
+            MenuAction::Root(action) => {
+                let outcome = root_action_outcome(&action);
+                self.run_root_menu_action(wm, action);
+                outcome
+            }
+            MenuAction::Window(client, action) => {
+                match action {
+                    WindowMenuAction::ToggleMaximize => wm.toggle_maximize_full(client),
+                    WindowMenuAction::Miniaturize => wm.miniaturize(client),
+                    WindowMenuAction::ToggleShade => wm.toggle_shade(client),
+                    WindowMenuAction::ToggleFullscreen => wm.toggle_fullscreen(client),
+                    WindowMenuAction::MoveToWorkspace(ws) => {
+                        wm.move_client_to_workspace(client, ws)
+                    }
+                    WindowMenuAction::Close => wm.close_client(client),
+                    WindowMenuAction::Kill => wm.kill_client(client),
+                }
+                ShellOutcome::Continue
+            }
+        }
+    }
+
+    /// Native swipe settings, read without cloning the session configuration.
+    pub fn desktop_gesture_config(&self) -> wm_core::GestureConfig {
+        self.state.input.gestures
+    }
+
+    fn workspace_overview_windows(wm: &WindowManager<B>, row: &[usize])
+        -> Vec<Vec<wm_core::OverviewThumbnail<B::WindowId, B::FrameId>>>
+    {
+        row.iter().map(|&space| wm.iter_clients().filter(|(id, c)| {
+            c.lifecycle == Lifecycle::Normal && !wm.mac_client_hidden(*id)
+                && (c.workspace == space || (c.flags.contains(ClientFlags::STICKY) && row.contains(&c.workspace)))
+        }).map(|(_, c)| wm_core::OverviewThumbnail {
+            window: c.window, frame: c.frame,
+            source: if c.frame.is_some() {
+                c.visual_geometry()
+            } else { c.geometry },
+            draw_content: !c.flags.contains(ClientFlags::SHADED),
+        }).collect()).collect()
+    }
+
+    fn overview_cards(&self) -> bool {
+        self.state.overview_style == wm_config::OverviewStyle::Cards && self.theme.chrome.is_some()
+    }
+
+    /// Prepare a neighboring live Overview without switching the WM or taking
+    /// any input ownership. Called once at horizontal axis lock, never per frame.
+    pub fn desktop_gesture_overview_scene(&self, wm: &WindowManager<B>, workspace: usize,
+        geometry: Rect) -> wm_core::OverviewScene<B::WindowId, B::FrameId> {
+        use wm_theme::overview::live;
+        let tile = crate::desktop::switcher_preview_px(self.state.scale);
+        let row = wm.workspace_row_on_output(wm.workspace_output_index(workspace).unwrap_or(wm.active_output_index()));
+        let local = row.iter().position(|&space| space == workspace).unwrap_or(0);
+        let clients: Vec<_> = wm.iter_clients().filter(|(id, c)| c.workspace == workspace
+            && c.lifecycle == Lifecycle::Normal && !wm.mac_client_hidden(*id)).collect();
+        let sources: Vec<_> = clients.iter().map(|(_, c)| if c.frame.is_some() {
+            c.visual_geometry()
+        } else { c.geometry }).collect();
+        let sizes: Vec<_> = sources.iter().map(|r| r.size).collect();
+        let cards = self.overview_cards();
+        let mut layout = if cards {
+            wm_theme::overview::modern::layout_in(&self.theme,geometry,self.desktop.overview_stage(geometry),&sources,(local,row.len()))
+        } else { live::layout(geometry.size,tile,&sizes,row.len().max(local+1)) };
+        if !cards && wm.workspace_layout(workspace) != wm_core::LayoutMode::Freeform {
+            live::preserve_arrangement(&mut layout, &sources);
+        }
+        let (mut fonts, mut swash) = (self.fonts.system(), self.fonts.swash());
+        let label_h = (tile / 2).max(16);
+        let mut label = |text: &str, width, inverted| crate::overview::styled_label(
+            Some(self.desktop.chrome()), inverted, &self.theme, &mut fonts, &mut swash, text, width, label_h);
+        let windows = clients.iter().zip(sources).zip(&layout.cells).map(|(((_, c), source), destination)| {
+            wm_core::OverviewWindow { window: c.window, frame: c.frame, source, destination: *destination,
+                draw_content: !c.flags.contains(ClientFlags::SHADED),
+                label: if cards {DecorationBuffer {width:0,height:0,pixels:Vec::new()}}
+                    else{label(&c.title, (tile * 6).min(geometry.size.w), true)} }
+        }).collect();
+        let workspace_windows = Self::workspace_overview_windows(wm, &row);
+        let spaces = layout.strip.iter().enumerate()
+            .zip(workspace_windows.into_iter().chain(std::iter::repeat_with(Vec::new)))
+            .map(|((i,rect),windows)| crate::overview::workspace_scene(&self.theme,Some(self.desktop.chrome()),
+                &mut fonts,&mut swash,*rect,layout.workspace_close_rect(i),i,(local,row.len()),label_h,windows,cards)).collect();
+        let selected = wm.focused_client().and_then(|focused| clients.iter().position(|(id, _)| *id == focused)).unwrap_or(0);
+        wm_core::OverviewScene { geometry, windows, spaces, workspace: local, selected, gap: layout.pad,
+            chrome: crate::overview::scene_chrome(&self.theme,Some(self.desktop.chrome()),layout.grid,cards) }
+    }
+
+    /// A desktop swipe can share Overview's grab, but cannot displace another
+    /// modal UI or an interactive window drag.
+    pub fn desktop_gesture_available(&self, wm: &WindowManager<B>) -> bool {
+        !wm.cycle_active() && !wm.interactive_drag_active() && !self.desktop.menu_visible() && !self.help.visible()
+            && !self.desktop.overview_pointer_pending()
+    }
+
+    /// A transition's cleanup must release its own Overview grab even after a
+    /// lock or another modal owner has made new desktop gestures unavailable.
+    pub fn finish_desktop_gesture_overview(&mut self, wm: &mut WindowManager<B>, opened: bool) {
+        if !opened { self.close_overview(wm); }
+    }
+
+    /// Explicit open/close semantics keep repeated upward swipes from toggling
+    /// Overview off. Workspace movement refreshes its existing card panel once.
+    pub fn on_desktop_gesture(
+        &mut self,
+        wm: &mut WindowManager<B>,
+        gesture: wm_core::DesktopGesture,
+    ) {
+        use wm_core::DesktopGesture;
+        if !self.desktop_gesture_available(wm) {
+            return;
+        }
+        match gesture {
+            DesktopGesture::OverviewOpen if !self.desktop.overview_visible() => {
+                self.open_overview(wm)
+            }
+            DesktopGesture::OverviewClose if self.desktop.overview_visible() => {
+                self.close_overview(wm)
+            }
+            DesktopGesture::WorkspaceNext | DesktopGesture::WorkspacePrevious => {
+                let current = wm.current_workspace();
+                let target = if wm.spaces_mode() {
+                    let direction = if gesture == DesktopGesture::WorkspaceNext { 1 } else { -1 };
+                    let Some(target) = wm.neighboring_workspace(current, direction) else { return; };
+                    target
+                } else if gesture == DesktopGesture::WorkspaceNext {
+                    if current + 1 == wm.workspace_count() && !wm.workspace_has_windows(current) {
+                        return;
+                    }
+                    current + 1
+                } else {
+                    current.saturating_sub(1)
+                };
+                wm.switch_workspace(target);
+                if wm.current_workspace() != current && self.desktop.overview_visible() {
+                    self.populate_overview(wm);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the Overview and takes the modal keyboard grab — the same
+    /// `Backend::grab_keyboard` the Alt-Tab cycle uses, taken from the
+    /// shell layer because this modality lives here. Grabbed only if
+    /// the panel actually came up: grabbing beside a surface that
+    /// failed to create would leave a desk with dead keys and nothing
+    /// on screen explaining why.
+    fn open_overview(&mut self, wm: &mut WindowManager<B>) {
+        self.miniwindows.invalidate(wm.backend_mut());
+        self.overview_output = wm.separate_spaces().then(|| wm.monitors_ref().get(wm.active_output_index()).map(|m| m.name.clone())).flatten();
+        // The Overview covers the monitor the panel hangs on, and its
+        // modal grab would eat the panel's Escape: exactly one of the
+        // two shell modes at a time.
+        self.populate_overview(wm);
+        if self.desktop.overview_visible() {
+            Backend::grab_keyboard(wm.backend_mut());
+        }
+    }
+
+    /// Captures the current workspace into the panel — fresh previews
+    /// every time, because windows change constantly and a stale
+    /// thumbnail defeats the whole "live overview" promise. Shared by
+    /// entry, the workspace-strip switch, and the mid-session refresh
+    /// `on_notification` triggers when a card's window closes or
+    /// miniaturizes under an open panel (a right-click menu pick can
+    /// do both), so the grid can never keep showing a window that is
+    /// gone.
+    ///
+    /// Only normal windows participate. Minimized windows remain available
+    /// through their desktop preview tiles and the window switcher.
+    fn populate_overview(&mut self, wm: &mut WindowManager<B>) {
+        self.overview_close_pressed = None;
+        let output = if let Some(name) = &self.overview_output {
+            let Some(index) = wm.monitors_ref().iter().position(|m| &m.name == name) else {
+                self.close_overview(wm);
+                return;
+            };
+            index
+        } else { wm.active_output_index() };
+        let current = wm.active_workspace_on_output(output);
+        let row = wm.workspace_row_on_output(output);
+        let spaces: Vec<_> = row.iter().map(|&space| wm.workspace_id(space)).collect();
+        if self.overview_spaces != spaces {
+            // Equal row lengths do not guarantee equal drop targets (a close
+            // and create can arrive in one batch). Preserve actual identities.
+            self.desktop.cancel_overview_pointer(wm.backend_mut(), &self.theme);
+        }
+        self.overview_spaces = spaces;
+        let area = wm.monitors_ref().get(output).map(|m| m.geometry);
+        let mut items: Vec<OverviewItem<B>> = wm
+            .iter_clients()
+            .filter(|(id, client)| {
+                self.overview_application.is_none_or(|app| wm.same_application(app, *id))
+                    && !wm.mac_client_hidden(*id)
+                    && client.workspace == current && client.lifecycle == Lifecycle::Normal
+            })
+            .map(|(id, client)| OverviewItem {
+                client: id,
+                managed: wm.is_layout_managed(id),
+                window: client.window,
+                title: client.title.clone(),
+                preview: None,
+                frame: client.frame,
+                draw_content: !client.flags.contains(ClientFlags::SHADED),
+                geometry: if client.frame.is_some() {
+                    client.visual_geometry()
+                } else {
+                    client.geometry
+                },
+            })
+            .collect();
+        // Previews in a second pass: `client_preview` borrows the WM
+        // immutably, which the iteration above also does — but the
+        // panel handoff below needs `backend_mut`, so everything is
+        // gathered before the mutable borrow starts (the same
+        // collect-then-paint dance `icon_clients` documents).
+        if !wm.backend().supports_live_overview() {
+            for item in &mut items {
+                item.preview = wm.client_preview(item.client);
+            }
+        }
+        let selected = wm
+            .focused_client()
+            .and_then(|focused| items.iter().position(|item| item.client == focused))
+            .unwrap_or(0);
+        let workspace = (row.iter().position(|&space| space == current).unwrap_or(0), row.len());
+        let workspace_windows = Self::workspace_overview_windows(wm, &row);
+        self.overview_revision = wm.protocol_state_revision();
+        self.desktop.show_overview(wm.backend_mut(), &self.theme, items, workspace, workspace_windows, (selected, area), self.overview_cards());
+    }
+
+    /// Ends the session without committing: grab released first, so
+    /// even a hide that finds no surface leaves the keyboard live.
+    /// Any open menu goes with it — a window menu opened from one of
+    /// the panel's cards would otherwise be left floating over the
+    /// bare desktop after an Escape, commanding a card that no longer
+    /// exists on screen. A no-op when no menu is open.
+    fn close_overview(&mut self, wm: &mut WindowManager<B>) {
+        self.overview_output = None;
+        self.overview_spaces.clear();
+        self.overview_close_pressed = None;
+        Backend::ungrab_keyboard(wm.backend_mut());
+        self.desktop.close_menu(wm.backend_mut());
+        self.desktop.hide_overview(wm.backend_mut());
+    }
+
+    fn dismiss_overview(&mut self, wm: &mut WindowManager<B>, target: Option<bool>) {
+        self.desktop.close_menu(wm.backend_mut());
+        if self.desktop.overview_pointer_pending() {
+            self.desktop.cancel_overview_pointer(wm.backend_mut(), &self.theme);
+        }
+        if !wm.backend_mut().transition_live_overview(target) {
+            self.close_overview(wm);
+        }
+    }
+
+    /// Commits the selection: animate back, then focus + raise the chosen
+    /// window through the public `ActivateRequested` path (the same
+    /// one a pager's `_NET_ACTIVE_WINDOW` message and the launcher
+    /// strip ride). The return animation retains its input ownership until the
+    /// windows reach their desktop positions; activation updates the stack
+    /// beneath that transition without exposing moving pointer targets.
+    fn commit_overview(&mut self, wm: &mut WindowManager<B>) {
+        let target = self
+            .desktop
+            .overview_item(self.desktop.overview_selected())
+            .map(|item| item.window);
+        self.dismiss_overview(wm, Some(false));
+        if let Some(window) = target {
+            // Not an ordinary activation: a shaded card stays shaded.
+            wm.activate_from_overview(window);
+        }
+    }
+
+    /// A click on the open Overview, both edges. The arm-on-press /
+    /// commit-on-release convention every button in this theme
+    /// follows: pressing a card selects it (visibly, on the highlight
+    /// plate), releasing over the same card commits — so a press
+    /// dragged off a card and released elsewhere changes the selection
+    /// but commits nothing, exactly like backing out of a menu row.
+    fn overview_space(&self, wm: &WindowManager<B>, local: usize) -> Option<usize> {
+        let id = self.overview_spaces.get(local)?;
+        (0..wm.workspace_count()).find(|&space| &wm.workspace_id(space) == id)
+    }
+
+    /// Modern cards expose a fixed minimum number of numbered destinations.
+    /// Materialize a future card only after the caller validates its gesture;
+    /// a retired identity is never interpreted as a request for a new space.
+    fn ensure_overview_space(&self, wm: &mut WindowManager<B>, local: usize) -> Option<usize> {
+        if let Some(space) = self.overview_space(wm, local) { return Some(space); }
+        if !self.overview_cards() || local < self.overview_spaces.len()
+            || local >= wm_core::MAX_WORKSPACES { return None; }
+        let needed = local + 1 - self.overview_spaces.len();
+        if needed > wm_core::MAX_WORKSPACES.saturating_sub(wm.workspace_count()) { return None; }
+        let output = self.overview_output.as_ref()
+            .and_then(|name| wm.monitors_ref().iter().position(|m| &m.name == name))
+            .unwrap_or(wm.active_output_index());
+        let row = wm.workspace_row_on_output(output);
+        if row.len() != self.overview_spaces.len() || row.iter().zip(&self.overview_spaces)
+            .any(|(&space, id)| &wm.workspace_id(space) != id) { return None; }
+        wm.select_output(output);
+        let mut destination = None;
+        for _ in 0..needed { destination = Some(wm.create_workspace()?); }
+        destination
+    }
+
+    fn on_overview_click(
+        &mut self,
+        wm: &mut WindowManager<B>,
+        local: Point,
+        button: MouseButton,
+        pressed: bool,
+    ) -> ShellOutcome {
+        let hit = self.desktop.overview_hit(wm.backend(), local);
+        if self.desktop.overview_pointer_pending() {
+            if button == MouseButton::Right && pressed {
+                self.desktop.cancel_overview_pointer(wm.backend_mut(), &self.theme);
+            } else if button == MouseButton::Left && !pressed {
+                match self.desktop.overview_pointer_release(wm.backend_mut(), &self.theme, local) {
+                    Some(OverviewRelease::Click(index)) => {
+                        self.desktop.select_overview_card(wm.backend_mut(), &self.theme, index);
+                        self.commit_overview(wm);
+                    }
+                    Some(OverviewRelease::Move { client, source, target })
+                        // The source must still belong to the displayed row.
+                        // Only an explicit future modern card may create a desk.
+                        if wm.client(client).is_some_and(|c| Some(c.workspace) == self.overview_space(wm, source)
+                                && matches!(c.lifecycle, Lifecycle::Normal | Lifecycle::Miniaturized)) => {
+                            if let Some(destination) = self.ensure_overview_space(wm, target) {
+                                wm.move_client_to_workspace(client, destination);
+                                self.populate_overview(wm);
+                            }
+                    }
+                    _ => {}
+                }
+            }
+            return ShellOutcome::Continue;
+        }
+        if pressed {
+            self.overview_close_pressed = None;
+            match (button, hit) {
+                (MouseButton::Left, OverviewHit::CloseWorkspace(index)) => {
+                    self.overview_close_pressed = Some(index);
+                }
+                (MouseButton::Left, OverviewHit::Card(index)) => {
+                    self.desktop.select_overview_card(wm.backend_mut(), &self.theme, index);
+                    self.desktop.overview_pointer_press(wm.backend_mut(), index, local);
+                }
+                // Right-click: the same window-commands menu a
+                // titlebar right-click opens, for the window this card
+                // shows. The menu is its own shell surface stacked
+                // over the panel and resolves through the ordinary
+                // menu routing; a pick that changes the desk (close,
+                // miniaturize) reaches the panel back through
+                // `on_notification`'s refresh.
+                (MouseButton::Right, OverviewHit::Card(index)) => {
+                    self.desktop.select_overview_card(wm.backend_mut(), &self.theme, index);
+                    if let Some(id) = self.desktop.overview_item(index).map(|item| item.client) {
+                        if let Some(client) = wm.client(id) {
+                            let ctx = WindowMenuContext {
+                                client: id,
+                                title: client.title.clone(),
+                                shaded: client.flags.contains(ClientFlags::SHADED),
+                                maximized: client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+                                fullscreen: client.flags.contains(ClientFlags::FULLSCREEN),
+                                workspace: client.workspace,
+                                workspace_count: wm.workspace_count(),
+                            };
+                            let at = self.pointer_root;
+                            self.desktop.open_window_menu(wm.backend_mut(), &self.theme, at, ctx);
+                        }
+                    }
+                }
+                // A workspace tile switches the desk under the open
+                // panel and re-populates the grid with fresh captures
+                // of what just became visible — the panel stays up,
+                // which is the point of having the strip at all.
+                (MouseButton::Left, OverviewHit::Workspace(target)) => {
+                    if self.overview_cards() {
+                        let destination = self.ensure_overview_space(wm,target);
+                        self.close_overview(wm);
+                        if let Some(destination) = destination { wm.switch_workspace(destination); }
+                        return ShellOutcome::Continue;
+                    }
+                    if let Some(target) = self.overview_space(wm, target) {
+                        wm.switch_workspace(target);
+                        self.populate_overview(wm);
+                    } else if target == self.overview_spaces.len() {
+                        if let Some(output) = self.overview_output.as_ref().and_then(|name| wm.monitors_ref().iter().position(|m| &m.name == name)) {
+                            wm.select_output(output);
+                        }
+                        if let Some(target) = wm.create_workspace() { wm.switch_workspace(target); }
+                        self.populate_overview(wm);
+                    }
+                }
+                // Pressing the empty panel backs out, like clicking
+                // away from a menu.
+                (MouseButton::Left, OverviewHit::Background) => self.dismiss_overview(wm, Some(false)),
+                _ => {}
+            }
+        } else if button == MouseButton::Left {
+            if let Some(index) = self.overview_close_pressed.take() {
+                if hit == OverviewHit::CloseWorkspace(index)
+                    && self.overview_space(wm, index).is_some_and(|space| wm.remove_workspace(space)) {
+                    self.populate_overview(wm);
+                }
+            }
+        }
+        ShellOutcome::Continue
+    }
+
+    /// A button press on the desktop background itself. Root reacts on
+    /// *press* (a context menu should appear the instant you press the
+    /// button, same as everywhere else) — everything else in the shell
+    /// (restoring an icon, picking a menu item) commits on *release*,
+    /// matching the arm-on-press/commit-on-release convention every
+    /// button in this theme follows. Releases on the root are the
+    /// binary's to route through [`Shell::on_shell_click`], whose
+    /// launcher-release offer must still see them (see its doc).
+    pub fn on_root_press(&mut self, wm: &mut WindowManager<B>, at: Point, button: MouseButton) -> ShellOutcome {
+        if self.help.visible() { self.dismiss_help(wm); return ShellOutcome::Continue; }
+        // Any press on the bare desktop is a click away from an open
+        // instrument panel; the press then keeps meaning what it always
+        // did (a right press still opens the root menu).
+        if button == MouseButton::Right {
+            self.desktop.open_root_menu(wm.backend_mut(), &self.theme, at);
+        } else {
+            self.desktop.close_menu(wm.backend_mut());
+        }
+        ShellOutcome::Continue
+    }
+
+    /// A button press/release on a shell surface — the routing heart of
+    /// the desktop.
+    ///
+    /// Two menu kinds share the pick path at the bottom: the root menu
+    /// is opened by [`Shell::on_root_press`], while the window menu is
+    /// opened from the `WindowMenuRequested` notification the titlebar
+    /// right-click emits (see [`Shell::on_notification`]) — but once
+    /// open, both are shell surfaces, so both deliver their clicks
+    /// through this method and resolve in the one `click_menu`
+    /// dispatch below. Without an explicit pointer grab while a menu is
+    /// open (see `Desktop::open_root_menu`), release events for a held
+    /// button would keep reporting against whatever surface the press
+    /// landed on rather than the menu now under the pointer; that grab
+    /// is what makes press-drag-release-to-pick work.
+    ///
+    /// The launcher strip routes ahead of everything else — releases
+    /// even ahead of the binary's own root-window branch: an
+    /// in-progress strip drag holds a pointer grab (like the icon
+    /// drags), so its release can report against any surface at all,
+    /// the root included, which is why the binary must route root
+    /// *releases* through here rather than dropping them.
+    /// `pointer_root` is the pointer's last known root position (shell
+    /// clicks themselves carry only surface-local coordinates), which
+    /// is exactly where the release happened — see the field's doc.
+    pub fn on_shell_click(
+        &mut self,
+        wm: &mut WindowManager<B>,
+        surface: B::ShellId,
+        local: Point,
+        button: MouseButton,
+        pressed: bool,
+    ) -> ShellOutcome {
+        if self.help.owns(surface) {
+            if button == MouseButton::Left { self.help.click(wm.backend_mut(), &self.theme, &self.fonts, local, pressed); }
+            return ShellOutcome::Continue;
+        }
+        // The modal Overview first: while it is open it covers the
+        // primary monitor, so a click on its surface can mean nothing
+        // else — and no strip/icon drag can be in progress under a
+        // panel that was opened from the keyboard. Clicks on surfaces
+        // it does not own (a window menu opened from one of its cards)
+        // fall through to the ordinary routing below.
+        if self.desktop.overview_owns(surface) {
+            // The selection surface rides over the panel, so a click
+            // on the selected card lands surface-local to *it*; the
+            // translation folds both surfaces into the one coordinate
+            // space the layout hit-tests in.
+            let local = self.desktop.overview_panel_point(surface, local);
+            return self.on_overview_click(wm, local, button, pressed);
+        }
+
+        if button == MouseButton::Left {
+            if pressed && self.miniwindows.press(wm.backend_mut(), surface, local) {
+                return ShellOutcome::Continue;
+            }
+            if !pressed {
+                if let Some(id) = self.miniwindows.release(wm.backend_mut()) {
+                    wm.deminiaturize(id);
+                    return ShellOutcome::Continue;
+                }
+            }
+        }
+        if pressed { return ShellOutcome::Continue; }
+
+        if let Some(action) = self
+            .desktop
+            .click_menu(wm.backend_mut(), &self.theme, surface, local)
+        {
+            return self.run_menu_action(wm, action);
+        }
+
+        ShellOutcome::Continue
+    }
+
+    fn open_help(&mut self, wm: &mut WindowManager<B>) {
+        if wm.cycle_active() || wm.interactive_drag_active() { return; }
+        self.desktop.close_menu(wm.backend_mut());
+        if self.desktop.overview_visible() { self.close_overview(wm); }
+        let Some(monitor) = wm.monitors_ref().get(wm.active_output_index()) else { return; };
+        let area = wm.usable_area_at(monitor.geometry.pos);
+        self.help_key = None;
+        self.help.open(wm.backend_mut(), &self.state, area, &self.fonts);
+    }
+
+    /// Release the guide before lock, output changes, or configuration reload.
+    pub fn dismiss_help(&mut self, wm: &mut WindowManager<B>) {
+        self.help.close(wm.backend_mut());
+        self.help_key = None;
+    }
+
+    pub fn on_shell_scroll(&mut self, wm: &mut WindowManager<B>, surface: B::ShellId, delta: wm_core::ScrollDelta) {
+        if self.help.owns(surface) { self.help.wheel(wm.backend_mut(), &self.theme, &self.fonts, delta.up); }
+    }
+
+    pub fn extra_poll_fds(&self) -> Vec<std::os::fd::RawFd> {
+        let mut fds = Vec::new();
+        self.extend_extra_poll_fds(&mut fds);
+        fds
+    }
+
+    /// Appends current shell-owned descriptors without allocating when
+    /// the caller's buffer already has enough capacity. This is the
+    /// event-loop form of [`Self::extra_poll_fds`].
+    pub fn extend_extra_poll_fds(&self, fds: &mut Vec<std::os::fd::RawFd>) {
+        fds.extend(self.control.poll_fds());
+    }
+
+    /// The side-effect half of a root-menu pick; its outcome half is
+    /// [`root_action_outcome`], which `on_shell_click` pairs with this
+    /// so the split can never let a pick's act and its outcome drift.
+    fn run_root_menu_action(&mut self, wm: &mut WindowManager<B>, action: RootMenuAction) {
+        match action {
+            RootMenuAction::LaunchTerminal => {
+                let terminal = spawn_terminal(
+                    self.state.terminal.as_deref(),
+                    &self.theme,
+                    self.state.terminal_font_px,
+                    terminal_screen(self),
+                );
+                self.terminals.extend(terminal);
+            }
+            RootMenuAction::Help => self.open_help(wm),
+            RootMenuAction::LaunchAbout => {
+                let env = launch_env(&self.theme.id, Some(self.state.appearance), self.state.scale);
+                spawn::spawn_detached_with_env(&about_binary_path(), &[], &env, &[]);
+            }
+            // Resolved by the desktop against the index its menu was
+            // built from — both the position and the generation have
+            // to match; the bounds-safe get covers the impossible
+            // desync anyway — menus fire `Kill`-grade commands, so
+            // "impossible" still doesn't get to panic.
+            RootMenuAction::LaunchApp { index, generation } => {
+                if let Some(entry) = self.desktop.app_entry(index, generation) {
+                    let terminal = launch_app(
+                        self.state.terminal.as_deref(),
+                        entry,
+                        &self.theme,
+                        self.state.terminal_font_px,
+                        terminal_screen(self),
+                        wm.backend_mut().create_activation_token(),
+                    );
+                    self.terminals.extend(terminal);
+                } else {
+                    // Not a bug to shout about: the menu was open
+                    // across a rescan of the index, and the generation
+                    // guard did its job — the Omarchy arm below keeps
+                    // the same contract across a definition reload.
+                    tracing::info!(index, generation, "application pick outlived its index; ignoring it");
+                }
+            }
+            RootMenuAction::OmarchyCommand { index, generation } => {
+                match self.desktop.omarchy_command(index, generation) {
+                    Some(command) => {
+                        // A theme flow launched from this desktop's own
+                        // menu carries an expectation the follow gate
+                        // would otherwise swallow: the user asked for
+                        // that theme, so when the pick lands (and only
+                        // then — see the armed field), the desk adopts
+                        // Omarchy's theme instead of silently keeping
+                        // its own while Omarchy changes underneath.
+                        if command.contains("omarchy-theme-set") && self.state.following.is_none() {
+                            self.omarchy_adoption_armed = Some(std::time::Instant::now());
+                        }
+                        run_omarchy_command(&command, &self.theme, wm.backend_mut().create_activation_token());
+                        self.desktop.note_omarchy_action_fired();
+                    }
+                    // Not a bug to shout about: the menu was open
+                    // across a reload of the definition, and the
+                    // generation guard did its job.
+                    None => tracing::info!(index, generation, "omarchy menu pick outlived its definition; ignoring it"),
+                }
+            }
+            RootMenuAction::SetWallpaper(wallpaper) => {
+                self.desktop.set_wallpaper(wm.backend_mut(), wallpaper);
+            }
+            RootMenuAction::ToggleOmarchyBar => {
+                self.desktop.toggle_omarchy_bar(wm.backend_mut());
+            }
+            RootMenuAction::SetTheme(id) if id == wm_theme::omarchy::ID => {
+                // Following is a choice, not a theme: persist the choice
+                // and re-resolve the session through the one path, which
+                // reads Omarchy's palette (or wears the flagship and
+                // waits, if there is none yet — `startup::resolve_look`).
+                if let Err(e) = theme_select::persist(id) {
+                    tracing::warn!(?e, id, "failed to persist theme selection");
+                }
+                // An unreadable file keeps the working state (with the
+                // rejection recorded); the choice to follow still holds.
+                let next = self.resolve_live_config().unwrap_or_else(|_| self.state.clone());
+                self.adopt_wallpaper_of(wm, &next.base_theme);
+                self.apply_session_state(wm, next);
+            }
+            RootMenuAction::SetTheme(id) => {
+                // Resolved first: a pick naming a theme that does not
+                // exist must change nothing at all, rather than persist
+                // a choice this session then declines to wear. Not
+                // reachable from the menu, which is generated from the
+                // same list — but this is also the path a future
+                // scripted theme change would take.
+                // Resolved in the session's *current* appearance: a
+                // theme pick changes which desktop you have, never
+                // which side of the light/dark axis you are on.
+                let Some(base) = wm_theme::default_theme::theme_variant(id, self.state.appearance) else {
+                    tracing::warn!(theme = id, "theme menu named a theme that does not exist; keeping the current one");
+                    return;
+                };
+                if let Err(e) = theme_select::persist(id) {
+                    tracing::warn!(?e, id, "failed to persist theme selection");
+                }
+                self.adopt_wallpaper_of(wm, &base);
+                self.apply_theme(wm, base);
+            }
+            RootMenuAction::Exit => {}
+        }
+    }
+
+    /// A theme implies its wallpaper. Applied *and* persisted: applied
+    /// because the desktop holds its wallpaper as loaded state that a
+    /// restyle does not re-read, and persisted so the next session
+    /// composes the same full look. The Wallpaper menu can still
+    /// override it afterward.
+    fn adopt_wallpaper_of(&mut self, wm: &mut WindowManager<B>, base: &Theme) {
+        // A theme that has a photograph on this machine wears it; the
+        // wallpaper it names is the ground it falls back to elsewhere.
+        // See `wallpaper::host_art_for_theme` for why the picture is a
+        // preference resolved here rather than the theme's own field.
+        #[cfg(feature = "lcos")]
+        let chosen = wallpaper::host_art_for_theme(&base.id)
+            .or_else(|| wallpaper::Wallpaper::from_id(&base.wallpaper));
+        #[cfg(not(feature = "lcos"))]
+        let chosen = wallpaper::Wallpaper::from_id(&base.wallpaper);
+        if let Some(paper) = chosen {
+            if let Err(e) = paper.persist() {
+                tracing::warn!(?e, theme = %base.id, "failed to persist theme wallpaper");
+            }
+            self.desktop.set_wallpaper(wm.backend_mut(), paper);
+        }
+    }
+
+    pub fn on_motion(&mut self, wm: &mut WindowManager<B>, root: Point) {
+        self.pointer_root = root;
+        self.miniwindows.motion(wm.backend_mut(), root);
+        if self.desktop.overview_pointer_motion(wm.backend_mut(), &self.theme, root) {
+            // A held card owns motion even outside the Overview output. Drain
+            // stale hover so a later release cannot select a different card.
+            while wm.backend_mut().take_shell_motion().is_some() {}
+            return;
+        }
+        // Menu hover rides the same cadence: every motion over a shell
+        // surface also arrives as a root-relative motion event (that is
+        // what got us called), so the pointer's final position is the
+        // one that should highlight a row.
+        //
+        // Drained to empty rather than one-per-call, because the two
+        // backends queue differently: X11 keeps only the latest shell
+        // motion (a compressed MotionNotify), while the compositor
+        // queues each one. Taking a single entry would leave the
+        // compositor's queue permanently one behind and growing under a
+        // fast sweep, highlighting rows the pointer left long ago. The
+        // last entry wins here for the same reason it does on X11.
+        let mut hover = None;
+        while let Some(entry) = wm.backend_mut().take_shell_motion() {
+            hover = Some(entry);
+        }
+        if let Some((surface, local)) = hover {
+            if self.desktop.overview_owns(surface) {
+                // Hover is the switcher's selection treatment applied
+                // by pointer: the card under the pointer becomes the
+                // selection. `select_overview_card` restages only on
+                // an actual change (and a change moves the small
+                // selection surface, never the panel buffer), so
+                // motion wandering inside one card costs nothing.
+                // Motion over the selection surface itself arrives
+                // local to it — translated back so leaving the
+                // selected card's plate onto a neighbor still selects
+                // the neighbor.
+                let local = self.desktop.overview_panel_point(surface, local);
+                if let OverviewHit::Card(index) = self.desktop.overview_hit(wm.backend(), local) {
+                    self.desktop.select_overview_card(wm.backend_mut(), &self.theme, index);
+                }
+            } else {
+                self.desktop.hover_menu(wm.backend_mut(), &self.theme, surface, local);
+            }
+        }
+    }
+
+    /// Reacts to a `wm-core` state change the shell needs to know about
+    /// but that `wm-core` itself has no opinion on — icon tiles for
+    /// miniaturized windows, the Alt+Tab switcher, and the titlebar
+    /// right-click window menu.
+    pub fn on_notification(&mut self, wm: &mut WindowManager<B>, notification: Notification) {
+        // An open Overview must track the desk it is showing: a window
+        // that closed, mapped, miniaturized or restored while the
+        // panel sat there (a right-click menu pick, an app exiting on
+        // its own) would otherwise leave a card pointing at nothing —
+        // and a click on that card would activate a ghost. Decided
+        // before the match consumes the notification, applied after
+        // the ordinary handling so icon tiles and the panel agree.
+        let refresh_overview = self.desktop.overview_visible()
+            && matches!(
+                &notification,
+                Notification::Miniaturized(..)
+                    | Notification::Deminiaturized(_)
+                    | Notification::Removed(_)
+                    | Notification::Mapped(_)
+                    | Notification::LayoutChanged(_)
+            );
+        match notification {
+            Notification::Miniaturized(_) | Notification::Deminiaturized(_) | Notification::Removed(_) => {}
+            // A freshly mapped window is where session restore lands:
+            // the first pending record with this window's class claims
+            // it (first-come-first-matched — see `session_layout`) and
+            // its remembered geometry, workspace and shape are applied
+            // through the same public calls the menus and keybindings
+            // use. A window with no record — the steady state once
+            // restore is over — follows normal placement untouched.
+            Notification::Mapped(id) => {
+                let restore = wm
+                    .client(id)
+                    .map(|client| client.class.clone())
+                    .and_then(|class| self.layout.claim(&class, std::time::Instant::now()));
+                if let Some(record) = restore {
+                    let geometry = restored_geometry(wm.monitors_ref(), &record);
+                    tracing::info!(
+                        class = %record.class,
+                        ?geometry,
+                        monitor = ?record.monitor_identity,
+                        workspace = record.workspace,
+                        "restoring a recorded window"
+                    );
+                    let initially_floating = wm.client(id).is_some_and(|c| c.placement.floating);
+                    wm.set_floating(id, true);
+                    wm.set_client_content_geometry(id, geometry);
+                    if wm.client(id).is_some_and(|c| c.workspace != record.workspace) {
+                        wm.move_client_to_workspace(id, record.workspace);
+                    }
+                    // Geometry before flags, deliberately: maximize records
+                    // the current geometry as its restore point, so the
+                    // remembered rect must be in place first for a later
+                    // unmaximize to return to it.
+                    if record.maximized {
+                        wm.maximize(id, MaximizeDirections::FULL);
+                    }
+                    if record.shaded {
+                        wm.shade(id);
+                    }
+                    if record.miniaturized {
+                        wm.miniaturize(id);
+                    }
+                    if let Some(spatial) = record.spatial {
+                        if let Some(r) = spatial.floating_geometry {
+                            let rect = restored_on_monitor(
+                                wm.monitors_ref(),
+                                Rect::new(
+                                    Point::new(r[0] as i32, r[1] as i32),
+                                    wm_core::Size::new(r[2] as u32, r[3] as u32),
+                                ),
+                                spatial.floating_monitor.as_deref(),
+                            );
+                            wm.set_client_content_geometry(id, rect);
+                        }
+                        let freeform = (wm.workspace_layout(record.workspace)
+                            != wm_core::LayoutMode::Freeform)
+                            .then_some(geometry);
+                        wm.restore_window_placement(
+                            id,
+                            wm_core::WindowPlacement {
+                                freeform,
+                                floating: spatial.floating,
+                                output: spatial.output,
+                                flow_width: spatial.flow_width,
+                                mosaic_weight: spatial.mosaic_weight,
+                            },
+                            spatial.order,
+                        );
+                        if let Some(origin) = spatial.fullscreen_origin { wm.restore_mac_fullscreen(id, origin); }
+                        if let Some(saved) = spatial.home_geometry.and_then(|r| r.to_geometry()) {
+                            wm.restore_space_home_geometry(id, saved);
+                        }
+                        if spatial.focused {
+                            self.restore_focus = Some(id);
+                        }
+                    } else {
+                        wm.set_floating(id, initially_floating);
+                    }
+                }
+            }
+            Notification::LayoutChanged(mode) => {
+                let (mut fonts, mut swash) = (self.fonts.system(), self.fonts.swash());
+                let label = wm_theme::overview::live::label(
+                    &self.theme,
+                    &mut fonts,
+                    &mut swash,
+                    mode.name(),
+                    (180.0 * self.state.scale) as u32,
+                    (36.0 * self.state.scale) as u32,
+                );
+                wm.backend_mut().show_layout_mode(mode, label);
+            }
+            Notification::CycleUpdated => {
+                if let Some((candidates, selected)) = wm.cycle_state() {
+                    // Previews are captured once per session (and again
+                    // only if the candidate set itself changes) —
+                    // stepping the selection is just a re-render of
+                    // stored entries.
+                    let entries = (self.desktop.switcher_entry_count() != Some(candidates.len())).then(|| {
+                        candidates
+                            .iter()
+                            .map(|(id, title)| wm_theme::switcher::SwitcherEntry {
+                                title: title.clone(),
+                                preview: wm.client_preview(*id),
+                            })
+                            .collect()
+                    });
+                    self.desktop.show_switcher(wm.backend_mut(), &self.theme, entries, selected);
+                }
+            }
+            Notification::CycleEnded => self.desktop.hide_switcher(wm.backend_mut()),
+            Notification::WindowMenuRequested { id, at } => {
+                // Titlebar right-click: `wm-core` reports which client
+                // and where, the shell owns what the menu contains.
+                // The context is a snapshot of the client's state at
+                // open time — that's what the item labels reflect —
+                // while the action a pick eventually fires re-reads
+                // live state inside `wm-core`, so a snapshot is all
+                // the menu needs. A stale id (the client vanished
+                // between the click and this drain) is silently
+                // nothing, matching every other stale-id path.
+                if let Some(client) = wm.client(id) {
+                    let ctx = WindowMenuContext {
+                        client: id,
+                        title: client.title.clone(),
+                        shaded: client.flags.contains(ClientFlags::SHADED),
+                        // Either axis counts: the menu's toggle drives
+                        // `toggle_maximize_full`, whose own un-maximize
+                        // branch fires when either flag is set.
+                        maximized: client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+                        fullscreen: client.flags.contains(ClientFlags::FULLSCREEN),
+                        workspace: client.workspace,
+                        workspace_count: wm.workspace_count(),
+                    };
+                    self.desktop.open_window_menu(wm.backend_mut(), &self.theme, at, ctx);
+                }
+            }
+        }
+        if refresh_overview {
+            self.populate_overview(wm);
+        }
+    }
+
+    pub fn tick(&mut self, wm: &mut WindowManager<B>) {
+        self.miniwindows.sync(wm, self.state.minimized_previews, self.state.scale,
+            &self.theme, self.desktop.chrome(), &self.fonts);
+        if let Some(spaces) = self.layout.take_restored_spaces() { wm.restore_display_spaces(spaces); }
+        if let Some(modes) = self.layout.take_restored_modes() {
+            for (workspace, mode) in modes.into_iter().enumerate() {
+                wm.set_workspace_layout(workspace, mode);
+            }
+        }
+        if !self.layout.restoring() {
+            if let Some(id) = self.restore_focus.take() {
+                if let Some(c) = wm.client(id) {
+                    let (workspace, window) = (c.workspace, c.window);
+                    wm.switch_workspace(workspace);
+                    wm.dispatch(BackendEvent::ActivateRequested(window));
+                }
+            }
+        }
+        let now = Instant::now();
+        // The appearance-request file, consumed the way the binaries
+        // consume reload/restart markers: one cached path at a bounded
+        // cadence, never one failed read per client frame. Consumed then
+        // acted so a request is honored exactly once; a request naming
+        // the current mode is consumed and does nothing.
+        if let Some(request) = self.appearance_requests.take(now) {
+            let mode = request.resolve(self.state.appearance);
+            tracing::info!(requested = ?request, resolved = mode.name(), "appearance-request received");
+            self.set_appearance(wm, mode);
+        }
+        // Following Omarchy: when its current theme changes on disk,
+        // re-resolve exactly as a reload would. The watch rate-limits
+        // itself to a look per second and is consulted while following
+        // — or while an adoption is armed, which is how a theme picked
+        // through this desktop's menu can be noticed *before* the desk
+        // follows. A session wearing a built-in with nothing armed
+        // never polls.
+        // Theme following also re-reads the entire Hyprland config.
+        // Leave its baseline untouched while the upgrade guard holds
+        // that tree, then catch up after resume.
+        let autoreload_paused = self.autoreload_paused();
+        let armed = self.omarchy_adoption_armed.is_some_and(|since| since.elapsed() < ADOPTION_ARM_WINDOW);
+        if self.state.following.is_none() && !armed {
+            self.omarchy_adoption_armed = None;
+        } else if !autoreload_paused && self.omarchy.changed(now) {
+            if self.state.following.is_some() {
+                tracing::info!("Omarchy's current theme or background changed; re-dressing");
+                // A rejection is logged and recorded by the resolve
+                // itself; the watch has nobody else to answer.
+                let _ = self.reresolve(wm);
+                // The background is part of the look and the watch fires
+                // for it too, but a background swap leaves the palette —
+                // and so the resolved theme — exactly as it was, and
+                // `apply_session_state` rightly repaints nothing for an
+                // unchanged theme. The picture is repainted here instead,
+                // and only if the desk is showing Omarchy's.
+                self.desktop.refresh_wallpaper(wm.backend_mut());
+            } else {
+                // The armed pick landed: Omarchy's theme really changed,
+                // so honor the intent expressed at the menu and follow —
+                // through the same persisted path the menu's own
+                // "Omarchy" entry takes, so the choice survives restart.
+                tracing::info!("adopting Omarchy's theme: it changed after a pick from this desktop's menu");
+                self.omarchy_adoption_armed = None;
+                self.run_root_menu_action(wm, RootMenuAction::SetTheme(wm_theme::omarchy::ID));
+            }
+        }
+        // Following the user's own Hyprland configuration. Omarchy's
+        // menu writes those files, so a rebind made through their UI
+        // has to reach a running session — otherwise "your menu still
+        // configures your machine" is a half-truth. Re-resolved through
+        // `reresolve`, which is the same one path a reload and a theme
+        // change take, so the read cannot resolve by different rules
+        // than the startup it replaces.
+        if let Some((roots, watch)) = &mut self.hyprland_config {
+            if hyprland_config_due(autoreload_paused, watch, std::time::Instant::now()) {
+                tracing::info!("the desktop's Hyprland configuration changed; re-reading it");
+                // Re-point the watch before re-resolving: the file set
+                // is itself part of what an edit can change (a fresh
+                // `source =` line brings in a file that was never
+                // watched), and taking the new set from the read that
+                // is about to be applied keeps the two in step.
+                let reading = wm_config::hyprland::read(roots);
+                reading.report();
+                watch.follow(&reading);
+                // A rejection is logged and recorded by the resolve
+                // itself; the watch has nobody else to answer.
+                let _ = self.reresolve(wm);
+                self.config_reloaded = true;
+            }
+        }
+        self.service_control(wm);
+        // The transient UI's parked Escape (see `keymap_action`) is
+        // consumed here, still inside the key event's loop iteration.
+        if std::mem::take(&mut self.transient_escape) {
+            self.desktop.close_menu(wm.backend_mut());
+        }
+        // Catch up once per completed preview batch. The backend may finish
+        // bounded asynchronous downloads over several dispatch turns; unchanged
+        // generations cost only the integer comparison and never repaint.
+        let generation = wm.backend().preview_generation();
+        if self.desktop.overview_wants_fresh_previews(generation) {
+            let previews: Vec<Option<DecorationBuffer>> =
+                self.desktop.overview_clients().into_iter().map(|client| wm.client_preview(client)).collect();
+            self.desktop.update_overview_previews(wm.backend_mut(), &self.theme, previews, generation);
+        }
+        if self.desktop.overview_visible() {
+            let output = self.overview_output.as_ref().and_then(|name| wm.monitors_ref().iter().position(|m| &m.name == name));
+            let expected = wm.workspace_position_count(output.unwrap_or(wm.active_output_index()));
+            if self.desktop.overview_workspace() != expected || (self.overview_output.is_some() && output.is_none())
+                || self.overview_revision != wm.protocol_state_revision() {
+                self.populate_overview(wm);
+            }
+        }
+        self.desktop.tick_menu(wm.backend_mut(), &self.theme);
+        // The application index: a `.desktop` file installed or
+        // removed during the session reaches the Applications submenu
+        // here. The directory poll and the walk it triggers both live
+        // in the rescanner — the walk on its own thread — and only a
+        // finished index is swapped in, so this tick never reads a
+        // desktop file. A root menu already open keeps its rows; its
+        // picks carry the old generation and dissolve.
+        if let Some(apps) = self.app_rescan.tick(now) {
+            tracing::info!(count = apps.entries().len(), generation = apps.generation(), "application index rescanned");
+            self.desktop.set_apps(apps);
+        }
+        // The session-layout store rides the same cadence. Most ticks
+        // find the exact arrangement it already holds; prove that by
+        // borrowed field comparisons so those ticks can advance the
+        // debounce without allocating, cloning every class, or
+        // rescanning the application index. A real change still builds
+        // the full owned snapshot once and resets the settle clock.
+        self.layout.note_spaces(wm.display_spaces_snapshot(), Instant::now());
+        self.layout.note_modes(
+            (0..wm.workspace_count()).map(|i| wm.workspace_layout(i)),
+            now,
+        );
+        if layout_matches_clients(wm, self.layout.current()) {
+            self.layout.service_current(now);
+        } else {
+            self.layout.service(layout_snapshot(wm, self.desktop.apps()), now);
+        }
+    }
+
+    /// How long a backend may block when no display/socket activity is
+    /// ready. Exact transient deadlines win; otherwise the bounded idle
+    /// poll services filesystem markers and worker-thread samples.
+    pub fn next_housekeeping_in(&self, now: Instant) -> Duration {
+        // Requests the control socket parked under its per-pass cap are
+        // work already read out of the kernel: no descriptor will wake
+        // the loop for them, so the next pass follows at once rather
+        // than at the idle bound.
+        if self.control.has_backlog() {
+            return Duration::ZERO;
+        }
+        let deadline = self
+            .desktop
+            .next_housekeeping_deadline()
+            .into_iter()
+            .chain(Some(self.appearance_requests.next_deadline()))
+            .min();
+        bounded_housekeeping_wait(now, deadline)
+    }
+
+    /// Flush session state and close the external bar control connections.
+    pub fn shut_down(&mut self) {
+        // The layout does need one thing on the way out that the
+        // paragraph above says nothing else does: a window closed
+        // moments before this must be forgotten *now*, not after a
+        // debounce that will never elapse.
+        self.layout.flush();
+        // Bars are told nothing but EOF, on both kinds of exit: a hot
+        // restart rebinds the same path, and the spec tells a client
+        // that loses the connection to reconnect and take the fresh
+        // snapshot — which is also the whole recovery story, so there
+        // is no farewell message to design.
+        self.control.shut_down();
+    }
+
+    /// One pass of the control socket (`crate::control`): admit new
+    /// bars, answer requests, publish what changed.
+    ///
+    /// The snapshot is taken only once someone is connected and one of
+    /// its cheap semantic inputs changed (or the client has a request),
+    /// so a quiet bar pays no client/title/output allocation at all.
+    /// A `focus-workspace` a client asked for is applied here and the
+    /// result published in the same pass, so the client's answer is
+    /// the `workspaces` event the switch produced, not one a tick late.
+    ///
+    /// The socket hands back a bounded number of commands per pass
+    /// (`control::MAX_REQUESTS_PER_PASS` per client, `REQUEST_BUDGET` in
+    /// all) and parks the rest, so a client that packs thousands of
+    /// requests into one write costs the compositor thread a few
+    /// switches per pass, not all of them at once.
+    fn service_control(&mut self, wm: &mut WindowManager<B>) {
+        let readable = self.control_readable.take();
+        self.control.accept();
+        if !self.control.has_clients() {
+            return;
+        }
+        let stamp = self.control_snapshot_stamp(wm);
+        if !self.control.snapshot_needed(stamp, readable) {
+            // A previous non-blocking write may still have bytes queued.
+            // Retrying it is socket maintenance, not a reason to rebuild
+            // the desktop view it already carries.
+            self.control.flush_pending();
+            return;
+        }
+        let snapshot = self.control_snapshot(wm);
+        let commands = self.control.service(&snapshot);
+        self.control_load.note_pass(commands.len());
+        let mut publish_after_command = false;
+        // The diagnostic dump walks every window, buffer and layer, and
+        // is built at most once per pass however many `debug` requests
+        // this pass carries: each still gets its own event, from the
+        // same instant.
+        let mut dump: Option<String> = None;
+        for command in commands {
+            match command {
+                // A switch, never a create — `docs/control-socket.md`
+                // §4 promises exactly this, and the promise is worth
+                // keeping because this protocol publishes the real
+                // workspace count, so a bar built on it draws only
+                // the workspaces that exist and never needs to
+                // conjure one. (The Hyprland compatibility socket
+                // deliberately answers the other way: Hyprland grows
+                // on demand and its clients — Omarchy's bar draws
+                // buttons one through five unconditionally — depend
+                // on that. Two protocols, two audiences, each honest
+                // to its own contract.)
+                control::Command::FocusWorkspace(index) => {
+                    publish_after_command = true;
+                    if index < wm.workspace_count() {
+                        wm.switch_workspace(index);
+                    } else {
+                        tracing::debug!(index, "control client asked for a workspace that does not exist; ignoring");
+                    }
+                }
+                control::Command::Debug { client, topic } => {
+                    let data = dump.get_or_insert_with(|| {
+                        self.control_load.dumps = self.control_load.dumps.wrapping_add(1);
+                        format!(
+                            "workspace={} focused_window={:?} clients={}\n{}",
+                            wm.current_workspace(),
+                            wm.focused_client().map(|id| id.as_u64()),
+                            wm.iter_clients()
+                                .filter(|(_, client)| client.lifecycle != Lifecycle::Withdrawn)
+                                .count(),
+                            wm.backend().diagnostic_snapshot(),
+                        )
+                    });
+                    self.control.answer_debug(client, topic, data);
+                }
+            }
+        }
+        self.control.flush_pending();
+        // A command is always a workspace request and is owed a
+        // post-command workspaces event even when it selected the already
+        // active workspace. `service` leaves that acknowledgement parked;
+        // a second snapshot is therefore needed exactly when a command was
+        // returned.
+        if self.control.has_clients() && publish_after_command {
+            let snapshot = self.control_snapshot(wm);
+            self.control.publish(&snapshot);
+        }
+        let stamp = self.control_snapshot_stamp(wm);
+        self.control.note_snapshot(stamp);
+    }
+
+    fn control_snapshot_stamp(&self, wm: &WindowManager<B>) -> control::SnapshotStamp {
+        // On one output the answer is definitionally zero. Besides
+        // avoiding even the slice walk, this keeps X11's exact
+        // `query_pointer` round trip out of the quiet single-monitor
+        // path. Multiple outputs still need the exact server position:
+        // client-content motion does not necessarily reach the shell.
+        let focused_output = if wm.monitors_ref().len() <= 1 {
+            0
+        } else {
+            let pointer = wm.backend().pointer_position().unwrap_or(self.pointer_root);
+            wm.monitor_index_at(pointer)
+        };
+        control::SnapshotStamp {
+            wm: wm.protocol_state_revision(),
+            // Output resize/hotplug reaches `on_screen_resize`, whose
+            // `apply_workareas` advances this even when the WM's client
+            // state stayed unchanged.
+            workareas: wm.workarea_revision(),
+            focused_output,
+            theme: self.control_theme_revision,
+        }
+    }
+
+    fn control_snapshot(&mut self, wm: &WindowManager<B>) -> control::Snapshot {
+        self.control_snapshot_builds = self.control_snapshot_builds.wrapping_add(1);
+        control::snapshot(
+            wm,
+            &control::Surroundings {
+                theme: &self.theme,
+                appearance: self.state.appearance,
+                decoration_style: self.state.decoration_style,
+                scale: self.state.scale,
+                pointer_root: self.pointer_root,
+                // The *choice* to follow, not whether the palette was
+                // found: a bar showing "Omarchy" while the flagship
+                // stands in is telling the truth about what the desk
+                // will wear the moment `omarchy-theme-set` runs.
+                following: self.state.following.map(str::to_string),
+            },
+        )
+    }
+
+    /// The screen/output arrangement changed (the binary drained the
+    /// backend's resize event): rehang the desktop chrome on the new
+    /// primary monitor's edges and re-derive one workarea per monitor.
+    /// `size` is the whole desktop's new extent; the monitor list is
+    /// re-read from the backend here rather than passed in, so an
+    /// output being plugged in or unplugged lands the same way a plain
+    /// resize does.
+    pub fn on_screen_resize(&mut self, wm: &mut WindowManager<B>, size: Size) {
+        self.dismiss_help(wm);
+        self.miniwindows.invalidate(wm.backend_mut());
+        if self.desktop.overview_visible() { self.close_overview(wm); }
+        let primary = primary_rect(&wm.monitors(), size);
+        self.desktop.resize_to_screen(wm.backend_mut(), size, primary);
+        self.apply_workareas(wm);
+    }
+}
+
+/// The line `hyprctl configerrors` carries for a reload whose file
+/// could not be read at all. One such line at most, and first: it is
+/// the reason nothing after it in the list has changed since the edit.
+const REJECTED_RELOAD: &str = "reload rejected: ";
+
+/// Records a rejected reload where `configerrors` reads, replacing the
+/// previous rejection so a user retrying a broken edit sees one line
+/// and not a history. The refusals from the last file that did apply
+/// stay below it: they still describe the running configuration.
+fn record_reload_rejection(diagnostics: &mut Vec<String>, error: &str) {
+    diagnostics.retain(|line| !line.starts_with(REJECTED_RELOAD));
+    diagnostics.insert(0, format!("{REJECTED_RELOAD}{error}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallpaper::Wallpaper;
+    use wm_core::Modifiers;
+
+    fn combo(keysym: u32) -> KeyCombo {
+        KeyCombo { keysym, modifiers: Modifiers::ALT }
+    }
+
+    #[test]
+    fn a_rejected_reload_is_one_line_at_the_top_of_configerrors() {
+        // The refusals from the last file that applied describe the
+        // running configuration and stay; the rejection goes first,
+        // because it is the reason they are still the current list.
+        let mut diagnostics = vec!["config: unknown top-level key bogus, ignoring it".to_string()];
+        record_reload_rejection(&mut diagnostics, "config.toml: invalid TOML: expected `=`");
+        assert_eq!(
+            diagnostics,
+            vec![
+                "reload rejected: config.toml: invalid TOML: expected `=`".to_string(),
+                "config: unknown top-level key bogus, ignoring it".to_string(),
+            ]
+        );
+        // A retry that fails differently replaces the line rather
+        // than stacking a history on top of the list.
+        record_reload_rejection(&mut diagnostics, "config.toml: invalid TOML: unterminated string");
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0], "reload rejected: config.toml: invalid TOML: unterminated string");
+    }
+
+    #[test]
+    fn a_later_duplicate_binding_wins_in_the_keymap() {
+        // The line further down the config file is the correction —
+        // plain insertion order into the map delivers exactly that.
+        let bindings = vec![(combo(1), Action::Close), (combo(1), Action::Miniaturize)];
+        let keymap = build_keymap(&bindings);
+        assert_eq!(keymap.get(&combo(1)), Some(&Action::Miniaturize));
+    }
+
+    #[test]
+    fn distinct_combos_keep_their_own_bindings() {
+        let bindings = vec![(combo(1), Action::Close), (combo(2), Action::Restart)];
+        let keymap = build_keymap(&bindings);
+        assert_eq!(keymap.get(&combo(1)), Some(&Action::Close));
+        assert_eq!(keymap.get(&combo(2)), Some(&Action::Restart));
+    }
+
+    #[test]
+    fn an_unbound_combo_misses_the_keymap() {
+        // Load-bearing for the modal Alt+Tab switcher: a miss must let
+        // the binary pass the key through to `wm-core` unchanged
+        // rather than resolve to anything.
+        let keymap = build_keymap(&[(combo(1), Action::Close)]);
+        assert_eq!(keymap.get(&combo(99)), None);
+    }
+
+    #[test]
+    fn housekeeping_waits_for_the_earliest_real_deadline_with_an_idle_cap() {
+        let now = Instant::now();
+        assert_eq!(bounded_housekeeping_wait(now, None), MAX_IDLE_HOUSEKEEPING);
+        assert_eq!(bounded_housekeeping_wait(now, Some(now - Duration::from_millis(1))), Duration::ZERO);
+        assert_eq!(
+            bounded_housekeeping_wait(now, Some(now + Duration::from_millis(37))),
+            Duration::from_millis(37)
+        );
+        assert_eq!(
+            bounded_housekeeping_wait(now, Some(now + MAX_IDLE_HOUSEKEEPING * 2)),
+            MAX_IDLE_HOUSEKEEPING
+        );
+    }
+
+    #[test]
+    fn exit_maps_to_the_exit_outcome() {
+        assert_eq!(root_action_outcome(&RootMenuAction::Exit), ShellOutcome::Exit);
+    }
+
+    #[test]
+    fn the_standard_terminal_shape_fits_any_ordinary_desk() {
+        // 18px on a 1920x1080 logical head: 80x24 must open as cells.
+        let theme = wm_theme::default_theme::nextstep_classic();
+        assert!(standard_cells_fit(18.0, &theme, Size::new(1920, 1080)));
+        // A modest laptop at a modest font still takes the standard.
+        assert!(standard_cells_fit(16.0, &theme, Size::new(1280, 800)));
+    }
+
+    #[test]
+    fn a_pathological_font_falls_back_to_the_fitted_pixel_size() {
+        // The config ceiling: 96px makes 80 columns wider than any
+        // screen this side of a video wall — the fallback must engage
+        // rather than let the frame march off the edge.
+        let theme = wm_theme::default_theme::nextstep_classic();
+        assert!(!standard_cells_fit(96.0, &theme, Size::new(1920, 1080)));
+        let (w, h) = terminal_window_size(&theme, Size::new(1920, 1080));
+        assert!(w <= 1920 && h <= 1080);
+    }
+
+    #[test]
+    fn set_theme_asks_the_binary_for_nothing() {
+        // This assertion used to read `ShellOutcome::Restart`, and
+        // inverting it is the whole point of the live-apply work: a
+        // theme pick is applied by `run_root_menu_action` in place, so
+        // there is no process-level act left for the binary to carry
+        // out. If this ever says Restart again, every theme pick has
+        // silently started costing the user their Wayland clients.
+        assert_eq!(root_action_outcome(&RootMenuAction::SetTheme("graphite")), ShellOutcome::Continue);
+    }
+
+    fn key(keysym: u32) -> KeyCombo {
+        KeyCombo { keysym, modifiers: Modifiers::ALT }
+    }
+
+    #[test]
+    fn a_grab_delta_takes_only_what_is_new_and_releases_only_what_is_gone() {
+        // The combo present in both lists is the interesting one: it
+        // must be left strictly alone. Releasing and re-taking it would
+        // work on X11 by luck (same-client grabs replace) and is
+        // exactly the kind of churn that becomes a dropped keypress on
+        // a backend where it does not.
+        let previous = vec![key(1), key(2)];
+        let next = vec![(key(2), Action::Close), (key(3), Action::Miniaturize)];
+        let (to_ungrab, to_grab) = grab_delta(&previous, &next);
+        assert_eq!(to_ungrab, vec![key(1)]);
+        assert_eq!(to_grab, vec![key(3)]);
+    }
+
+    #[test]
+    fn a_grab_delta_from_nothing_takes_everything() {
+        // The startup path: `Shell::new` reconciles from an empty set
+        // rather than having its own grab loop, so this is the case
+        // that has to behave like the old dedicated loop did.
+        let next = vec![(key(1), Action::Close), (key(2), Action::Restart)];
+        let (to_ungrab, to_grab) = grab_delta(&[], &next);
+        assert!(to_ungrab.is_empty());
+        assert_eq!(to_grab, vec![key(1), key(2)]);
+    }
+
+    #[test]
+    fn a_combo_bound_twice_is_grabbed_once() {
+        // A config may bind the same combo twice (last one wins in the
+        // keymap). Grabbing it twice would leave the second grab held
+        // after the first is released, so the session would keep
+        // swallowing a key the user had just unbound.
+        let next = vec![(key(1), Action::Close), (key(1), Action::Miniaturize)];
+        let (_, to_grab) = grab_delta(&[], &next);
+        assert_eq!(to_grab, vec![key(1)]);
+    }
+
+    fn monitor(geometry: Rect, primary: bool) -> MonitorInfo {
+        MonitorInfo { geometry, name: "test".to_string(), identity: None, primary }
+    }
+
+    #[test]
+    fn chrome_hangs_on_the_flagged_primary_whatever_its_position_in_the_list() {
+        let left = Rect { pos: Point::new(-1920, 0), size: Size::new(1920, 1080) };
+        let right = Rect { pos: Point::new(0, 0), size: Size::new(1600, 1200) };
+        let monitors = [monitor(left, false), monitor(right, true)];
+
+        assert_eq!(
+            primary_rect(&monitors, Size::new(3520, 1200)),
+            right,
+            "the flagged primary wins, not the first entry"
+        );
+    }
+
+    #[test]
+    fn with_no_flagged_primary_the_first_monitor_stands_in() {
+        // `Backend::monitors` allows a platform that names no primary
+        // at all — index 0 is then the primary, matching what wm-core
+        // itself does with the same list.
+        let first = Rect { pos: Point::new(0, 0), size: Size::new(1600, 1200) };
+        let second = Rect { pos: Point::new(1600, 0), size: Size::new(1920, 1080) };
+        let monitors = [monitor(first, false), monitor(second, false)];
+
+        assert_eq!(primary_rect(&monitors, Size::new(3520, 1200)), first);
+    }
+
+    #[test]
+    fn a_backend_reporting_no_monitors_falls_back_to_the_whole_screen() {
+        // Exactly the origin-anchored, screen-sized assumption the
+        // shell made before it was monitor-aware, so such a backend
+        // behaves the way it always did.
+        let screen = Size::new(1600, 1200);
+        assert_eq!(primary_rect(&[], screen), Rect { pos: Point::new(0, 0), size: screen });
+    }
+
+    #[test]
+    fn bare_arrows_and_return_drive_the_overview_and_everything_else_dismisses() {
+        use wm_core::Modifiers;
+        let bare = |keysym| KeyCombo { keysym, modifiers: Modifiers::empty() };
+        assert_eq!(overview_intent(&bare(XK_LEFT)), OverviewIntent::Move(-1, 0));
+        assert_eq!(overview_intent(&bare(XK_RIGHT)), OverviewIntent::Move(1, 0));
+        assert_eq!(overview_intent(&bare(XK_UP)), OverviewIntent::Move(0, -1));
+        assert_eq!(overview_intent(&bare(XK_DOWN)), OverviewIntent::Move(0, 1));
+        assert_eq!(overview_intent(&bare(XK_RETURN)), OverviewIntent::Commit);
+        assert_eq!(overview_intent(&bare(XK_KP_ENTER)), OverviewIntent::Commit);
+        // Escape dismisses by convention; any other stray key steps
+        // aside the way the Alt-Tab switcher does rather than eating
+        // the user's typing.
+        assert_eq!(overview_intent(&bare(0xff1b)), OverviewIntent::Dismiss);
+        assert_eq!(overview_intent(&bare('a' as u32)), OverviewIntent::Dismiss);
+    }
+
+    #[test]
+    fn modified_arrows_dismiss_instead_of_moving_the_selection() {
+        // A workspace chord (alt+ctrl+right) pressed out of habit over
+        // an open Overview must close it, not invisibly become
+        // selection movement bound to nothing the user chose.
+        let chord = KeyCombo { keysym: XK_RIGHT, modifiers: Modifiers::ALT | Modifiers::CONTROL };
+        assert_eq!(overview_intent(&chord), OverviewIntent::Dismiss);
+        let super_up = KeyCombo { keysym: XK_UP, modifiers: Modifiers::SUPER };
+        assert_eq!(overview_intent(&super_up), OverviewIntent::Dismiss);
+    }
+
+    #[test]
+    fn every_other_root_action_continues_the_session() {
+        for action in [
+            RootMenuAction::LaunchTerminal,
+            RootMenuAction::LaunchAbout,
+            RootMenuAction::LaunchApp { index: 0, generation: 1 },
+            RootMenuAction::OmarchyCommand { index: 0, generation: 1 },
+            RootMenuAction::SetWallpaper(Wallpaper::LavenderGrid),
+        ] {
+            assert_eq!(root_action_outcome(&action), ShellOutcome::Continue);
+        }
+    }
+}
+
+#[cfg(test)]
+mod adversarial_spaces_review {
+    use super::*;
+    use wm_core::fake_backend::{FakeBackend, FakeTheme};
+
+    #[test]
+    fn adversarial_fullscreen_over_maximize_preserves_original_restore_geometry() {
+        let mut wm = WindowManager::new(FakeBackend::new(), Box::new(FakeTheme));
+        wm.set_interaction_config(wm_core::InteractionConfig { mode: wm_core::InteractionMode::Mac, ..Default::default() });
+        let window = wm.backend_mut().create_window();
+        wm.backend_mut().window_classes.insert(window, "review-test".into());
+        wm.dispatch(wm_core::BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original = wm.client(id).unwrap().geometry;
+        wm.maximize(id, MaximizeDirections::FULL);
+        wm.fullscreen(id);
+        let records = layout_snapshot(&wm, &[]);
+        assert_eq!(restored_geometry(wm.monitors_ref(), &records[0]), original,
+            "fullscreen serialization must preserve the pre-maximize restore point");
+    }
+}
+
+#[cfg(test)]
+mod workspace_layouts {
+    use super::*;
+    use std::collections::BTreeMap;
+    use wm_core::fake_backend::{FakeBackend, FakeTheme};
+    use wm_core::LayoutMode;
+
+    /// A reload that touches an unrelated file re-applies the same
+    /// configuration. It must not revert a workspace the user switched
+    /// with SUPER+L, while a rule or default that did change still
+    /// lands where nobody chose otherwise.
+    #[test]
+    fn a_reread_never_undoes_a_live_toggle_and_still_applies_what_changed() {
+        let mut wm = WindowManager::new(FakeBackend::new(), Box::new(FakeTheme));
+        let mut applied = BTreeMap::new();
+        let rules = BTreeMap::from([(1, LayoutMode::Flow), (2, LayoutMode::Flow)]);
+        apply_workspace_layouts(&mut wm, &mut applied, Some(LayoutMode::Mosaic), &rules);
+        assert_eq!(wm.workspace_layout(0), LayoutMode::Mosaic, "general.layout = dwindle");
+        assert_eq!(wm.workspace_layout(1), LayoutMode::Flow, "the rule for workspace 2");
+        assert_eq!(wm.workspace_layout(2), LayoutMode::Flow, "the rule for workspace 3");
+
+        // SUPER+L twice on workspace 1: Mosaic, Flow, Mosaic — a chosen
+        // style that happens to equal the default. Once on workspace 2.
+        wm.toggle_workspace_layout();
+        wm.toggle_workspace_layout();
+        assert_eq!(wm.workspace_layout(0), LayoutMode::Mosaic);
+        wm.switch_workspace(1);
+        wm.toggle_workspace_layout();
+        assert_eq!(wm.workspace_layout(1), LayoutMode::Mosaic);
+
+        // An unrelated edit: the same configuration, read again.
+        apply_workspace_layouts(&mut wm, &mut applied, Some(LayoutMode::Mosaic), &rules);
+        assert_eq!(wm.workspace_layout(1), LayoutMode::Mosaic, "an unchanged rule is not re-applied over a toggle");
+        assert_eq!(wm.workspace_layout(0), LayoutMode::Mosaic);
+
+        // Omarchy's own toggle script saving workspace 3: that rule
+        // changed, so it lands; the untouched rule for workspace 2 still
+        // does not override the toggle.
+        let rules = BTreeMap::from([(1, LayoutMode::Flow), (2, LayoutMode::Mosaic)]);
+        apply_workspace_layouts(&mut wm, &mut applied, Some(LayoutMode::Mosaic), &rules);
+        assert_eq!(wm.workspace_layout(2), LayoutMode::Mosaic, "a changed rule is applied");
+        assert_eq!(wm.workspace_layout(1), LayoutMode::Mosaic, "an unchanged rule still leaves the toggle alone");
+
+        // A changed default reaches only workspaces nobody chose for.
+        wm.switch_workspace(4);
+        assert_eq!(wm.workspace_layout(4), LayoutMode::Mosaic, "a workspace first reached by a switch starts in the default");
+        apply_workspace_layouts(&mut wm, &mut applied, Some(LayoutMode::Flow), &rules);
+        assert_eq!(wm.workspace_layout(4), LayoutMode::Flow);
+        assert_eq!(wm.workspace_layout(3), LayoutMode::Flow);
+        assert_eq!(wm.workspace_layout(0), LayoutMode::Mosaic, "the toggled workspace keeps its style through a default change");
+        assert_eq!(wm.workspace_layout(1), LayoutMode::Mosaic);
+        assert_eq!(wm.workspace_layout(2), LayoutMode::Mosaic, "a ruled workspace keeps its rule through a default change");
+
+        // The configuration going away: Freeform is the default again,
+        // and a rule that vanished leaves its workspace as it is.
+        apply_workspace_layouts(&mut wm, &mut applied, None, &BTreeMap::new());
+        assert_eq!(wm.workspace_layout(3), LayoutMode::Freeform);
+        assert_eq!(wm.workspace_layout(2), LayoutMode::Mosaic);
+        assert_eq!(wm.workspace_layout(0), LayoutMode::Mosaic);
+        assert!(applied.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bound_resize {
+    use super::*;
+    use wm_core::fake_backend::{FakeBackend, FakeTheme};
+
+    /// One output at scale 2, with two windows arranged by `layout`.
+    fn desk(layout: wm_core::LayoutMode) -> (WindowManager<FakeBackend>, Vec<ClientId>) {
+        let mut wm = WindowManager::new(FakeBackend::new(), Box::new(FakeTheme));
+        wm.backend_mut().set_monitor_scales(vec![2.0]);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let window = wm.backend_mut().create_window();
+            wm.dispatch(BackendEvent::MapRequest(window));
+            ids.push(wm.client_for_window(window).unwrap());
+        }
+        wm.set_workspace_layout(0, layout);
+        (wm, ids)
+    }
+
+    /// A bound resize delta is in logical pixels, the unit Omarchy writes
+    /// its chords in and `hyprctl dispatch resizeactive` takes. On a
+    /// scale-2 output, SUPER+minus's -100 must move a Mosaic boundary as
+    /// far as the IPC path's -200 device pixels, and SUPER+equal's +100
+    /// must widen a Flow column by 100 logical pixels.
+    #[test]
+    fn a_bound_resize_moves_as_far_as_the_same_ipc_resize_on_a_scaled_output() {
+        for (layout, delta) in [
+            (wm_core::LayoutMode::Mosaic, Point::new(-100, 0)),
+            (wm_core::LayoutMode::Flow, Point::new(100, 0)),
+        ] {
+            let (mut bound, ids) = desk(layout);
+            let (mut ipc, ipc_ids) = desk(layout);
+            let geometry = |wm: &WindowManager<FakeBackend>, ids: &[ClientId]| {
+                ids.iter().map(|&id| wm.client(id).unwrap().geometry).collect::<Vec<_>>()
+            };
+            let before = geometry(&bound, &ids);
+            resize_by_logical_delta(&mut bound, ids[0], delta);
+            assert!(ipc.resize_layout_window(ipc_ids[0], Point::new(delta.x * 2, delta.y * 2)));
+            assert_ne!(geometry(&bound, &ids), before, "{layout:?}: the resize did nothing");
+            assert_eq!(
+                geometry(&bound, &ids),
+                geometry(&ipc, &ipc_ids),
+                "{layout:?}: a bound delta must be logical pixels"
+            );
+        }
+        // A window outside the layouts resizes its content by the same
+        // logical amount.
+        let (mut wm, ids) = desk(wm_core::LayoutMode::Freeform);
+        let before = wm.client(ids[0]).unwrap().geometry.size;
+        resize_by_logical_delta(&mut wm, ids[0], Point::new(-50, -25));
+        assert_eq!(
+            wm.client(ids[0]).unwrap().geometry.size,
+            Size::new(before.w - 100, before.h - 50)
+        );
+    }
+}
+
+#[cfg(test)]
+mod reload_guard {
+    use super::*;
+
+    /// Omarchy's reload guard: while auto-reload is paused an edit to a
+    /// watched file is not re-read however many ticks go by, and once
+    /// the pause lifts it is re-read exactly once.
+    #[test]
+    fn a_paused_watch_is_not_consulted_and_catches_up_once_when_resumed() {
+        let root = std::env::temp_dir().join(format!("chonk-reload-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let entry = root.join(".config/hypr/hyprland.conf");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&entry, "bind = SUPER, W, killactive,\n").unwrap();
+        let roots = wm_config::hyprland::Roots::under(&root);
+        let mut watch = wm_config::hyprland::Watch::new(&roots, &wm_config::hyprland::read(&roots));
+        let t0 = Instant::now();
+        let second = |n: u64| t0 + std::time::Duration::from_secs(n);
+        assert!(!hyprland_config_due(false, &mut watch, t0), "the first look is a baseline");
+
+        // Paused: the file is replaced, and poll after poll says nothing.
+        std::fs::write(&entry, "bind = SUPER SHIFT, Q, killactive,\n").unwrap();
+        for n in 2..=8 {
+            assert!(!hyprland_config_due(true, &mut watch, second(n)), "paused at t+{n}s");
+        }
+        // Resumed: seen once, then quiet.
+        assert!(hyprland_config_due(false, &mut watch, second(10)), "the edit is seen when the pause lifts");
+        assert!(!hyprland_config_due(false, &mut watch, second(12)), "and only once");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

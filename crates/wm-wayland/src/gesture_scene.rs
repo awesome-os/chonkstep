@@ -1,0 +1,607 @@
+//! Transient scene ownership for finger and keyboard desktop transitions. WM topology
+//! and focus are untouched until settlement; every frame reuses live textures.
+use crate::overview::{Overview, Window};
+use crate::renderer::SceneElement;
+use crate::state::{Compositor, Graphics, StackEntry, WaylandBackend};
+use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::{gles::GlesRenderer, Color32F};
+use std::time::{Duration, Instant};
+use wm_core::{
+    gesture_physics as physics, ClientFlags, DesktopGesture, Lifecycle, SwipeAxis, SwipeMotion,
+};
+use wm_theme_api::{Point, Rect};
+
+struct Plane {
+    workspace: usize,
+    windows: Vec<Window>,
+    overview: Option<Overview>,
+    background: Id,
+}
+
+pub(crate) struct Transition {
+    pub motion: SwipeMotion,
+    pub origin: usize,
+    pub output: Option<Rect>,
+    count: usize,
+    pub previous: Option<usize>,
+    pub next: Option<usize>,
+    pub position: f64,
+    pub velocity: f64,
+    pub projected: f64,
+    pub spring: Option<physics::Spring>,
+    overview_origin: bool,
+    base: f64,
+    planes: Vec<Plane>,
+    monitors: Vec<(Rect, f64)>,
+    last_frame: Instant,
+    next_frame: Instant,
+    frame_interval: Duration,
+    overview_token: Option<Id>,
+    /// Whether the armed spring came from a keyboard or pointer Overview
+    /// command rather than a released swipe: they answer to different
+    /// switches of the motion policy.
+    keyboard_target: bool,
+}
+impl Transition {
+    pub fn horizontal(&self) -> bool {
+        self.motion.axis == SwipeAxis::Horizontal
+    }
+    fn bounds(&self) -> (f64, f64) {
+        if self.horizontal() {
+            (
+                if self.previous.is_some() { -1.0 } else { 0.0 },
+                if self.next.is_some() { 1.0 } else { 0.0 },
+            )
+        } else {
+            (0.0, 1.0)
+        }
+    }
+    fn follow(&mut self, motion: SwipeMotion) {
+        self.motion = motion;
+        let raw = self.base
+            + motion.progress
+            + if !self.horizontal() && self.overview_origin {
+                1.0
+            } else {
+                0.0
+            };
+        let (min, max) = self.bounds();
+        let (position, derivative) = physics::resisted(raw, min, max);
+        self.position = position;
+        self.velocity = motion.velocity * derivative;
+        self.projected = physics::projected(position, self.velocity);
+    }
+}
+
+pub(crate) fn update(comp: &mut Compositor, motion: SwipeMotion) {
+    let Some(_) = comp.wm.monitors_ref().get(comp.wm.active_output_index()) else {
+        cancel(comp);
+        return;
+    };
+    if comp
+        .wm
+        .backend()
+        .gesture_scene
+        .as_ref()
+        .is_some_and(|s| s.motion.axis != motion.axis)
+    {
+        cancel(comp);
+    }
+    if comp.wm.backend().gesture_scene.is_none() {
+        let opened = comp.wm.backend().overview.is_some();
+        if motion.axis == SwipeAxis::Vertical {
+            if (opened && motion.progress >= 0.0) || (!opened && motion.progress <= 0.0) {
+                return;
+            }
+            if !opened {
+                comp.shell
+                    .on_desktop_gesture(&mut comp.wm, DesktopGesture::OverviewOpen);
+            }
+            if comp.wm.backend().overview.is_none() {
+                return;
+            }
+        }
+        begin(comp, motion, opened);
+    }
+    if let Some(scene) = comp.wm.backend_mut().gesture_scene.as_mut() {
+        scene.follow(motion);
+    }
+    // Finger input owns progress even when opening constructed a keyboard target.
+    comp.wm.backend_mut().overview_target = None;
+    sync_progress(comp);
+}
+
+fn begin(comp: &mut Compositor, motion: SwipeMotion, opened: bool) {
+    let Some(monitor) = comp.wm.monitors_ref().get(comp.wm.active_output_index()) else { return; };
+    let output = comp.wm.separate_spaces().then_some(monitor.geometry);
+    let origin = comp.wm.current_workspace();
+    let count = comp.wm.workspace_count();
+    let previous = if comp.wm.spaces_mode() { comp.wm.neighboring_workspace(origin, -1) } else { origin.checked_sub(1) };
+    let next = if comp.wm.spaces_mode() { comp.wm.neighboring_workspace(origin, 1) } else { (origin + 1 < wm_core::MAX_WORKSPACES
+        && (origin + 1 < count || comp.wm.workspace_has_windows(origin)))
+    .then_some(origin + 1) };
+    let mut planes = Vec::new();
+    if motion.axis == SwipeAxis::Horizontal {
+        for workspace in [Some(origin), previous, next].into_iter().flatten() {
+            let windows: Vec<_> = comp
+                .wm
+                .backend()
+                .stacking
+                .iter()
+                .rev()
+                .filter_map(|entry| match entry {
+                    StackEntry::Window(id) => comp.wm.client_for_window(*id),
+                    StackEntry::Frame(id) => comp.wm.client_for_frame(*id),
+                })
+                .filter_map(|id| comp.wm.client(id))
+                .filter(|c| {
+                    (if c.flags.contains(ClientFlags::STICKY) { workspace == origin } else { c.workspace == workspace })
+                        && c.lifecycle == Lifecycle::Normal
+                        && (!comp.wm.separate_spaces() || comp.wm.workspace_output_index(c.workspace) == comp.wm.workspace_output_index(origin))
+                })
+                .map(|c| {
+                    let source = c.frame.and_then(|id| comp.wm.backend().frames.get(&id))
+                        .map_or(c.geometry, |frame| frame.visual_geometry());
+                    let mut window = Window::snapshot(c.window, c.frame, source, comp.wm.backend());
+                    window.draw_content = !c.flags.contains(ClientFlags::SHADED);
+                    window.sticky = c.flags.contains(ClientFlags::STICKY);
+                    window
+                })
+                .collect();
+            let overview = comp
+                .wm
+                .backend()
+                .overview
+                .as_ref()
+                .filter(|_| workspace != origin)
+                .map(|o| {
+                    let scene = comp
+                        .shell
+                        .desktop_gesture_overview_scene(&comp.wm, workspace, o.geometry);
+                    Overview::new(o.surface, scene, comp.wm.backend())
+                });
+            planes.push(Plane {
+                workspace,
+                windows,
+                overview,
+                background: Id::new(),
+            });
+        }
+    }
+    let now = Instant::now();
+    let monitors = comp
+        .wm
+        .backend()
+        .monitors
+        .iter()
+        .map(|m| (m.geometry, comp.wm.backend().scale_at(m.geometry)))
+        .collect();
+    let frame_interval = comp
+        .outputs
+        .iter()
+        .filter_map(|o| o.output.current_mode())
+        .filter(|m| m.refresh > 0)
+        .map(|m| {
+            Duration::from_nanos(1_000_000_000_000 / (m.refresh as u64).clamp(1000, 1_000_000))
+        })
+        .min()
+        .unwrap_or(Duration::from_nanos(1_000_000_000 / 60));
+    let overview_token = comp
+        .wm
+        .backend()
+        .overview
+        .as_ref()
+        .map(|o| o.token().clone());
+    comp.wm.backend_mut().gesture_scene = Some(Transition {
+        motion,
+        origin,
+        output,
+        count,
+        previous,
+        next,
+        position: 0.0,
+        velocity: 0.0,
+        projected: 0.0,
+        spring: None,
+        overview_origin: opened,
+        base: 0.0,
+        planes,
+        monitors,
+        last_frame: now,
+        next_frame: now,
+        frame_interval,
+        overview_token,
+        keyboard_target: false,
+    });
+    crate::input::sync_pointer_focus(comp);
+}
+
+/// Touching a moving desktop catches it at its exact current position. The
+/// next locked-axis delta is relative to that position, not the logical origin.
+pub(crate) fn catch(comp: &mut Compositor) -> bool {
+    let Some(scene) = comp
+        .wm
+        .backend_mut()
+        .gesture_scene
+        .as_mut()
+        .filter(|s| s.spring.is_some())
+    else {
+        return false;
+    };
+    let (min, max) = scene.bounds();
+    scene.base = physics::unresisted(scene.position, min, max)
+        - if !scene.horizontal() && scene.overview_origin {
+            1.0
+        } else {
+            0.0
+        };
+    scene.spring = None;
+    scene.velocity = 0.0;
+    true
+}
+
+/// Keyboard and pointer commands settle the same live scene as a released
+/// swipe. Run after the shell's event drain, before its first rendered frame.
+pub(crate) fn apply_overview_target(comp: &mut Compositor) {
+    let Some(opened) = comp.wm.backend_mut().overview_target.take() else { return; };
+    let Some(overview) = comp.wm.backend().overview.as_ref() else { return; };
+    let position = overview.progress;
+    if !crate::input::gestures::available(comp) {
+        if !opened || position < 1.0 {
+            comp.shell.finish_desktop_gesture_overview(&mut comp.wm, false);
+        }
+        return;
+    }
+    let compatible = comp.wm.backend().gesture_scene.as_ref().is_some_and(|scene|
+        !scene.horizontal() && scene.overview_token.as_ref() == Some(overview.token()));
+    if !compatible {
+        cancel(comp);
+        begin(comp, SwipeMotion { axis: SwipeAxis::Vertical, x: 0.0, y: 0.0,
+            progress: 0.0, velocity: 0.0 }, position >= 1.0);
+    }
+    if let Some(scene) = comp.wm.backend_mut().gesture_scene.as_mut() {
+        scene.position = position;
+        let target = if opened { 1.0 } else { 0.0 };
+        scene.spring = Some(physics::Spring::new(position, scene.velocity, target));
+        scene.keyboard_target = true;
+        scene.last_frame = Instant::now();
+        scene.next_frame = scene.last_frame;
+    }
+    settle_or_sync(comp);
+}
+
+/// The policy an armed spring answers to. Recomputed per frame rather
+/// than stored, so a reload that turns motion off mid-flight lands the
+/// scene on its current target.
+fn spring_policy(comp: &Compositor, scene: &Transition) -> physics::MotionPolicy {
+    let policy = comp.wm.motion_policy();
+    policy.gate(if scene.keyboard_target {
+        policy.overview
+    } else {
+        policy.gesture_settle
+    })
+}
+
+/// After arming a spring: with motion off, jump to its target and run
+/// the same completion an animated frame would, in this pass, so a
+/// snapped transition has exactly the end state an animated one has.
+fn settle_or_sync(comp: &mut Compositor) {
+    let policy = comp
+        .wm
+        .backend()
+        .gesture_scene
+        .as_ref()
+        .filter(|scene| scene.spring.is_some())
+        .map(|scene| spring_policy(comp, scene));
+    match policy {
+        Some(policy) if !policy.enabled => {
+            let scene = comp.wm.backend_mut().gesture_scene.as_mut().unwrap();
+            let spring = scene.spring.as_mut().unwrap();
+            spring.advance_with(0.0, &policy);
+            scene.position = spring.position;
+            scene.velocity = spring.velocity;
+            complete(comp);
+        }
+        _ => sync_progress(comp),
+    }
+}
+
+fn sync_progress(comp: &mut Compositor) {
+    let backend = comp.wm.backend_mut();
+    if let Some(scene) = &backend.gesture_scene {
+        if !scene.horizontal() {
+            if let Some(overview) = backend.overview.as_mut() {
+                overview.progress = scene.position;
+            }
+        }
+        backend.mark_damaged();
+    }
+}
+
+pub(crate) fn release(comp: &mut Compositor, cancelled: bool, motion: Option<SwipeMotion>) {
+    if let Some(scene) = comp.wm.backend_mut().gesture_scene.as_mut() {
+        if let Some(motion) = motion {
+            scene.follow(motion);
+        }
+        let target = if cancelled {
+            if scene.horizontal() || !scene.overview_origin {
+                0.0
+            } else {
+                1.0
+            }
+        } else {
+            let (min, max) = scene.bounds();
+            physics::settle_target(scene.position, scene.velocity, min, max)
+        };
+        scene.spring = Some(physics::Spring::new(scene.position, scene.velocity, target));
+        scene.keyboard_target = false;
+        scene.last_frame = Instant::now();
+        scene.next_frame = scene.last_frame;
+    }
+    settle_or_sync(comp);
+}
+
+/// Ownership loss is immediate, unlike a libinput cancellation which settles.
+pub(crate) fn cancel(comp: &mut Compositor) {
+    let Some(scene) = comp.wm.backend_mut().gesture_scene.take() else {
+        return;
+    };
+    let owns_overview = scene.overview_token.as_ref() == comp.wm.backend().overview.as_ref().map(|o| o.token());
+    if owns_overview && !scene.horizontal() && !scene.overview_origin {
+        comp.shell
+            .finish_desktop_gesture_overview(&mut comp.wm, false);
+    } else if let Some(overview) = comp.wm.backend_mut().overview.as_mut().filter(|_| owns_overview) {
+        overview.progress = 1.0;
+    }
+    comp.wm.backend_mut().mark_damaged();
+    crate::input::sync_pointer_focus(comp);
+}
+
+pub(crate) fn deadline(comp: &Compositor) -> Option<Instant> {
+    // Native KMS wakes at vblank and uses its existing FrameClock deadlines.
+    // Only the nested, non-vsynced backend needs a finite animation deadline.
+    if !matches!(comp.graphics, Graphics::Winit(_)) {
+        return None;
+    }
+    comp.wm
+        .backend()
+        .gesture_scene
+        .as_ref()
+        .filter(|s| s.spring.is_some())
+        .map(|s| s.next_frame)
+}
+
+pub(crate) fn validate(comp: &mut Compositor) {
+    let Some(scene) = comp.wm.backend().gesture_scene.as_ref() else {
+        return;
+    };
+    let reason = if comp.wm.current_workspace() != scene.origin {
+        Some("active workspace changed")
+    } else if comp.wm.workspace_count() != scene.count {
+        Some("workspace topology changed")
+    } else if scene.next == Some(scene.count) && !comp.wm.workspace_has_windows(scene.origin) {
+        Some("source workspace became empty")
+    } else if !crate::input::gestures::available(comp) {
+        Some("desktop input ownership lost")
+    } else if scene.monitors.len() != comp.wm.backend().monitors.len() {
+        Some("output topology changed")
+    } else if scene
+            .monitors
+            .iter()
+            .zip(&comp.wm.backend().monitors)
+            .any(|((rect, scale), monitor)| {
+                *rect != monitor.geometry || *scale != comp.wm.backend().scale_at(monitor.geometry)
+            }) {
+        Some("output geometry or scale changed")
+    } else if scene.overview_token.as_ref() != comp.wm.backend().overview.as_ref().map(|o| o.token()) {
+        Some("Overview lifetime ended")
+    } else { None };
+    if let Some(reason) = reason {
+        tracing::debug!(reason, axis = ?scene.motion.axis, origin = scene.origin,
+            progress = scene.position, "cancelling desktop gesture");
+        crate::input::gestures::cancel(comp);
+    }
+}
+pub(crate) fn tick(comp: &mut Compositor) {
+    validate(comp);
+    let Some(scene) = comp.wm.backend().gesture_scene.as_ref() else {
+        return;
+    };
+    if scene.spring.is_none() {
+        return;
+    }
+    let now = Instant::now();
+    let policy = spring_policy(comp, scene);
+    let scene = comp.wm.backend_mut().gesture_scene.as_mut().unwrap();
+    let spring = scene.spring.as_mut().unwrap();
+    let finished = spring.advance_with(
+        now.saturating_duration_since(scene.last_frame)
+            .as_secs_f64(),
+        &policy,
+    );
+    scene.last_frame = now;
+    scene.next_frame = now + scene.frame_interval;
+    scene.position = spring.position;
+    scene.velocity = spring.velocity;
+    if finished {
+        complete(comp);
+    } else {
+        sync_progress(comp);
+    }
+}
+
+/// The one completion for a settled spring, animated or snapped: the
+/// workspace change still goes through the shell, Overview still
+/// releases its input ownership, and pointer focus is re-derived.
+fn complete(comp: &mut Compositor) {
+    let Some(scene) = comp.wm.backend_mut().gesture_scene.take() else {
+        return;
+    };
+    let target = scene.spring.map_or(scene.position, |spring| spring.target);
+    if scene.horizontal() {
+        if target > 0.0 {
+            comp.shell
+                .on_desktop_gesture(&mut comp.wm, DesktopGesture::WorkspaceNext);
+        } else if target < 0.0 {
+            comp.shell
+                .on_desktop_gesture(&mut comp.wm, DesktopGesture::WorkspacePrevious);
+        }
+    } else {
+        if let Some(overview) = comp.wm.backend_mut().overview.as_mut() {
+            overview.progress = target;
+        }
+        comp.shell
+            .finish_desktop_gesture_overview(&mut comp.wm, target > 0.5);
+    }
+    comp.wm.backend_mut().mark_damaged();
+    crate::input::sync_pointer_focus(comp);
+}
+
+pub(crate) fn render(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    scene: &Transition,
+    viewport: Rect,
+    purpose: crate::renderer::ScenePurpose,
+) -> Color32F {
+    if !scene.overview_origin {
+        crate::renderer::push_furniture(elements, renderer, backend, viewport, 1.0, true);
+        if let Some(origin) = scene.planes.first() {
+            for window in origin.windows.iter().filter(|w| w.sticky) {
+                let rect = Rect::new(Point::new(window.source.pos.x - viewport.pos.x,
+                    window.source.pos.y - viewport.pos.y), window.source.size);
+                crate::overview::render_window(elements, renderer, backend, window, rect, 1.0, purpose);
+            }
+        }
+    }
+    // Each output is its own viewport into the same normalized transition.
+    // Clipping to its translated source prevents windows on another monitor
+    // from leaking across a mixed-scale output boundary during the slide.
+    for plane in &scene.planes {
+        let direction = if Some(plane.workspace) == scene.previous { -1.0 } else if Some(plane.workspace) == scene.next { 1.0 } else { 0.0 };
+        let shift = plane_shift(direction, scene.position, viewport.size.w);
+        if shift.unsigned_abs() >= viewport.size.w {
+            continue;
+        }
+        let clip = Rect::new(Point::new(shift, 0), viewport.size);
+        let shifted_view = Rect::new(
+            Point::new(viewport.pos.x - shift, viewport.pos.y),
+            viewport.size,
+        );
+        let start = elements.len();
+        let overview = if plane.workspace == scene.origin {
+            backend.overview.as_ref()
+        } else {
+            plane.overview.as_ref()
+        };
+        if let Some(overview) = overview.filter(|o| o.covers(viewport)) {
+            crate::overview::render(elements, renderer, backend, overview, shifted_view, purpose);
+        } else {
+            for window in &plane.windows {
+                if window.sticky { continue; }
+                if !overlaps(window.source, viewport) {
+                    continue;
+                }
+                let rect = Rect::new(
+                    Point::new(
+                        window.source.pos.x - shifted_view.pos.x,
+                        window.source.pos.y - viewport.pos.y,
+                    ),
+                    window.source.size,
+                );
+                crate::overview::render_window(elements, renderer, backend, window, rect, 1.0, purpose);
+            }
+        }
+        if !scene.overview_origin && plane.workspace == scene.origin {
+            crate::renderer::push_furniture(elements, renderer, backend, shifted_view, 1.0, false);
+        }
+        crate::overview::space_background(
+            elements,
+            renderer,
+            backend,
+            viewport,
+            clip,
+            &plane.background,
+        );
+        crate::renderer::clip_plane(elements, start, clip, &plane.background);
+    }
+    Color32F::new(0.015, 0.015, 0.018, 1.0)
+}
+fn plane_shift(neighbor: f64, progress: f64, width: u32) -> i32 {
+    ((neighbor - progress) * f64::from(width)).round() as i32
+}
+fn overlaps(a: Rect, b: Rect) -> bool {
+    i64::from(a.pos.x) < i64::from(b.pos.x) + i64::from(b.size.w)
+        && i64::from(b.pos.x) < i64::from(a.pos.x) + i64::from(a.size.w)
+        && i64::from(a.pos.y) < i64::from(b.pos.y) + i64::from(b.size.h)
+        && i64::from(b.pos.y) < i64::from(a.pos.y) + i64::from(a.size.h)
+}
+
+pub(crate) fn for_each_neighbor(
+    backend: &WaylandBackend,
+    mut visit: impl FnMut(&crate::state::WindowRecord),
+) {
+    let Some(scene) = &backend.gesture_scene else {
+        return;
+    };
+    let target = if scene.position > 0.0 {
+        scene.next
+    } else if scene.position < 0.0 {
+        scene.previous
+    } else {
+        None
+    };
+    if let Some(plane) = scene.planes.iter().find(|p| Some(p.workspace) == target) {
+        for window in &plane.windows {
+            if !backend.scene_index.is_presented(window.window)
+                && !backend.overview.as_ref().is_some_and(|o| o.includes_window(window.window)
+                    && backend.shells.get(&o.surface).is_some_and(|s| s.mapped)) {
+                if let Some(record) = backend
+                    .windows
+                    .get(&window.window)
+                    .filter(|r| r.surface.alive())
+                {
+                    visit(record);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn normalized_motion_has_identical_sensitivity_on_mixed_outputs() {
+        // 1x 1080p, fractional 1440p, 2x 4K: scale is deliberately not
+        // an input to the transform. Per-output widths affect travel only.
+        for width in [1920, 2560, 3840] {
+            for progress in [-0.75, -0.25, 0.0, 0.125, 0.5, 1.0] {
+                assert!(
+                    (f64::from(plane_shift(0.0, progress, width)) / f64::from(width) + progress)
+                        .abs()
+                        < 1e-6
+                );
+                assert_eq!(
+                    plane_shift(1.0, progress, width) - plane_shift(0.0, progress, width),
+                    width as i32
+                );
+            }
+        }
+    }
+    #[test]
+    fn overview_interpolation_is_reversible_and_preserves_endpoints() {
+        let source = Rect::new(Point::new(2000, 70), wm_theme_api::Size::new(800, 600));
+        let target = Rect::new(Point::new(180, 250), wm_theme_api::Size::new(400, 300));
+        assert_eq!(crate::overview::interpolate(source, target, 0.0), source);
+        assert_eq!(crate::overview::interpolate(source, target, 1.0), target);
+        let half = crate::overview::interpolate(source, target, 0.5);
+        assert_eq!(half.pos, Point::new(1090, 160));
+        assert_eq!(half.size, wm_theme_api::Size::new(600, 450));
+        assert_eq!(
+            crate::overview::interpolate(target, source, 0.75),
+            crate::overview::interpolate(source, target, 0.25)
+        );
+    }
+}

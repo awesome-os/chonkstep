@@ -1,0 +1,398 @@
+//! Assert coordinates received over the wire, including the implicit button
+//! grab. Hover-only assertions miss a scale-dependent drag-selection error.
+
+use std::time::Duration;
+
+use chonk_testkit::{poll_until, profile_binary, Session, SessionOptions, WindowInfo};
+
+const EVENT: Duration = Duration::from_secs(10);
+const PROBE: &str = "chonk-input-probe";
+
+#[derive(Debug)]
+struct InputEvent {
+    sequence: u64,
+    kind: String,
+    x: f64,
+    y: f64,
+}
+
+fn event_after(session: &Session, after: u64, kind: &str) -> Option<InputEvent> {
+    session.client_log(PROBE).lines().rev().find_map(|line| {
+        let mut fields = line.strip_prefix("input ")?.split_whitespace();
+        let event = InputEvent {
+            sequence: fields.next()?.parse().ok()?,
+            kind: fields.next()?.into(),
+            x: fields.next()?.parse().ok()?,
+            y: fields.next()?.parse().ok()?,
+        };
+        (event.sequence > after && event.kind == kind).then_some(event)
+    })
+}
+
+fn wait_event(session: &Session, after: u64, kind: &str) -> InputEvent {
+    poll_until(EVENT, "client's next pointer event", || event_after(session, after, kind))
+        .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log(PROBE)))
+}
+
+/// A client may acknowledge a configure and commit before it redraws, so its
+/// settled buffer is smaller than the interior it was given; Chromium does
+/// this entering fullscreen. Stretching that buffer to the interior scaled
+/// every click and selection drag by the size ratio.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn a_settled_buffer_smaller_than_its_fullscreen_interior_is_not_stretched() {
+    let (mut session, window) = fullscreen_probe("pointer-coordinates-lagged-fullscreen", "lagged-fullscreen");
+    session.door().barrier().unwrap();
+    // Every configure sent so far is acknowledged and answered with the old
+    // 400x300 buffer, and the compositor has processed each answer.
+    poll_until(EVENT, "every configure answered with the old buffer", || {
+        let log = session.client_log(PROBE);
+        let last = |prefix: &str| log.lines().rev().find_map(|line| line.strip_prefix(prefix)?.parse::<u32>().ok());
+        let configured = last("surface configure ")?;
+        (last("configure answered ") == Some(configured)).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log(PROBE)));
+    session.door().barrier().unwrap();
+
+    let (x, y) = (300.0, 250.0);
+    let event = motion_received_at(&mut session, &window, (x, y));
+    assert!(
+        (event.x - x).abs() < 0.01 && (event.y - y).abs() < 0.01,
+        "a settled 400x300 buffer in a {}x{} interior must receive ({x}, {y}), got {event:?}",
+        window.w,
+        window.h
+    );
+}
+
+/// Chromium can present its fullscreen buffer while its last window geometry
+/// is still the windowed one. A configure in flight at that moment, such as the
+/// activation a click books, stretched the full-size buffer by the windowed
+/// ratio and scaled every click with it.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh"]
+fn a_buffer_filling_its_fullscreen_interior_is_not_stretched_by_stale_geometry() {
+    let (mut session, window) = fullscreen_probe("pointer-coordinates-stale-geometry", "stale-geometry-fullscreen");
+    // The fullscreen configure is answered with a full-size buffer under the
+    // pinned 400x300 geometry, and a later configure is left unacknowledged.
+    poll_until(EVENT, "a configure left pending after the full-size answer", || {
+        let log = session.client_log(PROBE);
+        (log.contains("configure answered ") && log.contains(" unanswered")).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log(PROBE)));
+    session.door().barrier().unwrap();
+
+    let (x, y) = (300.0, 250.0);
+    let event = motion_received_at(&mut session, &window, (x, y));
+    assert!(
+        (event.x - x).abs() < 0.01 && (event.y - y).abs() < 0.01,
+        "a full-size buffer under a stale 400x300 geometry must receive ({x}, {y}), got {event:?}"
+    );
+}
+
+/// Boots a session whose input probe runs in `mode`, which requests
+/// fullscreen, and waits for the ledger to hold it at the output's size.
+fn fullscreen_probe(name: &str, mode: &str) -> (Session, WindowInfo) {
+    let mut session = Session::boot(
+        name,
+        SessionOptions { scale: Some(1.0), config_extra: "show_dock = false\n".into(), ..SessionOptions::default() },
+    )
+    .expect("nested compositor");
+    let binary = profile_binary(PROBE).expect("input probe built");
+    session.launch(binary.to_str().unwrap(), &["1", "resizable", mode]).expect("probe launches");
+    session.wait_for_window("input-probe").expect("probe maps");
+    let window = poll_until(EVENT, "the fullscreen ledger rectangle", || {
+        let world = session.world().ok()?;
+        let window = world.window_matching("input-probe")?.clone();
+        (window.w == world.output_w && window.h == world.output_h).then_some(window)
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log(PROBE)));
+    (session, window)
+}
+
+/// What the probe receives for a pointer motion to `at` within its window.
+/// A first motion is sent and fenced beforehand, because it may arrive as an
+/// enter rather than a motion.
+fn motion_received_at(session: &mut Session, window: &WindowInfo, at: (f64, f64)) -> InputEvent {
+    let origin = (f64::from(window.x - window.offset_x), f64::from(window.y - window.offset_y));
+    session.door().motion(origin.0 + 200.0, origin.1 + 150.0).unwrap();
+    session.door().barrier().unwrap();
+    let seen = session
+        .client_log(PROBE)
+        .lines()
+        .filter_map(|line| line.strip_prefix("input ")?.split_whitespace().next()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    session.door().motion(origin.0 + at.0, origin.1 + at.1).unwrap();
+    wait_event(session, seen, "motion")
+}
+
+fn drag_at_scale(scale: f32, subsurface: bool) {
+    let mut session = Session::boot(
+        &format!("pointer-coordinates-{scale}-{}", if subsurface { "child" } else { "root" }),
+        SessionOptions { scale: Some(scale), config_extra: "show_dock = false\n".into(), ..SessionOptions::default() },
+    )
+    .expect("nested compositor");
+    let binary = profile_binary(PROBE).expect("input probe built");
+    session
+        .launch(binary.to_str().unwrap(), &[&scale.to_string(), "dnd", if subsurface { "subsurface" } else { "root" }])
+        .expect("probe launches");
+    let window = session.wait_for_window("input-probe").expect("probe maps");
+    session.door().barrier().unwrap();
+
+    // A fresh explicit hover after enter avoids assuming that map-time focus
+    // produced only one event. Each later action waits for its client receipt.
+    session.door().motion(f64::from(window.x + 20), f64::from(window.y + 20)).unwrap();
+    session.door().button("left", true).unwrap();
+    let first = wait_event(&session, 0, "press");
+    session.door().button("left", false).unwrap();
+    let mut last = wait_event(&session, first.sequence, "release");
+    let scale = f64::from(scale);
+    let offset = if subsurface { (40.0 * scale, 30.0 * scale) } else { (0.0, 0.0) };
+    let origin = (f64::from(window.x - window.offset_x) + offset.0, f64::from(window.y - window.offset_y) + offset.1);
+    let start = (80.0, 70.0);
+    session.door().motion(origin.0 + start.0 * scale, origin.1 + start.1 * scale).unwrap();
+    last = wait_event(&session, last.sequence, if subsurface { "enter" } else { "motion" });
+    assert!((last.x - start.0).abs() < 0.01 && (last.y - start.1).abs() < 0.01, "hover: {last:?}");
+    session.door().button("left", true).unwrap();
+    last = wait_event(&session, last.sequence, "press");
+
+    // Include motion past the client's right edge and into its titlebar.
+    // An implicit grab must keep the original surface and allow coordinates
+    // outside its bounds until the last held button is released.
+    for (x, y) in [(120.0, 90.0), (210.0, 160.0), (420.0, 90.0), (15.0, -10.0), (35.0, 45.0)] {
+        session.door().motion(origin.0 + x * scale, origin.1 + y * scale).unwrap();
+        last = wait_event(&session, last.sequence, "motion");
+        assert!(
+            (last.x - x).abs() < 0.01 && (last.y - y).abs() < 0.01,
+            "scale={scale}, held-button client coordinates expected ({x}, {y}), got {last:?}"
+        );
+    }
+    session.door().button("left", false).unwrap();
+    last = wait_event(&session, last.sequence, "release");
+
+    // Smithay delivers data-device coordinates without calling PointerTarget.
+    // Check this distinct path as well as pointer delivery before and after it.
+    session.door().button("right", true).unwrap();
+    last = wait_event(&session, last.sequence, "press");
+    poll_until(EVENT, "client to request internal drag", || {
+        session.client_log(PROBE).contains("started internal drag").then_some(())
+    })
+    .unwrap();
+    session.door().motion(origin.0 + start.0 * scale, origin.1 + start.1 * scale).unwrap();
+    last = wait_event(&session, last.sequence, "dnd-enter");
+    assert!((last.x - start.0).abs() < 0.01 && (last.y - start.1).abs() < 0.01, "DnD enter: {last:?}");
+    poll_until(EVENT, "drag action negotiated", || {
+        session.client_log(PROBE).contains("drag copy accepted").then_some(())
+    })
+    .unwrap();
+    for (x, y) in [(120.0, 90.0), (170.0, 100.0), (35.0, 45.0)] {
+        session.door().motion(origin.0 + x * scale, origin.1 + y * scale).unwrap();
+        last = wait_event(&session, last.sequence, "dnd-motion");
+        assert!(
+            (last.x - x).abs() < 0.01 && (last.y - y).abs() < 0.01,
+            "scale={scale}, data-device coordinates expected ({x}, {y}), got {last:?}"
+        );
+    }
+    session.door().button("right", false).unwrap();
+    last = wait_event(&session, last.sequence, "dnd-drop");
+    session.door().motion(origin.0 + start.0 * scale, origin.1 + start.1 * scale).unwrap();
+    last = wait_event(&session, last.sequence, "motion");
+    assert!((last.x - start.0).abs() < 0.01 && (last.y - start.1).abs() < 0.01, "hover after DnD: {last:?}");
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn unscaled_drag_coordinates_match_hover() {
+    drag_at_scale(1.0, false);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn integer_scaled_drag_coordinates_match_hover() {
+    drag_at_scale(2.0, false);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn fractional_scaled_drag_coordinates_match_hover() {
+    drag_at_scale(1.5, false);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn unscaled_subsurface_drag_coordinates_match_hover() {
+    drag_at_scale(1.0, true);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn integer_scaled_subsurface_drag_coordinates_match_hover() {
+    drag_at_scale(2.0, true);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn fractional_scaled_subsurface_drag_coordinates_match_hover() {
+    drag_at_scale(1.5, true);
+}
+
+fn touch_at_scale(scale: f32, subsurface: bool) {
+    let mut session = Session::boot(
+        &format!("touch-coordinates-{scale}-{}", if subsurface { "child" } else { "root" }),
+        SessionOptions { scale: Some(scale), config_extra: "show_dock = false\n".into(), ..SessionOptions::default() },
+    )
+    .expect("nested compositor");
+    let binary = profile_binary(PROBE).expect("input probe built");
+    session
+        .launch(binary.to_str().unwrap(), &[&scale.to_string(), if subsurface { "subsurface" } else { "root" }])
+        .expect("probe launches");
+    let window = session.wait_for_window("input-probe").expect("probe maps");
+    session.door().barrier().unwrap();
+    let scale = f64::from(scale);
+    let offset = if subsurface { (40.0 * scale, 30.0 * scale) } else { (0.0, 0.0) };
+    let origin = (f64::from(window.x - window.offset_x) + offset.0, f64::from(window.y - window.offset_y) + offset.1);
+    // The touchscreen covers the session's one output, the whole layout.
+    let world = session.world().unwrap();
+    let digitiser = |x, y| world.touch_fraction(origin.0 + x * scale, origin.1 + y * scale);
+    let (u, v) = digitiser(80.0, 70.0);
+    session.door().touch_down(0, u, v).unwrap();
+    session.door().touch_frame().unwrap();
+    let mut last = wait_event(&session, 0, "touch-down-0");
+    assert!((last.x - 80.0).abs() < 0.01 && (last.y - 70.0).abs() < 0.01, "touch down: {last:?}");
+
+    let (u, v) = digitiser(100.0, 90.0);
+    session.door().touch_down(1, u, v).unwrap();
+    session.door().touch_frame().unwrap();
+    last = wait_event(&session, last.sequence, "touch-down-1");
+    assert!((last.x - 100.0).abs() < 0.01 && (last.y - 90.0).abs() < 0.01, "second touch: {last:?}");
+
+    for (slot, x, y) in [(0, 120.0, 90.0), (1, 170.0, 100.0), (0, 420.0, 90.0), (1, 15.0, -10.0)] {
+        let (u, v) = digitiser(x, y);
+        session.door().touch_motion(slot, u, v).unwrap();
+        session.door().touch_frame().unwrap();
+        last = wait_event(&session, last.sequence, &format!("touch-motion-{slot}"));
+        assert!(
+            (last.x - x).abs() < 0.01 && (last.y - y).abs() < 0.01,
+            "scale={scale}, touch slot {slot} expected ({x}, {y}), got {last:?}"
+        );
+    }
+
+    // Lifting one finger must not end the remaining finger's grab.
+    session.door().touch_up(0).unwrap();
+    session.door().touch_frame().unwrap();
+    last = wait_event(&session, last.sequence, "touch-up-0");
+    let (u, v) = digitiser(35.0, 45.0);
+    session.door().touch_motion(1, u, v).unwrap();
+    session.door().touch_frame().unwrap();
+    last = wait_event(&session, last.sequence, "touch-motion-1");
+    assert!((last.x - 35.0).abs() < 0.01 && (last.y - 45.0).abs() < 0.01, "remaining touch: {last:?}");
+    session.door().touch_cancel().unwrap();
+    last = wait_event(&session, last.sequence, "touch-cancel");
+
+    // A device may still emit a sample for the cancelled physical contact.
+    // It must not reach the previous focus (especially across session lock).
+    // The client's subsequent fresh down proves ordering without a sleep-based
+    // negative assertion; a stale motion makes the probe fail its slot check.
+    session.door().touch_motion(1, u, v).unwrap();
+    session.door().touch_frame().unwrap();
+
+    // Cancellation releases slot IDs and the implicit grab for a fresh sequence.
+    session.door().touch_down(0, u, v).unwrap();
+    session.door().touch_frame().unwrap();
+    last = wait_event(&session, last.sequence, "touch-down-0");
+    assert!((last.x - 35.0).abs() < 0.01 && (last.y - 45.0).abs() < 0.01, "fresh touch: {last:?}");
+    session.door().touch_up(0).unwrap();
+    session.door().touch_frame().unwrap();
+    wait_event(&session, last.sequence, "touch-up-0");
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn unscaled_touch_coordinates_and_slots() {
+    touch_at_scale(1.0, false);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn integer_scaled_touch_coordinates_and_slots() {
+    touch_at_scale(2.0, false);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn fractional_scaled_touch_coordinates_and_slots() {
+    touch_at_scale(1.5, false);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn unscaled_subsurface_touch_coordinates_and_slots() {
+    touch_at_scale(1.0, true);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn integer_scaled_subsurface_touch_coordinates_and_slots() {
+    touch_at_scale(2.0, true);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn fractional_scaled_subsurface_touch_coordinates_and_slots() {
+    touch_at_scale(1.5, true);
+}
+
+/// A touchscreen covers one output, not the whole layout. With the nested
+/// output split in two, a touch at fractions of the digitiser lands at
+/// those fractions of the output it covers. Scaled to the union of both, as
+/// it once was, a touch on the left output landed twice as far right.
+fn touch_on_split_outputs(name: &str, hyprland_conf: Option<&str>, covered: usize) {
+    let mut options =
+        SessionOptions { scale: Some(1.0), config_extra: "show_dock = false\n".into(), ..SessionOptions::default() };
+    if let Some(conf) = hyprland_conf {
+        options.config_extra.push_str("hyprland_config = true\n");
+        options.config_root_files.push(("hypr/hyprland.conf".into(), conf.into()));
+    }
+    let mut session = Session::boot(name, options).expect("nested compositor");
+    session.door().virtual_outputs(true).unwrap();
+    // The door's split: the primary is the host's left half, and the
+    // second output takes the rest.
+    let world = session.world().unwrap();
+    let half = world.output_w / 2;
+    let (x, width) = if covered == 0 { (0, half) } else { (half, world.output_w - half) };
+    let (x, width, height) = (f64::from(x), f64::from(width), f64::from(world.output_h));
+    // A new window opens on the output under the pointer.
+    session.door().motion(x + width / 2.0, height / 2.0).unwrap();
+    let binary = profile_binary(PROBE).expect("input probe built");
+    session.launch(binary.to_str().unwrap(), &["1", "root"]).expect("probe launches");
+    let window = session.wait_for_window("input-probe").expect("probe maps");
+    session.door().barrier().unwrap();
+    let origin = (f64::from(window.x - window.offset_x), f64::from(window.y - window.offset_y));
+    let target = (origin.0 + 80.0, origin.1 + 70.0);
+    assert!((x..x + width).contains(&target.0), "the probe must open on output {covered}: {window:?}");
+
+    session.door().touch_down(0, (target.0 - x) / width, target.1 / height).unwrap();
+    session.door().touch_frame().unwrap();
+    let down = wait_event(&session, 0, "touch-down-0");
+    assert!((down.x - 80.0).abs() < 0.01 && (down.y - 70.0).abs() < 0.01, "touch on output {covered}: {down:?}");
+    session.door().touch_up(0).unwrap();
+    session.door().touch_frame().unwrap();
+    wait_event(&session, down.sequence, "touch-up-0");
+}
+
+/// No output is named and none is a built-in panel, so the primary.
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn a_touch_lands_on_the_primary_output_not_across_the_layout() {
+    touch_on_split_outputs("touch-split-primary", None, 0);
+}
+
+#[test]
+#[ignore = "needs a live Wayland session to nest inside"]
+fn a_touch_lands_on_the_output_the_configuration_names() {
+    touch_on_split_outputs(
+        "touch-split-configured",
+        Some("input {\n    touchdevice {\n        output = chonkstep-right\n    }\n}\n"),
+        1,
+    );
+}

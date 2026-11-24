@@ -1,0 +1,6643 @@
+//! The compositor application's central state and entry point.
+//!
+//! Two types carry everything, and the split between them is the whole
+//! architecture:
+//!
+//! - [`WaylandBackend`] is what `wm_core::WindowManager<B>` owns as its
+//!   `B`. It is a *ledger*, not a connection: plain records of every
+//!   window, decoration frame, and shell surface, a bottom-to-top
+//!   stacking order, and queues of pending events. The `Backend` trait
+//!   verbs (in `backend_impl.rs`) mutate these records and set
+//!   [`WaylandBackend::damage`]; nothing here talks to a display
+//!   server, because in this process *we are* the display server.
+//!
+//! - [`Compositor`] is the one calloop data type. Smithay's delegate
+//!   macros (`delegate_compositor!`, `delegate_xdg_shell!`, ...)
+//!   implement each protocol's dispatch traits for a single concrete
+//!   type, so every per-protocol state object, the seat, the outputs,
+//!   the winit backend with its GLES renderer, and the
+//!   `WindowManager`/`Shell` pair all hang off this struct — there is
+//!   no way to split them into separately-owned pieces without
+//!   fighting the macros. Protocol handlers (in `xdg.rs`,
+//!   `xwayland.rs`, `input.rs`) reach the ledger via
+//!   `self.wm.backend_mut()` and queue `BackendEvent`s / records;
+//!   [`Compositor::dispatch_pending`] then drains those queues in
+//!   exactly the order the X11 binary's event loop drains its backend
+//!   (read `crates/chonkstep/src/main.rs` — it is the reference), so
+//!   the same `wm-core` brain and the same `chonk-shell` desktop see
+//!   the same event discipline on both stacks.
+//!
+//! [`run`] wires it all together: winit + GLES, the Wayland globals,
+//! XWayland, `WindowManager` + `Shell` construction with the same
+//! theme/scale precedence as the X11 binary, and the dispatch loop.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::fd::{BorrowedFd, RawFd};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::memory::{MemoryBuffer, MemoryRenderBuffer};
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
+use smithay::desktop::{PopupKind, PopupManager};
+use smithay::input::keyboard::XkbConfig;
+use smithay::input::pointer::CursorImageStatus;
+use smithay::input::{Seat, SeatState};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
+
+use chonk_hyprland_ipc::MonitorMode;
+use smithay::reexports::wayland_protocols::xwayland::keyboard_grab::zv1::server::zwp_xwayland_keyboard_grab_v1::ZwpXwaylandKeyboardGrabV1;
+use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::{
+    Dispatcher, EventLoop, Interest, LoopHandle, Mode as TriggerMode, PostAction, RegistrationToken,
+};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgToplevelState;
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, GlobalId, ObjectId,
+};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
+use smithay::utils::{Logical, Physical, Transform, SERIAL_COUNTER};
+use smithay::utils::{Point as SPoint, Size as SSize};
+use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::shell::kde::decoration::KdeDecorationState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState};
+use smithay::wayland::shm::ShmState;
+use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::xwayland_shell::XWaylandShellState;
+use smithay::xwayland::X11Surface;
+
+use wm_core::{Backend, BackendEvent, KeyCombo, MonitorInfo, MouseButton, ScrollDelta, WindowManager, WindowType};
+use wm_theme::FontState;
+use wm_theme_api::{DecorationBuffer, Point, Rect, ResizeEdge, Size};
+
+use crate::input::DragGrab;
+use crate::input::keyboard::{resolve_keyboard_config, ResolvedKeyboard};
+
+use chonk_shell::shell::{Shell, ShellOutcome};
+use chonk_shell::startup::{
+    ensure_xcursor_size, recovering_from_crash, SessionRequestPoller, SessionState,
+};
+
+/// A managed client window (an xdg toplevel or an XWayland surface) in
+/// the id space `wm-core` reasons about. Plain integers rather than
+/// protocol handles so the ids stay `Copy + Eq + Hash` and the ledger
+/// records own the actual handles exactly once.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WlWindowId(pub u64);
+
+/// A decoration frame. On X11 this is a real second window the client
+/// gets reparented into; here it is purely a ledger entry — a geometry
+/// plus a rendered decoration buffer the renderer composes behind the
+/// client's content. Distinct from [`WlWindowId`] for the same reason
+/// the X11 backend keeps `XWindow`/`XFrame` distinct: the type system
+/// rules out handing the wrong handle to the wrong `Backend` verb.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WlFrameId(pub u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WlShellId(pub u64);
+
+/// The stand-in for "the root window" in shell-click routing. The X11
+/// binary tells root presses apart from shell-surface clicks by
+/// comparing against the real root window's XID; a Wayland session has
+/// no root window, so the input code queues background presses (a
+/// press that hit no shell surface, no frame, and no client) under
+/// this sentinel id instead. Id 0 is never allocated —
+/// [`WaylandBackend`]'s id counter starts at 1 — so the comparison in
+/// [`Compositor::dispatch_pending`] can never collide with a real
+/// surface.
+pub(crate) const ROOT_SHELL: WlShellId = WlShellId(0);
+
+/// Monotonic diagnostics for the two demand-driven protocol publishers.
+/// The opt-in E2E door exposes these so tests can prove an empty diff was
+/// cheap, rather than merely observing that it emitted no wire event.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProtocolPublishMetrics {
+    pub hyprland_event_snapshots: u64,
+    pub foreign_toplevel_full_syncs: u64,
+    pub foreign_toplevel_drag_syncs: u64,
+}
+
+/// Aggregated cost of a named section of the compositor's event-loop
+/// pass. Durations are cumulative so the test door can bracket any
+/// interaction; `max` keeps a single hitch visible instead of averaging
+/// it into a long quiet sample.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PhaseTiming {
+    pub calls: u64,
+    pub total: Duration,
+    pub max: Duration,
+}
+
+impl PhaseTiming {
+    fn record(&mut self, elapsed: Duration) {
+        self.calls = self.calls.saturating_add(1);
+        self.total = self.total.saturating_add(elapsed);
+        self.max = self.max.max(elapsed);
+    }
+}
+
+/// Live frame/pass instrumentation. It is always cheap and available:
+/// a handful of monotonic clock reads and fixed-size counters, with no
+/// allocation or logging in the frame path. The optional `profile`
+/// Cargo feature complements these counters by enabling the profiling
+/// spans already embedded throughout Smithay.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FrameStats {
+    pub dispatch: PhaseTiming,
+    pub input: PhaseTiming,
+    pub shell: PhaseTiming,
+    pub protocols: PhaseTiming,
+    pub layout: PhaseTiming,
+    /// Scene/render attempts, including damage-tracker no-ops. Successful
+    /// submissions alone can hide expensive work on an unchanged scene.
+    pub render_attempts: u64,
+    pub render: PhaseTiming,
+    pub gesture_build: PhaseTiming,
+    pub flush: PhaseTiming,
+    pub ipc: PhaseTiming,
+    /// Power-of-two microsecond ceilings, from <=1 us through >16384 us.
+    pub dispatch_histogram: [u64; 16],
+    pub render_histogram: [u64; 16],
+}
+
+impl FrameStats {
+    pub(crate) fn record_gesture_build(&mut self, elapsed: Duration) {
+        self.gesture_build.record(elapsed);
+    }
+    fn histogram_bucket(elapsed: Duration) -> usize {
+        let micros = elapsed.as_micros().max(1);
+        (u128::BITS - (micros - 1).leading_zeros()).min(15) as usize
+    }
+
+    fn record_dispatch(&mut self, elapsed: Duration) {
+        self.dispatch.record(elapsed);
+        let bucket = Self::histogram_bucket(elapsed);
+        self.dispatch_histogram[bucket] = self.dispatch_histogram[bucket].saturating_add(1);
+    }
+
+    fn record_render(&mut self, elapsed: Duration) {
+        self.render.record(elapsed);
+        let bucket = Self::histogram_bucket(elapsed);
+        self.render_histogram[bucket] = self.render_histogram[bucket].saturating_add(1);
+    }
+}
+
+/// One entry in the bottom-to-top managed-window stacking order.
+/// Shell surfaces have their own [`WaylandBackend::shell_stacking`]
+/// because they are rendered in bands, never interleaved with managed
+/// windows. Keeping each order exactly where it has meaning avoids
+/// walking every application window merely to find the dock.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StackEntry {
+    Frame(WlFrameId),
+    /// A managed window that owns no frame because its client drew its
+    /// own chrome (`wm_core::ClientChrome::Bare` — Edge,
+    /// LibreOffice, anything that sets `_MOTIF_WM_HINTS` to ask not to
+    /// be decorated). It sits in the *frame* band, not above it: such
+    /// a window is managed in every other respect, so it has to layer
+    /// against its framed neighbours and below the dock exactly as a
+    /// framed window does. That is the whole reason it needs an entry
+    /// of its own — an override-redirect menu is deliberately outside
+    /// `stacking` and always on top, and a browser treated the same way
+    /// would sit over the dock forever.
+    Window(WlWindowId),
+}
+
+/// Constant-time admission for the two scene bands that otherwise
+/// require searching the complete window ledger or stacking order.
+/// Mutation stays private so lifecycle code cannot update one set and
+/// forget the other.
+#[derive(Default)]
+pub(crate) struct SceneIndex {
+    unmanaged: HashSet<WlWindowId>,
+    presented: HashSet<WlWindowId>,
+}
+
+impl SceneIndex {
+    pub(crate) fn mark_unmanaged(&mut self, window: WlWindowId) {
+        self.presented.remove(&window);
+        self.unmanaged.insert(window);
+    }
+
+    pub(crate) fn mark_presented(&mut self, window: WlWindowId) {
+        self.unmanaged.remove(&window);
+        self.presented.insert(window);
+    }
+
+    pub(crate) fn mark_hidden(&mut self, window: WlWindowId) {
+        self.presented.remove(&window);
+    }
+
+    pub(crate) fn forget(&mut self, window: WlWindowId) {
+        self.unmanaged.remove(&window);
+        self.presented.remove(&window);
+    }
+
+    pub(crate) fn unmanaged(&self) -> impl Iterator<Item = WlWindowId> + '_ {
+        self.unmanaged.iter().copied()
+    }
+
+    pub(crate) fn presented(&self) -> impl Iterator<Item = WlWindowId> + '_ {
+        self.presented.iter().copied()
+    }
+
+    pub(crate) fn is_presented(&self, window: WlWindowId) -> bool {
+        self.presented.contains(&window)
+    }
+}
+
+/// Re-spells one window's place in the frame band without moving it:
+/// window slot to frame slot when chrome is created, frame slot to
+/// window slot when it is released. Appends on top when there is no
+/// slot yet, which is the ordinary first-map case.
+///
+/// The depth is the whole point. A window that grows or loses a
+/// titlebar has not been raised, and re-appending it would put it in
+/// front of everything the user had stacked over it — a browser
+/// jumping to the foreground because the page went full-screen. It is
+/// also the only place the two spellings can be swapped atomically:
+/// leaving both in `stacking` draws the client twice, at two depths,
+/// and dropping both leaves a mapped window with no slot at all,
+/// invisible to the renderer and to the hit-test alike.
+pub(crate) fn replace_stack_entry(stacking: &mut Vec<StackEntry>, old: StackEntry, new: StackEntry) {
+    match stacking.iter().position(|entry| *entry == old) {
+        Some(index) => stacking[index] = new,
+        None => stacking.push(new),
+    }
+}
+
+/// Gives `entry` a slot on top if it does not already hold one.
+///
+/// Idempotent on purpose: a frameless window is mapped again on every
+/// return from another workspace and on every deminiaturize, and each
+/// of those must keep the depth it had rather than count as a raise.
+pub(crate) fn ensure_stack_entry(stacking: &mut Vec<StackEntry>, entry: StackEntry) {
+    if !stacking.contains(&entry) {
+        stacking.push(entry);
+    }
+}
+
+/// Moves `entry` to the top of `stacking`. Answers whether it was in
+/// there to move, which is every caller's damage test.
+///
+/// Top of the vector is top of the managed-window band; unmanaged X11
+/// surfaces and shell furniture have separate renderer-owned bands.
+///
+/// Both application raise verbs — `raise` on a frame and
+/// `raise_frameless` on a window whose client drew its own chrome — are
+/// this one function under different names. A framed and a
+/// client-decorated window must restack identically.
+pub(crate) fn raise_stack_entry(stacking: &mut Vec<StackEntry>, entry: StackEntry) -> bool {
+    let Some(index) = stacking.iter().position(|held| *held == entry) else {
+        return false;
+    };
+    let held = stacking.remove(index);
+    stacking.push(held);
+    true
+}
+
+/// The protocol handle behind a managed window. Both kinds flow
+/// through the same [`WlWindowId`] space and the same `BackendEvent`
+/// translations, which is what lets urxvt (X11, via XWayland) and a
+/// native Wayland terminal receive identical management.
+pub(crate) enum ManagedSurface {
+    Xdg(ToplevelSurface),
+    X11(X11Surface),
+}
+
+/// The surface a client asked to have carried under the pointer for
+/// the life of a drag: `wl_data_device.start_drag`'s icon, holding
+/// smithay's `dnd_icon` role. Set by `selection.rs`'s `started` and
+/// cleared by its `dropped`, which fires on every end of the grab —
+/// drop, cancel, and the `unset_grab` a session lock performs — so
+/// nothing here outlives the drag. Kept in the scene ledger beside the
+/// other surfaces the renderer composes (`ime_popups`,
+/// `lock_surfaces`) because the on-screen frame, every capture and the
+/// frame-callback drain all read the ledger and none of them reads
+/// the `Compositor`.
+///
+/// The icon is drawn and never hit-tested: the protocol ignores a drag
+/// icon's input region, and the drop target smithay's grab computes
+/// must be whatever is *under* the icon.
+#[derive(Debug)]
+pub(crate) struct DndIcon {
+    pub(crate) surface: WlSurface,
+    /// A drag preview can contain the originating window's secrets too.
+    pub(crate) capture_redacted: bool,
+    /// Where the icon's origin sits relative to the drag's hotspot, in
+    /// the icon's own surface-local units. Accumulated from every
+    /// `wl_surface.attach` dx/dy and `wl_surface.offset` the icon
+    /// commits (smithay folds both into `SurfaceAttributes::buffer_delta`,
+    /// which `xdg.rs`'s commit handler drains here), because each is
+    /// relative to the previous buffer's corner, not to the hotspot.
+    pub(crate) offset: SPoint<i32, Logical>,
+    /// The touch point carrying the drag, when a finger started it
+    /// (smithay starts a `DnDGrab` from either the pointer's or the
+    /// touch's implicit grab). `None` anchors the icon to the pointer.
+    /// Slot and its latest global position, kept current by
+    /// `input.rs`'s touch-motion handler.
+    pub(crate) touch: Option<(smithay::backend::input::TouchSlot, SPoint<f64, Logical>)>,
+}
+
+impl DndIcon {
+    /// Where the drag's hotspot is right now: the finger for a touch
+    /// drag, else the pointer.
+    pub(crate) fn anchor(&self, pointer_location: SPoint<f64, Logical>) -> SPoint<f64, Logical> {
+        self.touch.map_or(pointer_location, |(_, position)| position)
+    }
+
+    /// Folds one committed `buffer_delta` into the offset.
+    pub(crate) fn shift(&mut self, delta: SPoint<i32, Logical>) {
+        self.offset = Self::shifted(self.offset, delta);
+    }
+
+    /// `offset` moved by one more commit's delta. Saturating, since
+    /// both values are the client's to choose.
+    pub(crate) fn shifted(offset: SPoint<i32, Logical>, delta: SPoint<i32, Logical>) -> SPoint<i32, Logical> {
+        (offset.x.saturating_add(delta.x), offset.y.saturating_add(delta.y)).into()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InputDeviceRecord {
+    pub id: String,
+    pub name: String,
+    pub keyboard: bool,
+    pub pointer: bool,
+    pub touch: bool,
+    pub tablet: bool,
+    pub switch: bool,
+}
+
+impl ManagedSurface {
+    /// The `wl_surface` carrying this window's pixels — what the
+    /// renderer draws and the seat focuses. `None` for an XWayland
+    /// window whose surface association hasn't arrived yet (X11
+    /// windows exist before XWayland binds a `wl_surface` to them; the
+    /// renderer and focus plumbing simply skip them until it lands).
+    pub(crate) fn wl_surface(&self) -> Option<WlSurface> {
+        match self {
+            ManagedSurface::Xdg(toplevel) => Some(toplevel.wl_surface().clone()),
+            ManagedSurface::X11(surface) => surface.wl_surface(),
+        }
+    }
+
+    /// Whether the client end of this handle still exists. Dead
+    /// handles are skipped rather than drawn — a client can vanish
+    /// between a protocol callback and the next render.
+    pub(crate) fn alive(&self) -> bool {
+        match self {
+            ManagedSurface::Xdg(toplevel) => toplevel.alive(),
+            ManagedSurface::X11(surface) => surface.alive(),
+        }
+    }
+}
+
+/// Ledger entry for one managed client window. The protocol handlers
+/// (`xdg.rs`, `xwayland.rs`) create and update these; `backend_impl.rs`
+/// reads them to answer the `Backend` property queries the X11 backend
+/// answers with ICCCM round-trips — on Wayland the data is pushed to
+/// us (xdg toplevel state, XWayland property events), so the record
+/// caches it and the queries become lookups.
+pub(crate) struct WindowRecord {
+    pub surface: ManagedSurface,
+    /// Last observed protocol constraints, for change-driven core events.
+    pub size_hints: wm_core::SizeHints,
+    /// The client content's root-relative rectangle — the analogue of
+    /// the client window's geometry inside its X11 frame. Written by
+    /// `Backend::configure_client`/`position_client`; read by the
+    /// renderer (where to draw the surface tree) and the input code
+    /// (chrome vs. content hit-testing).
+    pub content: Rect,
+    pub mapped: bool,
+    /// `wm-core`'s authoritative fullscreen state. Protocol clients
+    /// receive the same bit through `Backend::publish_net_state`; the
+    /// renderer and hit-test retain it here so a focused fullscreen
+    /// window can occlude desktop-level `Top` and shell furniture on
+    /// only the output it occupies.
+    pub fullscreen: bool,
+    /// Display boundary for independently visible Spaces; shared by pixels and input.
+    pub space_output: Option<String>,
+    pub space_clip_id: smithay::backend::renderer::element::Id,
+    /// Cached title (xdg `set_title` / XWayland property events keep
+    /// it current and queue `BackendEvent::TitleChanged`).
+    pub title: Option<String>,
+    /// xdg `app_id` / X11 `WM_CLASS` — what `Backend::window_class`
+    /// reports so per-app shell behavior (dock matching, opacity
+    /// rules) works identically on both stacks.
+    pub app_id: Option<String>,
+    /// `xdg_toplevel_tag_v1`'s tag and description: the application's
+    /// own stable name for this window (`main`, `preferences`) and a
+    /// human-readable description of it. ChonkStep's own copies, kept
+    /// from the handler arguments and bounded before storage
+    /// (`core_protocols::MAX_TOPLEVEL_TAG_BYTES`); the Hyprland IPC
+    /// reports them as `xdgTag`/`xdgDescription`, and window rules
+    /// read the tag at map time. Always `None` for an XWayland window,
+    /// which has no such protocol.
+    pub xdg_tag: Option<String>,
+    pub xdg_description: Option<String>,
+    /// Decoration policy class, decided at map time exactly as the X11
+    /// backend decides it from `_NET_WM_WINDOW_TYPE`: override-redirect
+    /// XWayland windows (menus, tooltips) come through as `Unmanaged`
+    /// and are rendered as-is with no frame.
+    ///
+    /// `Unmanaged` is the renderer's and the hit-test's entire test for
+    /// "outside `stacking`, above everything", so nothing else may
+    /// borrow it. In particular a managed window that has no frame
+    /// because its client draws its own chrome stays whatever it is
+    /// (usually `Normal`) — it is frameless, not unmanaged, and it
+    /// layers by its own [`StackEntry::Window`] slot like any framed
+    /// neighbour.
+    pub window_type: WindowType,
+    /// Resolved managed parent. XDG updates this on commits and X11 on
+    /// `WM_TRANSIENT_FOR` property changes, allowing the backend query
+    /// to stay cheap and stable across lifecycle transitions.
+    pub parent: Option<WlWindowId>,
+    /// Protocol-declared modal state (`xdg_dialog_v1` or EWMH modal).
+    pub modal: bool,
+    /// State an xdg toplevel asked for before its first buffer, replayed
+    /// to `wm-core` right after its `MapRequest`.
+    pub premap: PremapStates,
+    /// Most recent preview of this window's contents, refreshed by
+    /// [`crate::capture`] while rendering and served back through
+    /// `Backend::capture_window_image`. `None` until the first
+    /// snapshot (or forever, for a window that never maps), which the
+    /// shell's icon and switcher renderers already handle.
+    pub snapshot: Option<DecorationBuffer>,
+    /// Whether the managed surface tree has committed since
+    /// [`snapshot`](Self::snapshot) was last refreshed. Preview
+    /// readback is a synchronous GPU operation; remembering real pixel
+    /// changes prevents an unrelated animated window from forcing
+    /// static windows through that stall once per second forever.
+    pub snapshot_dirty: bool,
+    /// When the compositor most recently tried to refresh
+    /// [`snapshot`](Self::snapshot). Attempts, rather than only
+    /// successful captures, are recorded so an unimportable or dying
+    /// client cannot retry a synchronous GPU readback every frame.
+    pub snapshot_attempted_at: Option<Instant>,
+    /// Everything the two decoration protocols have said about this
+    /// toplevel — see [`crate::decoration`], which also holds the
+    /// policy that reads it.
+    ///
+    /// The pair of fields this replaced (`negotiated_decoration` and
+    /// `requested_client_side`) were written in three places and read
+    /// in none: the decision had been moved to an `app_id` prefix list
+    /// and the protocol's own answer was being collected and discarded.
+    /// A Chrome web-app window asked for server-side decorations, was
+    /// told server-side, and was then left unframed because its
+    /// `app_id` began with "chrome".
+    ///
+    /// Always default for XWayland surfaces, which answer the same
+    /// question through `_MOTIF_WM_HINTS` instead.
+    pub decoration: crate::decoration::DecorationNegotiation,
+    /// The chrome `wm-core` settled on for this window
+    /// (`Backend::set_window_chrome`), anticipated from the evidence
+    /// before the initial configure. Read by the tiled-state bookkeeping,
+    /// and by the hit-test, which holds an edge-framed client's content
+    /// to its own input regions.
+    pub chrome: wm_core::ClientChrome,
+    /// Whether a layout mode currently clips this window into a tile
+    /// (`Backend::present_layout`): one of the two reasons it is told it
+    /// is tiled, edge chrome being the other.
+    pub layout_tiled: bool,
+    /// Where this surface's *window* starts inside its own buffer, from
+    /// `xdg_surface.set_window_geometry`.
+    ///
+    /// A client drawing its own chrome usually draws a drop shadow
+    /// around it, and that shadow is part of the buffer while being no
+    /// part of the window: GTK declares `set_window_geometry(22, 22,
+    /// w, h)` on a buffer 44px wider than `w`. Everything this
+    /// compositor positions — the frame, the hit rect, `content` above
+    /// — means the *window*, so the surface has to be drawn this much
+    /// up and to the left of it for the two to line up. Ignoring it is
+    /// what put the window visibly inside its own frame, hanging off
+    /// the left of the screen.
+    ///
+    /// Zero for surfaces that declare no geometry, which is the
+    /// overwhelming majority.
+    pub content_offset: Point,
+    /// Density used for an outstanding compositor resize. A client can commit
+    /// the new viewport destination with an older GPU buffer; that temporary
+    /// stretch must not change the frame, renderer or input coordinate scale.
+    pub resize_scale: Option<ResizeScale>,
+    /// The `opacity` window rule this window mapped under, from
+    /// configuration only. `None` draws it opaque. See
+    /// [`effective_alpha`] for how focus and fullscreen read it.
+    pub opacity: Option<wm_core::OpacityRule>,
+    /// The session toggle (`SUPER + BACKSPACE`, `setprop … opaque`):
+    /// draws the window opaque whatever its rule says until toggled
+    /// back. Never persisted, never set by a client.
+    pub force_opaque: bool,
+    /// `no_dim`: `dim_inactive` leaves this window alone.
+    pub no_dim: bool,
+    /// `no_screen_share`: every capture the compositor renders (a
+    /// portal screen share, a screencopy recording, a screenshot) shows
+    /// an opaque rectangle where this window and its popups are, while
+    /// the output itself shows the window as usual. From configuration
+    /// only, through `Backend::set_capture_redacted`; no client request
+    /// can clear it.
+    pub capture_redacted: bool,
+    /// Stable id of the rectangle a capture draws in place of a
+    /// redacted window. Minted once so a `copy_with_damage` stream's
+    /// retained damage tracker sees one unchanging element rather than
+    /// a fresh one every frame - the same reason `dim_id` exists.
+    pub capture_redaction_id: smithay::backend::renderer::element::Id,
+    /// Stable id of the quad drawn in front of this window while it is
+    /// unfocused under `dim_inactive`. Minted once so the damage tracker
+    /// sees one retained element that comes and goes rather than a
+    /// fresh one every frame — the same reason `FrameRecord::fill_id`
+    /// exists.
+    pub dim_id: smithay::backend::renderer::element::Id,
+}
+
+/// The alpha a window's body is composited at.
+///
+/// The session toggle wins over everything; a window no rule names is
+/// opaque; fullscreen takes the rule's third value and is otherwise
+/// opaque even when the active alpha is not, because a translucent
+/// fullscreen surface can no longer be scanned out directly and no rule
+/// asked for that; and the rest is the focus cue Omarchy writes its
+/// rules for. Input never reads this: hit-testing and focus are the
+/// same at every alpha.
+pub(crate) fn effective_alpha(record: &WindowRecord, focused: bool, fullscreen: bool) -> f32 {
+    alpha_for(record.opacity, record.force_opaque, focused, fullscreen)
+}
+
+/// [`effective_alpha`] on the two fields it reads, so the decision is
+/// testable without a surface to hang a record on.
+fn alpha_for(opacity: Option<wm_core::OpacityRule>, force_opaque: bool, focused: bool, fullscreen: bool) -> f32 {
+    if force_opaque {
+        return 1.0;
+    }
+    let Some(rule) = opacity else {
+        return 1.0;
+    };
+    if fullscreen {
+        return rule.fullscreen.unwrap_or(1.0);
+    }
+    if focused {
+        rule.active
+    } else {
+        rule.inactive
+    }
+}
+
+/// Element counts from one drawn frame; see `WaylandBackend::scene_elements`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SceneElementCounts {
+    pub total: usize,
+    pub composited: usize,
+    pub skipped: usize,
+}
+
+impl SceneElementCounts {
+    pub(crate) fn from_states(
+        total: usize,
+        states: &smithay::backend::renderer::element::RenderElementStates,
+    ) -> Self {
+        use smithay::backend::renderer::element::RenderElementPresentationState as State;
+        let mut counts = Self { total, composited: 0, skipped: 0 };
+        for state in states.states.values() {
+            match state.presentation_state {
+                State::Skipped => counts.skipped += 1,
+                State::Rendering { .. } | State::ZeroCopy => counts.composited += 1,
+            }
+        }
+        counts
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResizeScale {
+    pub factor: f64,
+    pub output_scale: f64,
+    pub expected: Size,
+}
+
+impl WindowRecord {
+    /// A fresh record for a surface that just appeared: unmapped, no
+    /// cached properties yet — the handlers fill fields in as the
+    /// client provides them.
+    pub(crate) fn new(surface: ManagedSurface, content: Rect) -> Self {
+        Self {
+            surface,
+            size_hints: wm_core::SizeHints::default(),
+            content,
+            mapped: false,
+            fullscreen: false,
+            space_output: None,
+            space_clip_id: smithay::backend::renderer::element::Id::new(),
+            title: None,
+            app_id: None,
+            xdg_tag: None,
+            xdg_description: None,
+            window_type: WindowType::Normal,
+            parent: None,
+            modal: false,
+            premap: PremapStates::default(),
+            snapshot: None,
+            snapshot_dirty: true,
+            snapshot_attempted_at: None,
+            decoration: crate::decoration::DecorationNegotiation::default(),
+            chrome: wm_core::ClientChrome::Full,
+            layout_tiled: false,
+            content_offset: Point::new(0, 0),
+            resize_scale: None,
+            opacity: None,
+            force_opaque: false,
+            no_dim: false,
+            capture_redacted: false,
+            capture_redaction_id: smithay::backend::renderer::element::Id::new(),
+            dim_id: smithay::backend::renderer::element::Id::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::alpha_for;
+    use wm_core::OpacityRule;
+
+    #[test]
+    fn a_window_without_a_rule_is_opaque_in_every_state() {
+        for focused in [true, false] {
+            for fullscreen in [true, false] {
+                assert_eq!(alpha_for(None, false, focused, fullscreen), 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn focus_picks_the_active_or_inactive_alpha_and_fullscreen_defaults_opaque() {
+        let rule = Some(OpacityRule { active: 0.985, inactive: 0.96, fullscreen: None });
+        assert_eq!(alpha_for(rule, false, true, false), 0.985);
+        assert_eq!(alpha_for(rule, false, false, false), 0.96);
+        // No third value: fullscreen stays opaque so the scanout path
+        // is untouched, whichever window has focus.
+        assert_eq!(alpha_for(rule, false, true, true), 1.0);
+        assert_eq!(alpha_for(rule, false, false, true), 1.0);
+    }
+
+    #[test]
+    fn a_third_value_is_the_fullscreen_alpha() {
+        let rule = Some(OpacityRule { active: 0.9, inactive: 0.8, fullscreen: Some(0.7) });
+        assert_eq!(alpha_for(rule, false, true, true), 0.7);
+        assert_eq!(alpha_for(rule, false, false, true), 0.7);
+        assert_eq!(alpha_for(rule, false, false, false), 0.8);
+    }
+
+    #[test]
+    fn the_session_toggle_wins_over_the_rule() {
+        let rule = Some(OpacityRule { active: 0.5, inactive: 0.5, fullscreen: Some(0.5) });
+        for focused in [true, false] {
+            for fullscreen in [true, false] {
+                assert_eq!(alpha_for(rule, true, focused, fullscreen), 1.0);
+            }
+        }
+    }
+}
+
+/// Window states an xdg toplevel asked for before its first buffer.
+///
+/// xdg-shell lets a client set its toplevel up, fullscreen or maximized
+/// included, before the initial commit. `wm-core` has no client to apply
+/// such a request to until the map, and would drop it, so the request is
+/// recorded here and replayed right after the `MapRequest`. The last
+/// request of each kind wins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PremapStates {
+    pub fullscreen: bool,
+    pub maximized: bool,
+}
+
+impl PremapStates {
+    /// The requests to replay after the map. Maximize goes first, so a
+    /// window that asked for both keeps the maximized state underneath
+    /// fullscreen, as a rule-driven map applies them.
+    pub(crate) fn requests(self) -> impl Iterator<Item = (wm_core::NetState, Option<wm_core::NetState>)> {
+        [
+            self.maximized.then_some((wm_core::NetState::MaximizedHorz, Some(wm_core::NetState::MaximizedVert))),
+            self.fullscreen.then_some((wm_core::NetState::Fullscreen, None)),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+#[cfg(test)]
+mod premap_tests {
+    use super::PremapStates;
+    use wm_core::NetState;
+
+    #[test]
+    fn premap_states_replay_maximize_under_fullscreen_and_nothing_when_unset() {
+        assert_eq!(PremapStates::default().requests().count(), 0);
+        let both = PremapStates { fullscreen: true, maximized: true };
+        assert_eq!(
+            both.requests().collect::<Vec<_>>(),
+            [(NetState::MaximizedHorz, Some(NetState::MaximizedVert)), (NetState::Fullscreen, None)]
+        );
+    }
+}
+
+pub(crate) struct FramePart {
+    pub offset: Point,
+    pub size: Size,
+    pub buffer: MemoryRenderBuffer,
+    /// Every texel is opaque or fully transparent, with at least one hole.
+    pub binary_alpha: bool,
+}
+
+/// Uniform chrome keeps no CPU pixel buffer or GPU texture. Its element ID
+/// belongs to the retained frame, and its commit changes only on semantic edits.
+pub(crate) struct FrameSolid {
+    pub solid: wm_theme_api::DecorationSolid,
+    pub id: smithay::backend::renderer::element::Id,
+    pub commit: smithay::backend::renderer::utils::CommitCounter,
+}
+
+impl FrameSolid {
+    pub(crate) fn new(solid: wm_theme_api::DecorationSolid) -> Self {
+        Self { solid, id: smithay::backend::renderer::element::Id::new(), commit: Default::default() }
+    }
+
+    pub(crate) fn update(&mut self, solid: wm_theme_api::DecorationSolid) {
+        if self.solid != solid { self.solid = solid; self.commit.increment(); }
+    }
+
+    pub(crate) fn element(&self, rect: Rect, alpha: f32) -> smithay::backend::renderer::element::solid::SolidColorRenderElement {
+        use smithay::backend::renderer::{element::{solid::SolidColorRenderElement, Kind}, Color32F};
+        let [r, g, b] = self.solid.rgb.map(|channel| f32::from(channel) / 255.0 * alpha);
+        SolidColorRenderElement::new(self.id.clone(), smithay::utils::Rectangle::new(
+            (rect.pos.x, rect.pos.y).into(), (rect.size.w as i32, rect.size.h as i32).into()),
+            self.commit, Color32F::new(r, g, b, alpha), Kind::Unspecified)
+    }
+}
+
+/// Ledger entry for one decoration frame. `parts` holds only the imported
+/// chrome perimeter; the stable solid fill covers transient client gaps.
+/// No layout is cached here: chrome hit-testing happens in `wm-core`
+/// against the client's own theme-authoritative layout, so the
+/// backend only needs where the frame is, never what is drawn on it.
+pub(crate) struct FrameRecord {
+    pub window: WlWindowId,
+    pub geometry: Rect,
+    pub input_margin: u32,
+    pub input_exclusion: Option<Rect>,
+    pub parts: Vec<FramePart>,
+    pub solids: Vec<FrameSolid>,
+    pub effects: Option<crate::frame_effects::FrameEffects>,
+    pub fill_id: smithay::backend::renderer::element::Id,
+    pub mapped: bool,
+}
+
+impl FrameRecord {
+    pub(crate) fn visual_geometry(&self) -> Rect {
+        let margin = self.input_margin.min(self.geometry.size.w / 2).min(self.geometry.size.h / 2);
+        Rect::new(Point::new(self.geometry.pos.x + margin as i32, self.geometry.pos.y + margin as i32),
+            Size::new(self.geometry.size.w - margin * 2, self.geometry.size.h - margin * 2))
+    }
+}
+
+/// Ledger entry for one shell surface. `buffer: None` means "never
+/// painted yet" — the renderer fills the geometry with `background`
+/// then, mirroring the X11 backend's window-background-color behavior
+/// between creation and first blit.
+pub(crate) struct ShellRecord {
+    pub geometry: Rect,
+    pub buffer: Option<MemoryRenderBuffer>,
+    /// Exact CPU-side pixel allocation represented by `buffer`. Kept
+    /// separately because Smithay intentionally exposes no raw-memory
+    /// accessor on `MemoryRenderBuffer`; diagnostics still need to prove a
+    /// hidden monitor-sized panel released its storage.
+    pub buffer_bytes: usize,
+    pub background: (u8, u8, u8),
+    pub above: bool,
+    pub mapped: bool,
+    /// A stable render-element id for the background fill drawn while
+    /// `buffer` is `None`. Minted once at creation: the damage tracker
+    /// keys element history by id, so a fresh `Id::new()` per frame
+    /// reads as "everything old vanished, everything new appeared" —
+    /// harmless under full-frame redraws, and exactly what makes
+    /// incremental damage useless the moment they stop.
+    pub fill_id: smithay::backend::renderer::element::Id,
+}
+
+/// The desktop background, as last painted by the shell through
+/// `Backend::paint_root_color`/`paint_root_image`. On X11 this becomes
+/// a root-window pixmap; here the renderer simply draws it as the
+/// scene's bottom layer — same trait verbs, no pixmap machinery.
+pub(crate) enum RootBackground {
+    Color((u8, u8, u8)),
+    Image(MemoryRenderBuffer),
+}
+
+/// What the seat's keyboard should hold after the current pass — a
+/// window, or deliberately nothing.
+///
+/// `Nothing` is not a missing feature dressed up as a variant; its
+/// absence was a shipped bug. When `wm-core` miniaturized the focused
+/// window it set its own `focused = None` and published
+/// `active_window(None)`, but the seat kept keyboard focus on the
+/// hidden surface and its toplevel kept the `Activated` state. The
+/// restore then re-focused the *same* window, so smithay deduplicated
+/// the `set_focus` (no `wl_keyboard.enter`) and the unchanged
+/// `Activated` produced no configure — the whole cycle was invisible
+/// on the wire. A client that had minimized *itself*
+/// (`xdg_toplevel.set_minimized` — Edge's own Minimize menu item)
+/// was still waiting for a configure to tell it it was unminimized,
+/// and until one arrived it discarded every key and click the seat
+/// delivered. Clearing the seat and the `Activated` flags at
+/// miniaturize time makes the restore a real re-enter and a real
+/// state change, which is exactly the wake-up such a client listens
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusIntent {
+    Window(WlWindowId),
+    Nothing,
+}
+
+/// An xdg toplevel resize that may invalidate popup anchors rooted in
+/// that surface. `ready` becomes true only after the client has acked
+/// our resize configure and committed its new toplevel buffer, giving
+/// it a full protocol round trip in which to send `xdg_popup.reposition`.
+pub(crate) struct PopupParentResize {
+    root: WlSurface,
+    ready: bool,
+}
+
+/// The `Backend` the `WindowManager` owns: pure bookkeeping the
+/// protocol handlers write into and the renderer reads out of. See the
+/// module docs for why no display connection lives here.
+pub struct WaylandBackend {
+    /// The whole-number scale every `wl_output` in this session
+    /// advertises, and therefore the factor smithay applies to every
+    /// element it composes.
+    ///
+    /// Shared allocator for all three id spaces — window, frame, and
+    /// shell ids never collide, which makes stray-id bugs loud in logs
+    /// instead of silently aliasing. Starts at 1 so [`ROOT_SHELL`]
+    /// (id 0) stays forever unallocated.
+    next_id: u64,
+    pub(crate) windows: HashMap<WlWindowId, WindowRecord>,
+    /// Managed visibility and override-redirect membership, maintained
+    /// at lifecycle edges and read on the pointer/commit hot paths. A
+    /// pure Wayland session has no unmanaged members, so it never scans
+    /// every normal window merely to rediscover that fact.
+    pub(crate) scene_index: SceneIndex,
+    /// Constant-time reverse lookup for native Wayland roots and for
+    /// XWayland roots after their first associated commit. The object
+    /// id includes its client/generation identity, so protocol id reuse
+    /// cannot alias a dead surface. Kept in lockstep by
+    /// [`Self::remember_window`], [`Self::ensure_window_surface_index`],
+    /// [`Self::forget_surface`], and [`Self::forget_window`].
+    surface_windows: HashMap<ObjectId, WlWindowId>,
+    /// Root surfaces that currently own at least one tracked xdg popup.
+    /// `PopupManager::popups_for_surface` takes the surface-tree state
+    /// lock even on a miss, so rendering and pointer motion consult this
+    /// constant-time gate before probing the overwhelmingly common
+    /// popup-free root. Reconciled immediately after popup cleanup.
+    popup_roots: HashMap<ObjectId, WlSurface>,
+    /// Per-application decoration overrides — see
+    /// `wm_config::DecorationRules`. Held on the backend because both
+    /// the decoration decision (`client_draws_own_chrome`) and the
+    /// answers sent on both decoration protocols consult it, and a live
+    /// config reload must move all of them at once.
+    pub(crate) decoration_rules: wm_config::DecorationRules,
+    pub(crate) frames: HashMap<WlFrameId, FrameRecord>,
+    pub(crate) shells: HashMap<WlShellId, ShellRecord>,
+    pub(crate) overview: Option<crate::overview::Overview>,
+    pub(crate) overview_target: Option<bool>,
+    pub(crate) gesture_scene: Option<crate::gesture_scene::Transition>,
+    pub(crate) layout_scene: crate::layout_scene::Scene,
+    pub(crate) capture_ui: Option<crate::capture_tool::Overlay>,
+    /// Bottom-to-top managed application order — see [`StackEntry`].
+    pub(crate) stacking: Vec<StackEntry>,
+    /// Whether [`Self::stacking`] has actually moved since the X server
+    /// was last told about it.
+    ///
+    /// "Dirty means changed, not mentioned", the same discipline
+    /// `EwmhLedger`'s `note_*` methods keep: the stacking vector is
+    /// re-derived on paths that run every pass, and telling XWayland
+    /// unconditionally would put a `grab_server`/`ungrab_server` pair
+    /// on the XWM connection once a frame. Only the three verbs that
+    /// return "the vector moved" set this.
+    pub(crate) stacking_dirty: bool,
+    /// The live `zwp_xwayland_keyboard_grab_v1` an XWayland client holds
+    /// the keyboard with, if any.
+    ///
+    /// The *resource* rather than a bool, because the grab has no end
+    /// callback: smithay drops it lazily, on the first key after the
+    /// client destroyed the object. Holding the object means the gate
+    /// can ask whether it is still alive and answer correctly the
+    /// instant the client lets go, rather than one keystroke late.
+    ///
+    /// And its own field rather than `KeyboardHandle::is_grabbed`,
+    /// because smithay's input-method installs a keyboard grab too;
+    /// gating the compositor's keybindings on "any grab" would disable
+    /// them all whenever an IME popup was up. See the handler in
+    /// `core_protocols.rs`.
+    pub(crate) xwayland_keyboard_grab: Option<ZwpXwaylandKeyboardGrabV1>,
+    /// A keyboard configuration a reload resolved, waiting for the
+    /// compositor to install it.
+    ///
+    /// Staged rather than applied in the setter because the seat lives
+    /// on `Compositor` and the setter is a `Backend` verb, which only
+    /// ever sees the ledger. `Compositor::apply_pending_keyboard`
+    /// drains it on the next pass — the same shape every other
+    /// deferred backend request in this file takes.
+    pub(crate) pending_keyboard: Option<wm_core::KeyboardConfig>,
+    /// The shortcut-inhibit policy the shell last applied: whether a
+    /// focused client may take every chord, and the chord that takes
+    /// them back. Read by the inhibit handler in `core_protocols.rs`
+    /// and the key filter in `input.rs`. A ledger like
+    /// `pending_keyboard`, and for the same reason: the grants live on
+    /// `Compositor`, so a reload that turns grants off has an active
+    /// one to withdraw — `apply_shortcut_inhibit_policy` does that at
+    /// the top of the next dispatch pass when `_changed` says to.
+    pub(crate) shortcut_inhibit_policy: wm_core::ShortcutInhibitPolicy,
+    pub(crate) shortcut_inhibit_policy_changed: bool,
+    pub(crate) pending_pointer: Option<wm_core::PointerConfig>,
+    pub(crate) pointer_config: wm_core::PointerConfig,
+    /// Which input devices are switched off by name, from the configuration
+    /// and from live `hl.device` requests.
+    pub(crate) input_device_states: crate::input::devices::DeviceStates,
+    /// Post-libinput axis multipliers, also used by the nested backend:
+    /// one for wheel, tilt and button scrolling, one for finger scrolling.
+    pub(crate) pointer_scroll_factor: f64,
+    pub(crate) touchpad_scroll_factor: f64,
+    /// The xkb layout actually installed on the seat.
+    ///
+    /// What IPC reports, rather than the config's own `kb_layout`: the
+    /// two differ whenever `XKB_DEFAULT_LAYOUT` is set, and after a
+    /// reload the config value can name a layout libxkbcommon rejected
+    /// and the session never adopted. A bar that prints this should be
+    /// printing the keymap in force.
+    pub(crate) keyboard_layout: String,
+    /// Human-readable XKB group names and the active group selected on
+    /// the seat. Kept for immutable IPC snapshots.
+    pub(crate) keyboard_layouts: Vec<String>,
+    pub(crate) active_keyboard_layout: u32,
+    /// Set when the workspace row moves, drained by
+    /// `workspace::refresh`. On the ledger rather than on
+    /// `WorkspaceState` because the verb that knows the row changed is
+    /// a `Backend` method, which only ever sees the ledger.
+    pub(crate) workspaces_dirty: bool,
+    /// Bottom-to-top order within both shell bands. A shell's `above`
+    /// bit chooses its band; entries of the other band are skipped.
+    /// This is the single source of shell order for both rendering and
+    /// hit-testing, just as `stacking` is for managed applications.
+    pub(crate) shell_stacking: Vec<WlShellId>,
+    /// Events queued by protocol handlers and backend verbs, drained
+    /// by `Backend::poll_event` exactly as the X11 backend's socket is.
+    pub(crate) pending: VecDeque<BackendEvent<WlWindowId, WlFrameId>>,
+    /// Toplevels whose configuration this pass has changed, and whether
+    /// one of them is *owed* a configure even if nothing changed — the
+    /// answer a client's own request has to get, refusal included.
+    ///
+    /// The same record-now/act-later shape as [`Self::pending`] beside
+    /// it, and for a sharper reason: a configure states what the window
+    /// *is*, so one sent from inside a request handler states what it
+    /// was before `wm-core` ever saw the request. See
+    /// `crate::xdg::flush_configures` for the invariant and the bug
+    /// that made it one.
+    pub(crate) configure_debt: HashMap<WlWindowId, crate::xdg::ConfigureDebt>,
+    /// Native toplevel roots whose size changed this pass. Any xdg
+    /// popup tree rooted there is dismissed after the client accepts
+    /// the resize unless it supplies a fresh anchor: a non-reactive
+    /// popup cannot legally be reconfigured, and a client that sends
+    /// no `xdg_popup.reposition` has given us no updated anchor to
+    /// place it from. See
+    /// [`Compositor::dismiss_popups_after_parent_resize`].
+    popup_parent_resizes: Vec<PopupParentResize>,
+    /// Clicks on shell surfaces (surface, surface-local position,
+    /// button, pressed) — plus background presses under [`ROOT_SHELL`].
+    /// Drained by `Backend::take_shell_click` for the loop's shell
+    /// routing.
+    pub(crate) shell_clicks: VecDeque<(WlShellId, Point, MouseButton, bool)>,
+    /// Pointer motion over shell surfaces, drained by
+    /// `Backend::take_shell_motion` (the shell itself drains this
+    /// inside `Shell::on_motion`, same as on X11).
+    pub(crate) shell_motions: VecDeque<(WlShellId, Point)>,
+    /// Whole wheel notches over shell surfaces (surface,
+    /// surface-local position, delta) — plus notches over the desktop
+    /// background under [`ROOT_SHELL`], mirroring `shell_clicks`.
+    /// Drained by `Backend::take_shell_scroll`.
+    ///
+    /// Queued rather than summed: a caller reading three separate
+    /// one-notch entries and a caller reading one three-notch entry
+    /// both behave correctly (the delta is a count), but only the
+    /// queue preserves the positions, and on a dock the position is
+    /// which tile the user was pointing at when each notch landed.
+    pub(crate) shell_scrolls: VecDeque<(WlShellId, Point, ScrollDelta)>,
+    /// Output size change waiting for the loop's
+    /// `take_screen_resize` drain (the winit window was resized).
+    pub(crate) pending_resize: Option<Size>,
+    /// Key combos the WM asked to intercept (`Backend::grab_key`).
+    /// There is no server to register grabs with — the compositor sees
+    /// every key anyway — so "grabbing" is just this filter list the
+    /// input code consults before deciding whether a press becomes a
+    /// `BackendEvent::KeyPress` or is forwarded to the focused client.
+    pub(crate) grabbed_combos: Vec<KeyCombo>,
+    pub(crate) release_combos: Vec<KeyCombo>,
+    pub(crate) locked_combos: Vec<KeyCombo>,
+    pub(crate) repeating_combos: Vec<KeyCombo>,
+    /// Switch toggles, as device name and new state, waiting for
+    /// `dispatch_pending` to resolve them against the switch bindings.
+    /// Bounded where they are staged.
+    pub(crate) pending_switches: Vec<(String, bool)>,
+    pub(crate) repeat_rate: u32,
+    pub(crate) repeat_delay: std::time::Duration,
+    /// The modal exclusive grab (`Backend::grab_keyboard`, the Alt-Tab
+    /// switcher): while set, *every* press becomes a `KeyPress` and
+    /// releases additionally queue `KeyRelease` — see wm-x11's
+    /// KeyRelease commentary, mirrored by `input.rs`.
+    pub(crate) pending_quit: Vec<(WlWindowId, Instant)>,
+    pub(crate) killed_clients: Vec<ClientId>,
+    pub(crate) keyboard_grabbed: bool,
+    /// A modal keyboard ownership transition waiting to reach the seat.
+    /// Canceling back to the same window may produce no window-focus intent.
+    pub(crate) keyboard_grab_changed: bool,
+    pub(crate) root_background: RootBackground,
+    /// Every output this session drives, in the order `run` discovered
+    /// them (connector order on the session backend, one entry on the
+    /// nested one) — the primary first. Served verbatim by
+    /// `Backend::monitors`, and consulted by the input code to confine
+    /// the pointer, so this is the ledger's whole idea of the physical
+    /// screen layout.
+    pub(crate) monitors: Vec<MonitorInfo>,
+    /// The fractional UI scale of each monitor, parallel to
+    /// [`WaylandBackend::monitors`] (same indices, same order). On the
+    /// ledger rather than on [`Compositor`] because the `Backend` verbs
+    /// that convert between a client's logical units and this ledger's
+    /// physical ones (`resize_client`, `size_hints`) run inside the
+    /// `WindowManager`'s `&mut self` and can reach nothing else — the
+    /// standing rule every deferred field above documents. Kept in step
+    /// with `Compositor::outputs` by `advertise_scale` and the
+    /// output-management apply path; nowhere else writes it.
+    ///
+    /// Not a field on `MonitorInfo`, deliberately: that type belongs to
+    /// `wm-core` and is shared with the X11 backend, where a per-monitor
+    /// scale has no meaning (the X session is scaled by rasterizing the
+    /// theme larger, not by telling anyone a factor).
+    pub(crate) monitor_scales: Vec<f64>,
+    /// Per-monitor display hardware facts, in the same index order as
+    /// `Backend::monitors` — what the connector's EDID and chosen mode
+    /// say, mirrored here for the callers that ask over IPC.
+    ///
+    /// Not on `MonitorInfo` for the same reason `monitor_scales` is
+    /// not (see above): that type is `wm-core`'s and is shared with the
+    /// X11 backend, and nothing in the core wants a mode list. The
+    /// Hyprland IPC snapshot and `zwlr_output_management` are the only
+    /// readers, and both live on this side of the boundary.
+    pub(crate) monitor_outputs: Vec<MonitorOutput>,
+    /// Connected outputs kept out of the layout (see
+    /// [`Compositor::parked_outputs`]), mirrored for `monitors all`.
+    pub(crate) parked_monitors: Vec<ParkedMonitor>,
+    /// Live input devices, maintained from backend hotplug events and
+    /// served through Hyprland-compatible IPC.
+    pub(crate) input_devices: Vec<InputDeviceRecord>,
+    /// Live input-method candidate popups. Kept in the scene ledger so
+    /// rendering and hit-testing consult the same collection.
+    pub(crate) ime_popups: Vec<smithay::wayland::input_method::PopupSurface>,
+    /// The drag icon of the client drag in flight, if it offered one.
+    /// See [`DndIcon`].
+    pub(crate) dnd_icon: Option<DndIcon>,
+    /// The union bounding box of [`WaylandBackend::monitors`] — what
+    /// `Backend::screen_size` reports, and the space every rect in this
+    /// ledger lives in. With one output it is that output's size, which
+    /// is why the single-monitor path never notices the distinction.
+    pub(crate) output_size: Size,
+    /// Set by every mutating verb (paint, map, move, restack, ...);
+    /// the renderer clears it after drawing. This is the whole
+    /// redraw-scheduling protocol: no damage, no render.
+    pub(crate) damage: bool,
+    /// A scene transition retired visible pixels that Smithay's
+    /// per-element history cannot reliably rediscover from the new scene.
+    ///
+    /// The physical backend distributes this edge to every output beside
+    /// [`Self::damage`]. Each output keeps it until that output has rendered
+    /// successfully, so a connector blocked on an older page flip cannot
+    /// miss the invalidation. This remains separate from ordinary damage:
+    /// resetting buffer ages for pointer motion would turn every cursor
+    /// sample into a full-panel redraw on hardware without a cursor plane.
+    pub(crate) full_damage_required: bool,
+    /// Call site that most recently invalidated the scene. A static
+    /// `Location` costs no allocation on the hot path and makes a live
+    /// diagnostic dump answer why the compositor last chose to draw.
+    pub(crate) last_damage_source: Option<&'static std::panic::Location<'static>>,
+    /// Compositor-wide cursor suppression requested through the
+    /// Hyprland compatibility socket. The owner is the focused client
+    /// at the moment it hides the cursor, so killing a screensaver
+    /// cannot strand the rest of the session without a pointer.
+    pub(crate) cursor_hidden: bool,
+    pub(crate) cursor_hidden_owner: Option<WlSurface>,
+    /// The compositor's own reason to hide the pointer (typing, touch or
+    /// idleness), kept apart from the IPC flag above; see
+    /// [`crate::input::cursor_visibility`].
+    pub(crate) cursor_visibility: crate::input::cursor_visibility::CursorVisibility,
+    /// Selected graphics stack and hardware identity for live system
+    /// information (`nested-winit` or the KMS/driver/render-node set).
+    pub(crate) graphics_diagnostics: String,
+    pub(crate) gpu_timings: std::rc::Rc<std::cell::RefCell<crate::gpu_timer::Measurements>>,
+    pub(crate) native_frame_stats: Vec<crate::gpu_stats::OutputStats>,
+    /// What the nested backend's last drawn frame held: elements built,
+    /// elements the damage tracker composited, and elements it skipped
+    /// as fully occluded. The number the translucency cost is judged
+    /// by, reported through `debug scene`; the native pipeline keeps
+    /// the same counts per frame in [`Self::native_frame_stats`].
+    pub(crate) scene_elements: SceneElementCounts,
+    /// Handle to the wayland display, for verbs that must touch
+    /// protocol state directly (client credentials for `window_pid`,
+    /// disconnecting a client for `kill_client`).
+    pub(crate) display_handle: DisplayHandle,
+    /// Focus intent recorded by `Backend::set_input_focus` (a window)
+    /// or by `publish_active_window(None)` (nothing). The keyboard
+    /// lives on the seat, the seat lives on [`Compositor`], and
+    /// applying focus needs `&mut Compositor` — which a backend verb,
+    /// running inside the `WindowManager`'s `&mut self`, can never
+    /// have. So the verb records the intent here and
+    /// [`Compositor::dispatch_pending`] applies it after the drain,
+    /// the same each-loop cadence X11 focus changes effectively land
+    /// on.
+    ///
+    /// The `Nothing` intent exists because "no window is focused" is a
+    /// real state `wm-core` enters (miniaturize, the focused window
+    /// closing, a workspace switch away) and the seat must follow it.
+    /// See [`FocusIntent`] for the Edge bug that shipped while it
+    /// didn't.
+    pub(crate) pending_focus: Option<FocusIntent>,
+    /// The preview edge the shell hinted through
+    /// `Backend::set_preview_edge` — the Overview's card size while a
+    /// session is open, `None` the rest of the time. Read by the
+    /// capture pass (`crate::capture`), which sizes the per-window
+    /// snapshots from it; the reason it is a ledger field and not a
+    /// capture-module local is the same `pending_focus` story: the
+    /// verb runs inside the `WindowManager`'s `&mut self`, and the
+    /// capture pass runs later with the renderer in hand.
+    pub(crate) preview_edge: Option<u32>,
+    /// Advanced by the capture pass each time it lands snapshots taken
+    /// at the hinted [`WaylandBackend::preview_edge`] — the shell polls
+    /// it (`Backend::preview_generation`) to learn that previews it
+    /// fetched before those captures ran are worth fetching again.
+    pub(crate) preview_generation: u64,
+    /// A UI scale change `Shell::apply_session_state` has announced,
+    /// waiting for [`Compositor::dispatch_pending`] to rebuild the
+    /// compositor's own pointer from it.
+    ///
+    /// Same detour, and the same reason for it, as
+    /// [`WaylandBackend::pending_focus`]: the thing that has to change
+    /// hangs off [`Compositor`], and a `Backend` verb runs inside the
+    /// `WindowManager`'s `&mut self` and can never reach it. What is
+    /// particular to this one is *why* the announcement is worth
+    /// recording at all rather than acting on where the reload was
+    /// noticed — see the drain in `dispatch_pending`.
+    pub(crate) pending_cursor_scale: Option<f32>,
+    /// A pointer warp the window manager asked for through
+    /// `Backend::warp_pointer` (`focusmonitor`), in ledger pixels,
+    /// waiting for [`Compositor::dispatch_pending`] to apply it through
+    /// `input::warp_pointer` — the same detour as
+    /// [`WaylandBackend::pending_cursor_scale`], for the same reason:
+    /// moving the pointer needs the `Compositor`, which a `Backend`
+    /// verb cannot reach. Applied through the script warp's own gate,
+    /// so a binding cannot move the pointer behind the lock surface or
+    /// out of a client's pointer constraint either.
+    pub(crate) pending_pointer_warp: Option<Point>,
+    /// The interactive drag currently holding the pointer, if any.
+    ///
+    /// This *is* `Backend::grab_pointer_for_drag` — there is no server
+    /// to ask, so the grab is a fact recorded here and consulted by the
+    /// routing in `input.rs`, exactly as [`WaylandBackend::
+    /// keyboard_grabbed`] is for the modal keyboard grab. See
+    /// [`DragGrab`] for what goes wrong without one.
+    pub(crate) pointer_grab: Option<DragGrab>,
+    /// A pointer-grab transition waiting for
+    /// [`Compositor::dispatch_pending`] to tell the seat about it.
+    ///
+    /// The same detour, and the same reason for it, as
+    /// [`WaylandBackend::pending_focus`]: taking the pointer away from
+    /// the client under it and giving it back are both seat operations,
+    /// and the `Backend` verbs that decide them run inside the
+    /// `WindowManager`'s `&mut self`, which can never reach a seat.
+    /// Routing needs no such detour and does not wait for this — the
+    /// flag above is live the instant the verb returns.
+    pub(crate) pending_pointer_grab: Option<PointerGrabChange>,
+    /// Where the pointer is, mirrored from `input.rs` on every motion —
+    /// what `Backend::pointer_position` answers with.
+    ///
+    /// The mirror exists because `wm-core` genuinely cannot remember
+    /// this for itself: motion over a client's own content is the
+    /// client's and is never queued as a `PointerMotion`, so by the
+    /// time a client-decorated window asks to be dragged
+    /// (`MoveRequest`), the position `wm-core` last heard can be stale
+    /// by the whole width of that window — and the drag began by
+    /// teleporting the window by exactly that error on its first
+    /// motion. On X11 the backend asks the server (`query_pointer`);
+    /// here the compositor is the server, and this field is its answer.
+    /// `None` only before the first motion of the session, when there
+    /// is no position to be had from anywhere.
+    pub(crate) pointer: Option<Point>,
+    /// The cursor each frame most recently asked to show, from
+    /// `Backend::set_frame_cursor`: an entry per frame whose pointer is
+    /// (or was last) over a resize hitbox, absent meaning the plain
+    /// arrow. The renderer reads this — through
+    /// [`crate::input::pointer_subject`] — to pick the pointer image
+    /// while the pointer is over that frame's chrome; on X11 the server
+    /// did this from a per-window cursor attribute, and this map is
+    /// that attribute's ledger spelling.
+    pub(crate) frame_cursors: HashMap<WlFrameId, ResizeEdge>,
+    /// Every wlr-layer-shell surface, in creation order (which is the
+    /// z-order within a layer band — newest on top). On the ledger,
+    /// not the [`Compositor`], because the renderer's scene walk and
+    /// the input hit walk read only the ledger, and a surface family
+    /// either of them cannot see would be drawn but unclickable or the
+    /// reverse. See `layers.rs`.
+    pub(crate) layers: Vec<crate::layers::LayerRecord>,
+    /// Layer-surface namespaces the shell has asked to keep off the
+    /// screen (`Backend::set_layer_surface_hidden`) — Omarchy's bar
+    /// while the user has it switched off in the root menu. A hidden
+    /// surface is treated exactly as `layers::declined` treats
+    /// Omarchy's background: configured, committed, answered, and
+    /// neither drawn, hit-tested, nor allowed to reserve an edge. See
+    /// [`WaylandBackend::layer_presented`].
+    pub(crate) hidden_layer_namespaces: std::collections::BTreeSet<String>,
+    /// Whether layer placement must be recomputed before the next
+    /// frame. Visibility policy lives on the backend because it is a
+    /// [`Backend`] verb; this edge carries that change to the protocol
+    /// owner without making `wm-core` know about Wayland layer state.
+    pub(crate) layer_layout_dirty: bool,
+    /// Whether idle inhibition must be recomputed after a scene-
+    /// visibility edge. Pixel-only commits deliberately leave this
+    /// clear; map, workspace, layer-policy, destruction, and lock
+    /// transitions set it. Consumed by `idle::refresh`.
+    pub(crate) idle_policy_dirty: bool,
+    /// Whether an ext-session-lock holds the session. THE flag the
+    /// renderer and the input path branch on: while set, only
+    /// [`WaylandBackend::lock_surfaces`] render and receive input —
+    /// everything else in this ledger is treated as nonexistent. Set
+    /// and cleared only by `lock.rs`'s handler; a locker crashing
+    /// clears the surfaces but never this flag (see `lock.rs`'s module
+    /// docs for why that asymmetry is the security property).
+    pub(crate) locked: bool,
+    /// The lock client's surfaces, one per output it has covered.
+    pub(crate) lock_surfaces: Vec<crate::lock::LockSurfaceEntry>,
+    /// `xdg_activation_v1`'s token ledger. On the backend rather than in
+    /// `CoreProtocols` because the shell mints tokens for the commands
+    /// it launches through `Backend::create_activation_token`, and the
+    /// backend is the only compositor state the shell can reach. The
+    /// policy that admits and redeems tokens stays in
+    /// `core_protocols.rs`.
+    pub(crate) activation: smithay::wayland::xdg_activation::XdgActivationState,
+    /// When the abandoned-token sweep next runs; see
+    /// `WaylandBackend::sweep_activation_tokens`.
+    pub(crate) next_activation_token_sweep: Instant,
+    /// Buffered EWMH publishes waiting for `dispatch_pending` to flush
+    /// them to the XWayland root — the record-now/act-later detour the
+    /// `Backend::publish_*` verbs take for the reason `pending_focus`
+    /// documents: the connection (when it exists at all) hangs off
+    /// [`Compositor`], which a backend verb can never reach. See
+    /// `xewmh.rs`.
+    pub(crate) ewmh: crate::xewmh::EwmhLedger,
+}
+
+/// Which way a drag grab just moved, for the seat-side half that
+/// [`crate::input::apply_pointer_grab_change`] performs.
+pub(crate) enum PointerGrabChange {
+    Taken,
+    Released,
+}
+
+impl WaylandBackend {
+    /// Capture overlays and shell panels own input independently. Closing
+    /// either one must leave the other panel's modal ownership intact.
+    pub(crate) fn modal_keyboard_grabbed(&self) -> bool {
+        self.keyboard_grabbed || crate::capture_tool::modal(self)
+    }
+
+    /// The chrome this window's client should wear, from what it has
+    /// actually told us — the decoration protocols first, and the
+    /// `[decorations]` rules above them.
+    ///
+    /// The whole policy lives in [`crate::decoration`]; this is the
+    /// lookup that feeds it the record's evidence and identity. The
+    /// KDE-manager bind is a property of the *client*, not the surface,
+    /// so it is folded in here rather than duplicated onto every
+    /// record the client owns.
+    pub(crate) fn xdg_client_chrome(&self, record: &WindowRecord) -> wm_core::ClientChrome {
+        crate::decoration::client_chrome(
+            &self.decoration_rules,
+            record.app_id.as_deref(),
+            self.decoration_evidence(record),
+        )
+    }
+
+    /// This record's negotiation, with `kde_manager_bound` resolved
+    /// against the live client set.
+    pub(crate) fn decoration_evidence(&self, record: &WindowRecord) -> crate::decoration::DecorationEvidence {
+        let mut negotiation = record.decoration;
+        negotiation.kde_manager_bound = self.client_bound_kde_decoration(record);
+        negotiation.evidence()
+    }
+
+    /// Whether the client owning this surface has bound the KDE
+    /// decoration manager.
+    fn client_bound_kde_decoration(&self, record: &WindowRecord) -> bool {
+        let ManagedSurface::Xdg(toplevel) = &record.surface else {
+            return false;
+        };
+        toplevel
+            .wl_surface()
+            .client()
+            .and_then(|client| {
+                client
+                    .get_data::<ClientState>()
+                    .map(|data| data.kde_decoration_bound.load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn new(display_handle: DisplayHandle, monitors: Vec<MonitorInfo>, scale: f32) -> Self {
+        let output_size = union_size(&monitors);
+        let monitor_scales = vec![scale.max(0.125) as f64; monitors.len()];
+        let monitor_outputs = vec![MonitorOutput::default(); monitors.len()];
+        let activation = smithay::wayland::xdg_activation::XdgActivationState::new::<Compositor>(&display_handle);
+        Self {
+            next_id: 1,
+            windows: HashMap::new(),
+            overview: None,
+            overview_target: None,
+            gesture_scene: None,
+            layout_scene: crate::layout_scene::Scene::default(),
+            capture_ui: None,
+            scene_index: SceneIndex::default(),
+            surface_windows: HashMap::new(),
+            popup_roots: HashMap::new(),
+            configure_debt: HashMap::new(),
+            popup_parent_resizes: Vec::new(),
+            decoration_rules: wm_config::DecorationRules::default(),
+            frames: HashMap::new(),
+            shells: HashMap::new(),
+            stacking: Vec::new(),
+            shell_stacking: Vec::new(),
+            pending: VecDeque::new(),
+            shell_clicks: VecDeque::new(),
+            shell_motions: VecDeque::new(),
+            shell_scrolls: VecDeque::new(),
+            pending_resize: None,
+            grabbed_combos: Vec::new(),
+            release_combos: Vec::new(),
+            locked_combos: Vec::new(),
+            repeating_combos: Vec::new(),
+            pending_switches: Vec::new(),
+            repeat_rate: 25,
+            repeat_delay: std::time::Duration::from_millis(200),
+            pending_quit: Vec::new(),
+            killed_clients: Vec::new(),
+            keyboard_grabbed: false,
+            keyboard_grab_changed: false,
+            root_background: RootBackground::Color((0, 0, 0)),
+            monitors,
+            monitor_scales,
+            monitor_outputs,
+            parked_monitors: Vec::new(),
+            stacking_dirty: false,
+            xwayland_keyboard_grab: None,
+            pending_keyboard: None,
+            shortcut_inhibit_policy: wm_core::ShortcutInhibitPolicy::default(),
+            shortcut_inhibit_policy_changed: false,
+            pending_pointer: None,
+            pointer_config: wm_core::PointerConfig::default(),
+            input_device_states: Default::default(),
+            pointer_scroll_factor: 1.0,
+            touchpad_scroll_factor: 1.0,
+            keyboard_layout: String::new(),
+            keyboard_layouts: Vec::new(),
+            active_keyboard_layout: 0,
+            workspaces_dirty: true,
+            input_devices: Vec::new(),
+            ime_popups: Vec::new(),
+            dnd_icon: None,
+            output_size,
+            damage: true,
+            full_damage_required: false,
+            last_damage_source: None,
+            cursor_hidden: false,
+            cursor_hidden_owner: None,
+            cursor_visibility: Default::default(),
+            graphics_diagnostics: "backend=uninitialized".to_string(),
+            gpu_timings: Default::default(),
+            native_frame_stats: Vec::new(),
+            scene_elements: SceneElementCounts::default(),
+            display_handle,
+            pending_focus: None,
+            preview_edge: None,
+            preview_generation: 0,
+            pending_cursor_scale: None,
+            pending_pointer_warp: None,
+            pointer_grab: None,
+            pending_pointer_grab: None,
+            pointer: None,
+            frame_cursors: HashMap::new(),
+            layers: Vec::new(),
+            hidden_layer_namespaces: std::collections::BTreeSet::new(),
+            layer_layout_dirty: true,
+            idle_policy_dirty: true,
+            locked: false,
+            activation,
+            next_activation_token_sweep: Instant::now() + crate::core_protocols::ACTIVATION_TOKEN_SWEEP_INTERVAL,
+            lock_surfaces: Vec::new(),
+            ewmh: crate::xewmh::EwmhLedger::default(),
+        }
+    }
+
+    /// Allocates the next id in the shared counter — used by the
+    /// protocol handlers for window ids and by `backend_impl` for
+    /// frame/shell ids.
+    pub(crate) fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Queues an event for the next `poll_event` drain.
+    pub(crate) fn queue(&mut self, event: BackendEvent<WlWindowId, WlFrameId>) {
+        self.pending.push_back(event);
+    }
+
+    /// Begin (or refresh) the popup-anchor grace period for a parent
+    /// resize. Repeated interactive-resize motions coalesce by root.
+    pub(crate) fn note_popup_parent_resize(&mut self, root: WlSurface) {
+        if let Some(resize) = self.popup_parent_resizes.iter_mut().find(|resize| resize.root == root) {
+            resize.ready = false;
+        } else {
+            self.popup_parent_resizes.push(PopupParentResize { root, ready: false });
+        }
+    }
+
+    /// The resized parent has committed after accepting every pending
+    /// configure. Its client has now had the opportunity to reposition
+    /// its popups, so an unchanged non-reactive anchor may be retired.
+    pub(crate) fn popup_parent_committed(&mut self, root: &WlSurface) {
+        if let Some(resize) = self.popup_parent_resizes.iter_mut().find(|resize| &resize.root == root) {
+            resize.ready = true;
+        }
+    }
+
+    /// An explicit reposition is the fresh anchor this grace period was
+    /// waiting for. The popup remains mapped at the client's new place.
+    pub(crate) fn popup_repositioned(&mut self, root: &WlSurface) {
+        self.popup_parent_resizes.retain(|resize| &resize.root != root);
+    }
+
+    /// Removes one resize whose client round trip has completed while
+    /// retaining the Vec allocation for future interactive resizes.
+    fn take_ready_popup_parent_resize(&mut self) -> Option<WlSurface> {
+        let index = self.popup_parent_resizes.iter().position(|resize| resize.ready)?;
+        Some(self.popup_parent_resizes.swap_remove(index).root)
+    }
+
+    /// Whether a layer surface is one the user can see and click right
+    /// now: mapped, still alive, and neither declined by policy
+    /// ([`crate::layers::declined`]) nor hidden by the shell
+    /// ([`Self::hidden_layer_namespaces`]). The renderer, the hit walk,
+    /// the exclusive-zone pass and the keyboard-focus pass all ask this
+    /// and nothing else, so a surface can never be drawn where it cannot
+    /// be clicked, reserve a strip it does not occupy, or receive an
+    /// animation callback for pixels that were not presented.
+    pub(crate) fn layer_presented(&self, record: &crate::layers::LayerRecord) -> bool {
+        record.mapped
+            && record.surface.alive()
+            && !crate::layers::declined(record.layer, &record.namespace)
+            && !self.hidden_layer_namespaces.contains(&record.namespace)
+    }
+
+    /// Marks the scene dirty. Every mutating verb and every handler
+    /// that changes anything visible must call this (or set the field)
+    /// or its change waits for the next unrelated damage to appear.
+    #[track_caller]
+    pub(crate) fn mark_damaged(&mut self) {
+        self.damage = true;
+        self.last_damage_source = Some(std::panic::Location::caller());
+    }
+
+    /// The alpha this window's body is composited at right now: its
+    /// rule read against the active window, unless the native kill
+    /// switch draws everything opaque.
+    pub(crate) fn window_alpha(&self, id: WlWindowId, record: &WindowRecord) -> f32 {
+        if self.decoration_rules.opacity_rules_disabled {
+            return 1.0;
+        }
+        effective_alpha(record, self.ewmh.active_window() == Some(id), record.fullscreen)
+    }
+
+    /// How dark a quad to draw in front of this window: `dim_inactive`'s
+    /// strength while the window is unfocused, unless its rule says
+    /// `no_dim`. A fullscreen window is never dimmed, so its surface
+    /// stays the single element its output shows.
+    pub(crate) fn window_dim(&self, id: WlWindowId, record: &WindowRecord) -> Option<f32> {
+        let strength = self.decoration_rules.dim_inactive.filter(|strength| *strength > 0.0)?;
+        (!record.no_dim && !record.fullscreen && self.ewmh.active_window() != Some(id)).then_some(strength)
+    }
+
+    /// Whether gaining or losing focus changes how this window is
+    /// drawn — an alpha that differs by focus, or a dim — so a focus
+    /// change knows whether it owes the scene a repaint.
+    pub(crate) fn focus_changes_look(&self, id: WlWindowId) -> bool {
+        let Some(record) = self.windows.get(&id).filter(|record| record.mapped) else {
+            return false;
+        };
+        let dims = self.decoration_rules.dim_inactive.is_some_and(|strength| strength > 0.0)
+            && !record.no_dim
+            && !record.fullscreen;
+        dims
+            || (!self.decoration_rules.opacity_rules_disabled
+                && effective_alpha(record, true, record.fullscreen) != effective_alpha(record, false, record.fullscreen))
+    }
+
+    /// Records that the answer to "may the session idle?" can have
+    /// changed. Kept separate from pixel damage so an animated client
+    /// does not make the idle protocol rescan ownership at frame rate.
+    pub(crate) fn mark_idle_policy_dirty(&mut self) {
+        self.idle_policy_dirty = true;
+    }
+
+    /// Consumes one idle-policy invalidation edge.
+    pub(crate) fn take_idle_policy_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.idle_policy_dirty)
+    }
+
+    /// Ends whatever drag grab is in flight and asks the seat to hand
+    /// the pointer back to the client under it.
+    ///
+    /// The single exit, so that "no drag holds the pointer" and "the
+    /// client under it has been told" cannot come apart: `Backend::
+    /// ungrab_pointer` calls it when the drag's owner is finished, and
+    /// `input.rs` calls it when it finds a grab whose drag is already
+    /// over. Idempotent — no grab means nothing to announce either.
+    pub(crate) fn end_pointer_grab(&mut self) {
+        if self.pointer_grab.take().is_some() {
+            self.pending_pointer_grab = Some(PointerGrabChange::Released);
+            // A matching frame during a drag is only a temporary catch-up;
+            // retain its density until release. Replies still in flight keep
+            // their latch and will release it in the normal commit path.
+            let settled: Vec<_> = self.windows.iter().filter_map(|(&id, record)| {
+                let resize = record.resize_scale?;
+                let root = record.surface.wl_surface()?;
+                (self.unlatched_window_surface_scale(record) == resize.factor
+                    && crate::xdg::committed_content_size(&root, resize.factor, self.output_size)
+                        == Some(resize.expected)).then_some(id)
+            }).collect();
+            for id in settled {
+                self.windows.get_mut(&id).unwrap().resize_scale = None;
+            }
+        }
+    }
+
+    /// The fractional UI scale of the monitor containing `rect`'s
+    /// center — the factor a surface anchored there is composed at.
+    /// Falls back to the primary monitor's scale (index 0) for a rect
+    /// in dead space or an empty layout, and to 1.0 when there are no
+    /// monitors at all, which no running session has.
+    ///
+    /// The center, not the top-left corner: a window straddling two
+    /// screens has to be measured by *one* factor, and the monitor
+    /// holding most of it is the least surprising choice — the same
+    /// tie-break `wm-core` uses for placement.
+    pub(crate) fn scale_at(&self, rect: Rect) -> f64 {
+        scale_for_rect(&self.monitors, &self.monitor_scales, rect)
+    }
+
+    /// Display ownership wins over the geometry of a clipped or sliding window.
+    /// Keep scale negotiation, popup rendering and input on the same output.
+    pub(crate) fn window_output_scale(&self, record: &WindowRecord) -> f64 {
+        if let Some(index) = self.space_output_for(record).and_then(|name| self.monitors.iter().position(|m| m.name == name)) {
+            return self.monitor_scales.get(index).copied().unwrap_or(1.0);
+        }
+        self.scale_at(record.surface.wl_surface().as_ref().and_then(|surface| self.window_for_surface(surface))
+            .and_then(|id| self.layout_scene.workarea(id)).unwrap_or(record.content))
+    }
+
+    /// The factor one managed window's surface is composed at: what the
+    /// client itself committed, corrected only for the integral-fallback
+    /// case (`xdg::effective_surface_scale`) on the output the window
+    /// lives on. The single definition the renderer, the hit-test, the
+    /// ledger measurement and the configure path all call — four sites
+    /// describing one rectangle must multiply by one number.
+    pub(crate) fn window_surface_scale(&self, record: &WindowRecord) -> f64 {
+        if let Some(resize) = record.resize_scale {
+            if resize.output_scale == self.window_output_scale(record) {
+                return resize.factor;
+            }
+        }
+        self.unlatched_window_surface_scale(record)
+    }
+
+    pub(crate) fn unlatched_window_surface_scale(&self, record: &WindowRecord) -> f64 {
+        let Some(surface) = record.surface.wl_surface() else {
+            return 1.0;
+        };
+        // Xwayland is the one client this compositor never invites to
+        // scale itself (it is told through XSETTINGS instead and keeps
+        // committing 1x buffers over 1x rectangles), so the fallback
+        // correction must not apply to it either.
+        if matches!(record.surface, ManagedSurface::X11(_)) {
+            return crate::xdg::committed_buffer_scale(&surface) as f64;
+        }
+        crate::xdg::effective_surface_scale(
+            crate::xdg::committed_surface_scale(&surface),
+            self.window_output_scale(record),
+        )
+    }
+
+    /// Keep a framed native client's last buffer inside its current interior
+    /// while a resize reply is in flight. Rendering and input use the same
+    /// transform; protocol sizes continue to use the unmodified surface scale.
+    pub(crate) fn window_presentation(
+        &self,
+        record: &WindowRecord,
+        framed: bool,
+    ) -> (Point, smithay::utils::Scale<f64>) {
+        let base = self.window_surface_scale(record);
+        let committed = if framed && matches!(record.surface, ManagedSurface::Xdg(_)) {
+            // Only an unanswered resize stretches. A client whose settled
+            // buffer differs from the interior (a fullscreen page rounded a
+            // pixel, a size it chose) is drawn and hit-tested 1:1; stretching
+            // it anyway moves every click by the ratio on both axes. Nor does
+            // a buffer that already fills the interior: its pixels answer the
+            // resize whatever its last window geometry says. Chromium can
+            // present its fullscreen buffer while that geometry is still the
+            // windowed one, and any configure then in flight, such as the
+            // activation a click books, stretched its clicks by that ratio.
+            record.surface.wl_surface().filter(|surface| {
+                let fills = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
+                    state.surface_size()
+                })
+                .flatten()
+                .is_some_and(|size| {
+                    let w = crate::xdg::scale_length(size.w, base).max(0) as u32;
+                    let h = crate::xdg::scale_length(size.h, base).max(0) as u32;
+                    w.abs_diff(record.content.size.w) <= 1 && h.abs_diff(record.content.size.h) <= 1
+                });
+                !fills && self.surface_windows.get(&surface.id())
+                    .is_some_and(|window| crate::xdg::resize_pending(self, *window, surface))
+            }).and_then(|surface| {
+                crate::xdg::committed_content_size(&surface, base, self.output_size)
+            })
+        } else {
+            None
+        };
+        let fit = committed.filter(|size| size.w > 0 && size.h > 0)
+            .map(|size| (
+                record.content.size.w.max(1) as f64 / size.w as f64,
+                record.content.size.h.max(1) as f64 / size.h as f64,
+            )).unwrap_or((1.0, 1.0));
+        let origin = Point::new(
+            record.content.pos.x.saturating_sub(crate::xdg::scale_length(record.content_offset.x, fit.0)),
+            record.content.pos.y.saturating_sub(crate::xdg::scale_length(record.content_offset.y, fit.1)),
+        );
+        (origin, (base * fit.0, base * fit.1).into())
+    }
+
+    /// Inserts the authoritative window record and, when its root is
+    /// already known, its reverse surface index as one operation.
+    pub(crate) fn remember_window(&mut self, window: WlWindowId, record: WindowRecord) {
+        let surface = record.surface.wl_surface();
+        if self.windows.insert(window, record).is_some() {
+            // Ids are never reused in a session, but keep the index
+            // correct even if that allocator invariant is changed.
+            self.surface_windows.retain(|_, indexed| *indexed != window);
+            self.scene_index.forget(window);
+        }
+        if let Some(surface) = surface {
+            self.surface_windows.insert(surface.id(), window);
+        }
+    }
+
+    /// Resolves and, only when necessary, indexes a root learned after
+    /// record creation. That is the X11 lifecycle: the X window exists
+    /// before XWayland associates its `wl_surface`; the first surface
+    /// commit pays one fallback scan and insertion, while native and
+    /// subsequent X11 commits perform one read-only hash probe.
+    pub(crate) fn ensure_window_surface_index(&mut self, surface: &WlSurface) -> Option<WlWindowId> {
+        if let Some(window) = self.surface_windows.get(&surface.id()) {
+            return Some(*window);
+        }
+        let window = self
+            .windows
+            .iter()
+            .find(|(_, record)| record.surface.wl_surface().as_ref() == Some(surface))
+            .map(|(id, _)| *id)?;
+        self.surface_windows.insert(surface.id(), window);
+        Some(window)
+    }
+
+    /// Drops an XWayland index edge at the protocol object's exact
+    /// lifetime boundary. An X11 record can outlive this surface and
+    /// acquire a different association when it remaps.
+    ///
+    /// An xdg window is the opposite: its role-destruction callback is
+    /// authoritative for retiring the whole record, and clients which
+    /// disappear by closing their connection can make Wayland dispatch
+    /// `wl_surface.destroyed` before `xdg_toplevel.destroyed`. Keep that
+    /// edge alive for the later callback or it cannot find and retire
+    /// the record, leaving a permanently mapped ghost in the ledger.
+    pub(crate) fn forget_surface(&mut self, surface: &WlSurface) {
+        let id = surface.id();
+        let belongs_to_xdg = self
+            .surface_windows
+            .get(&id)
+            .and_then(|window| self.windows.get(window))
+            .is_some_and(|record| matches!(record.surface, ManagedSurface::Xdg(_)));
+        if !belongs_to_xdg {
+            self.surface_windows.remove(&id);
+        }
+    }
+
+    /// Resolves a `wl_surface` back to the managed window it belongs
+    /// to with one read-only hash probe. Native roots are indexed at
+    /// toplevel creation; the XWayland commit path explicitly calls
+    /// [`Self::ensure_window_surface_index`] for its one late-binding
+    /// lifecycle, so an ordinary miss never needs to scan the ledger.
+    pub(crate) fn window_for_surface(&self, surface: &WlSurface) -> Option<WlWindowId> {
+        self.surface_windows.get(&surface.id()).copied()
+    }
+
+    /// Indexes the ultimate toplevel/layer root of a newly tracked
+    /// popup. Nested menus therefore cost one root entry, not one entry
+    /// per submenu.
+    pub(crate) fn remember_popup_root(&mut self, root: WlSurface) {
+        self.popup_roots.insert(root.id(), root);
+    }
+
+    pub(crate) fn surface_has_popups(&self, root: &WlSurface) -> bool {
+        self.popup_roots.contains_key(&root.id())
+    }
+
+    /// Iterates a root's popups without touching Smithay's surface-tree
+    /// state on the ordinary no-popup path.
+    pub(crate) fn popups_for_surface<'a>(
+        &self,
+        root: &'a WlSurface,
+    ) -> impl Iterator<Item = (PopupKind, SPoint<i32, Logical>)> + 'a {
+        self.surface_has_popups(root)
+            .then(|| PopupManager::popups_for_surface(root))
+            .into_iter()
+            .flatten()
+    }
+
+    /// Drops roots whose last popup disappeared. Smithay owns popup
+    /// lifetime and exposes no destroy hook that says "this was the last
+    /// one", so reconciliation beside `PopupManager::cleanup` is the
+    /// authoritative collection edge.
+    pub(crate) fn reconcile_popup_roots(&mut self) {
+        self.popup_roots.retain(|_, root| {
+            root.is_alive() && PopupManager::popups_for_surface(root).next().is_some()
+        });
+    }
+
+    /// Slow truth used only when a rare mapping transition needs to
+    /// refresh [`Self::scene_index`] and by invariant tests. The
+    /// commit path must read the set instead of calling this: commits
+    /// are frequent; map, unmap and chrome changes are not.
+    pub(crate) fn managed_stack_exposes_window(&self, window: WlWindowId) -> bool {
+        self.stacking.iter().any(|entry| match entry {
+            StackEntry::Window(candidate) => *candidate == window,
+            StackEntry::Frame(frame) => self
+                .frames
+                .get(frame)
+                .is_some_and(|record| record.window == window && record.mapped),
+        })
+    }
+
+    /// Reconciles one managed window after a rare mapping or stack-kind
+    /// transition. Keeping the derived predicate here gives every
+    /// mutation site one operation to call and keeps the frequent read
+    /// path a single set lookup.
+    pub(crate) fn sync_managed_scene_index(&mut self, window: WlWindowId) {
+        let presented = self.windows.get(&window).is_some_and(|record| {
+            record.mapped
+                && record.window_type != WindowType::Unmanaged
+                && self.managed_stack_exposes_window(window)
+        });
+        if presented {
+            self.scene_index.mark_presented(window);
+        } else {
+            self.scene_index.mark_hidden(window);
+        }
+    }
+
+    /// Drops a window's ledger entry *and* the stacking slot a
+    /// frameless one holds.
+    ///
+    /// Every removal site has to go through here now that
+    /// [`StackEntry::Window`] exists. A framed window's slot belongs to
+    /// its frame and `Backend::destroy_decoration` prunes it during
+    /// `wm-core`'s teardown, but a client-decorated window's slot is
+    /// keyed by the window id itself, and nothing else would ever
+    /// collect it: the renderer and the hit-test would keep walking a
+    /// stale entry, find no record behind it, and skip — quietly
+    /// growing the stack by one dead slot per client-decorated window
+    /// the session ever opened.
+    pub(crate) fn forget_window(&mut self, window: WlWindowId) {
+        if let Some(record) = self.windows.remove(&window) {
+            if let Some(root) = record.surface.wl_surface() {
+                // A client is allowed to disappear while a resize
+                // configure is in flight. Such a root will never
+                // commit and become ready, so retire its grace record
+                // at the same lifecycle edge as its window.
+                self.popup_parent_resizes.retain(|resize| resize.root != root);
+                self.popup_roots.remove(&root.id());
+            }
+            self.mark_idle_policy_dirty();
+        }
+        self.surface_windows.retain(|_, indexed| *indexed != window);
+        self.scene_index.forget(window);
+        self.stacking.retain(|entry| !matches!(entry, StackEntry::Window(w) if *w == window));
+        // Same collection duty for the pending EWMH properties: keyed
+        // by window id, and nothing downstream would ever drain an
+        // entry whose window no longer resolves.
+        self.ewmh.prune_window(window);
+    }
+}
+
+/// Per-client data attached when a wayland client connects. Smithay's
+/// compositor protocol machinery requires each client to carry its
+/// `CompositorClientState`; the decoration flag rides along beside it.
+#[derive(Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
+    /// Output captures on the opt-in demo connection include capture controls.
+    /// Immutable and connection-local: disconnecting cannot leave a global mode on.
+    pub capture_overlays: bool,
+    /// Whether this client has bound
+    /// `org_kde_kwin_server_decoration_manager`.
+    ///
+    /// Load-bearing evidence, not a statistic: a GTK4 client that binds
+    /// the manager and then creates no decoration object for a toplevel
+    /// is declining this desktop's chrome for it, and telling that
+    /// apart from a client that never spoke at all is what keeps a
+    /// libadwaita headerbar from wearing our titlebar above it. See
+    /// `crate::decoration`.
+    ///
+    /// Per-client rather than a set on the backend so it cannot outlive
+    /// the client: `ClientData::disconnected` gets no access to the
+    /// compositor, so a set would have leaked one entry per client that
+    /// ever spoke this protocol. Atomic because the bind handler holds
+    /// only `&ClientState`.
+    pub kde_decoration_bound: std::sync::atomic::AtomicBool,
+    /// Present only for connections admitted by
+    /// `wp_security_context_v1`. Mutex-backed because Wayland global
+    /// filters receive only a shared client-data reference.
+    pub security_context: std::sync::Mutex<
+        Option<smithay::wayland::security_context::SecurityContext>,
+    >,
+    /// The peer's process id, recorded right after the connection is
+    /// admitted (`client_mesa::record_peer`). Global filters read it
+    /// from here because they run while the display holds its own lock:
+    /// asking the display for the peer credentials from inside a filter
+    /// takes that lock again and deadlocks the compositor on the first
+    /// `wl_registry` of the first client. Unset for in-process
+    /// connections, which then see no filtered global that needs it.
+    pub peer_pid: std::sync::OnceLock<i32>,
+}
+
+impl ClientState {
+    pub(crate) fn confined(
+        context: smithay::wayland::security_context::SecurityContext,
+    ) -> Self {
+        Self {
+            security_context: std::sync::Mutex::new(Some(context)),
+            ..Self::default()
+        }
+    }
+}
+
+pub(crate) fn client_is_confined(client: &smithay::reexports::wayland_server::Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .is_some_and(|data| data.security_context.lock().is_ok_and(|context| context.is_some()))
+}
+
+/// Capabilities that affect other clients belong to ordinary desktop helpers,
+/// not clients explicitly admitted through a sandbox security context. Keep
+/// this gate shared so capture, input injection, clipboard monitoring,
+/// window lists, workspace control and output/session management enforce the
+/// same boundary.
+///
+/// Deliberately left visible to confined clients: the ordinary application
+/// protocols, `ext_idle_notifier_v1` (a presence app's "away" status reveals
+/// only that the user is idle, which any focused window can already infer),
+/// and `zwp_keyboard_shortcuts_inhibit_manager_v1`, whose grants are gated
+/// separately. Classify each new global here rather than let it default.
+pub(crate) fn privileged_global_visible(
+    client: &smithay::reexports::wayland_server::Client,
+) -> bool {
+    !client_is_confined(client)
+}
+
+pub(crate) fn client_captures_overlays(client: &smithay::reexports::wayland_server::Client) -> bool {
+    privileged_global_visible(client)
+        && client.get_data::<ClientState>().is_some_and(|data| data.capture_overlays)
+}
+
+/// The security-context protocol's own recursively-confined-listener guard.
+/// Smithay requires this global to be hidden from clients created through a
+/// context, independently of the policy for every other privileged global.
+pub(crate) fn security_context_global_visible(
+    client: &smithay::reexports::wayland_server::Client,
+) -> bool {
+    !client_is_confined(client)
+}
+
+impl ClientData for ClientState {
+    fn initialized(&self, _client_id: ClientId) {}
+
+    /// Says why a client went away.
+    ///
+    /// This was an empty stub, and the silence cost real debugging
+    /// time: a client that vanishes mid-session is indistinguishable
+    /// from one that exited on purpose, so "the shell disappeared when
+    /// I closed a menu" had no first clue to follow at all — not even
+    /// whether the compositor had hung up or the client had walked
+    /// away. A protocol error carries the offending object and the
+    /// interface's own message, which is the difference between a
+    /// bisect and a read.
+    ///
+    /// Levels are chosen so a normal session stays quiet: a client
+    /// closing its own connection is the ordinary way programs exit
+    /// and is logged at debug, while a protocol error means *this
+    /// compositor* rejected something and killed the client for it,
+    /// which is a bug here until proven otherwise.
+    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
+        match reason {
+            DisconnectReason::ConnectionClosed => {
+                tracing::debug!(?client_id, "client closed its connection");
+            }
+            DisconnectReason::ProtocolError(error) => tracing::warn!(
+                ?client_id,
+                object = %error.object_interface,
+                object_id = error.object_id,
+                code = error.code,
+                message = %error.message,
+                "client killed for a protocol error"
+            ),
+        }
+    }
+}
+
+/// The one calloop data type — see the module docs for why everything
+/// must live on a single struct. Fields are `pub` (not `pub(crate)`)
+/// only where the re-exported API surface needs them; the protocol
+/// handler modules are in-crate and reach everything either way.
+/// Which graphics stack this session is driving. The two arms are the
+/// same desktop with different plumbing underneath: `Winit` renders
+/// into a window on somebody else's desktop (the development and
+/// preview mode), `Session` owns a DRM/KMS device, its outputs, and
+/// its input devices through libseat (the real login session). The
+/// scene they draw is one function, [`crate::renderer::build_scene`],
+/// so the choice never reaches anything visual.
+pub(crate) enum Graphics {
+    Winit(Box<WinitGraphicsBackend<GlesRenderer>>),
+    // Constructed by `session::init` once the DRM backend lands; the
+    // allow keeps the staged build warning-free until then.
+    #[allow(dead_code)]
+    Session(Box<crate::session::SessionGraphics>),
+}
+
+/// One output, as the graphics backend hands it to [`run`] before any
+/// wayland global exists: the `Output` with its mode already set, plus
+/// where it sits in the global coordinate space. The session backend
+/// produces one of these per connected connector; the nested backend
+/// produces exactly one, at the origin.
+pub(crate) struct OutputSetup {
+    pub output: Output,
+    /// Stable EDID description (`make model serial`) for matching
+    /// `monitor = desc:...` and persisting placement independently of
+    /// the connector port. `None` for nested/virtual outputs and
+    /// hardware whose EDID could not be read.
+    pub identity: Option<String>,
+    /// EDID serial kept separately because Smithay's
+    /// `PhysicalProperties` carries only make and model.
+    pub serial: String,
+    pub position: Point,
+    pub size: Size,
+    /// User-visible orientation. Kept separate from the nested
+    /// backend's `Flipped180` EGL correction.
+    pub transform: Transform,
+    /// Mode selected by a startup monitor rule, to be applied to KMS
+    /// before the `wl_output` global is published.
+    pub requested_mode: Option<usize>,
+    /// Every mode this output can drive, current/preferred first. One
+    /// entry on the nested backend (the host window has no modes to
+    /// offer); the connector's full EDID mode list on the session
+    /// backend. Carried so wlr-output-management can enumerate honest
+    /// alternatives instead of pretending the current mode is the only
+    /// one.
+    pub modes: Vec<Mode>,
+    pub powered: bool,
+    pub vrr_supported: bool,
+    /// Whether adaptive sync is allowed when the renderer proves this frame
+    /// is a direct-scanout fullscreen client.
+    pub vrr_requested: bool,
+    /// The DRM property's live value for the next commit.
+    pub vrr_enabled: bool,
+}
+
+
+/// What one output's connector says about itself: the EDID identity and
+/// the modes it can drive.
+///
+/// Mirrored onto [`WaylandBackend::monitor_outputs`] so the Hyprland IPC
+/// snapshot can report measured values instead of conventional ones.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MonitorOutput {
+    pub make: String,
+    pub model: String,
+    pub serial: String,
+    /// Current mode's refresh in millihertz; 0 when no real mode is
+    /// driven, which is what the wire layer turns into its fallback.
+    pub refresh_millihertz: u32,
+    /// wl_output transform number (0/1/2/3 for the rotations we
+    /// support), mirrored into the Hyprland compatibility snapshot.
+    pub transform: i32,
+    pub modes: Vec<MonitorMode>,
+    pub powered: bool,
+    pub vrr_supported: bool,
+    pub vrr_enabled: bool,
+}
+
+/// A parked output as the Hyprland IPC snapshot lists it under
+/// `monitors all`: its name, its EDID description and the hardware facts
+/// a driven output carries in [`MonitorOutput`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParkedMonitor {
+    pub name: String,
+    pub identity: Option<String>,
+    pub hardware: MonitorOutput,
+}
+
+/// A connected output outside the layout: no `wl_output` global, no
+/// entry in [`Compositor::outputs`], nothing positional. Everything
+/// needed to put it back is the [`OutputSetup`] hotplug adds an output
+/// from, kept here rather than rebuilt. The session backend keeps the
+/// connector's scanout state beside it (`session::park_output`).
+pub(crate) struct ParkedOutput {
+    pub setup: OutputSetup,
+}
+
+/// One output the compositor drives, everything the session needs to
+/// know about it in one place.
+///
+/// The order of [`Compositor::outputs`] is the contract: index 0 is the
+/// primary monitor, and the same index selects the matching entry in
+/// `Backend::monitors` and (on the session backend) in
+/// `SessionGraphics::outputs`. Nothing keys outputs by name, so nothing
+/// has to agree on one.
+pub(crate) struct OutputEntry {
+    pub output: Output,
+    pub identity: Option<String>,
+    pub serial: String,
+    /// Top-left corner in global compositor space. Every rect in the
+    /// ledger is global, so this is what the renderer subtracts to put
+    /// the one shared scene into this output's framebuffer.
+    pub position: Point,
+    pub size: Size,
+    pub transform: Transform,
+    /// This output's fractional UI scale — what fractional-scale-v1
+    /// tells clients on it, what `wl_output.scale` advertises the
+    /// ceiling of, and what `WaylandBackend::monitor_scales` mirrors
+    /// for the ledger's arithmetic. Starts at the session scale
+    /// (`advertise_scale` writes every entry); wlr-output-management
+    /// can then move one output's value on its own.
+    pub scale: f64,
+    /// The modes this output can drive — see [`OutputSetup::modes`].
+    pub modes: Vec<Mode>,
+    pub powered: bool,
+    pub vrr_supported: bool,
+    /// User/configuration policy; the renderer gates the live property further
+    /// to direct-scanout frames.
+    pub vrr_requested: bool,
+    pub vrr_enabled: bool,
+    /// Only the nested backend renders through this: the session
+    /// backend's `DrmCompositor` owns damage tracking per crtc itself.
+    /// It is built from the `Output`, so a resize of that output
+    /// retunes it with no work here.
+    pub damage_tracker: OutputDamageTracker,
+    /// Reusable storage for the nested backend's on-screen scene. The
+    /// element handles are cleared between frames while the vector's
+    /// allocation stays hot; offscreen captures intentionally keep
+    /// their one-shot storage separate.
+    pub scene_scratch: Vec<crate::renderer::SceneElement>,
+    /// The `wl_output` global clients bind to. Dropping the id does not
+    /// take the global down — that needs
+    /// `DisplayHandle::disable_global` — so this is held for the one
+    /// caller that passes it there: connector hot-unplug taking an
+    /// output safely back off the wire.
+    pub(crate) global: GlobalId,
+}
+
+impl OutputEntry {
+    /// Advertises one output to clients and prepares it for rendering.
+    pub(crate) fn new(setup: OutputSetup, display_handle: &DisplayHandle) -> Self {
+        let global = setup.output.create_global::<Compositor>(display_handle);
+        let damage_tracker = physical_damage_tracker(&setup.output, setup.size);
+        Self {
+            output: setup.output,
+            identity: setup.identity,
+            serial: setup.serial,
+            position: setup.position,
+            size: setup.size,
+            transform: setup.transform,
+            scale: 1.0,
+            modes: setup.modes,
+            powered: setup.powered,
+            vrr_supported: setup.vrr_supported,
+            vrr_requested: setup.vrr_requested,
+            vrr_enabled: setup.vrr_enabled,
+            damage_tracker,
+            scene_scratch: Vec::new(),
+            global,
+        }
+    }
+}
+
+/// A damage tracker for `output` pinned to scale 1, whatever scale the
+/// output advertises. Rebuilt (never `from_output`) on a mode change —
+/// see [`Compositor::on_output_resized`].
+///
+/// The pin is the whole reason advertising a real scale on the
+/// `wl_output` is safe, and it earns the space to say precisely why.
+/// What `OutputDamageTracker::render_output` reads from its mode source
+/// (smithay 0.7, `damage/mod.rs` + `output.rs`) is the mode size in
+/// physical pixels, the output's *fractional scale*, and its transform.
+/// The output rectangle it clips against is the physical mode size —
+/// that part is safe — but every element is asked for its rectangle
+/// through `Element::geometry(scale)` with that fractional scale, and
+/// both `MemoryRenderBufferRenderElement` and
+/// `WaylandSurfaceRenderElement` implement `geometry` as "my stored
+/// physical location, unchanged, with my *logical* size multiplied by
+/// the scale I was just passed" (`element/memory.rs`,
+/// `element/surface.rs`). A memory buffer's logical size is its pixel
+/// size divided by the buffer scale it was constructed with — 1 for
+/// every buffer this compositor makes, because the theme rasterizes in
+/// device pixels.
+///
+/// So the day `change_current_state(scale = 2)` was tried on the real
+/// 4K session with `from_output` trackers, every chrome element kept
+/// its device-pixel position and doubled in size: the 3840x2160
+/// wallpaper became a 7680x4320 element with only its top-left quarter
+/// inside the output, the dock's tiles grew out past the right edge
+/// and vanished, and the frames' titlebars painted at twice their
+/// width over the windows beside them. Mixed spaces, one multiply.
+///
+/// Pinning the tracker to 1.0 makes `geometry(1.0)` the identity on
+/// logical sizes: the compositor composes in physical pixels end to
+/// end, exactly as it did when the outputs said 1, and the advertised
+/// scale becomes what it should be — protocol metadata for clients,
+/// with the per-surface correction in `renderer::push_surface_tree`
+/// putting their scaled buffers back at 1 buffer pixel : 1 screen
+/// pixel. The session backend pins its `DrmCompositor`s the same way
+/// (`session::attach_output`); the two must never disagree.
+pub(crate) fn physical_damage_tracker(output: &Output, fallback_size: Size) -> OutputDamageTracker {
+    // `OutputDamageTracker` wants the untransformed framebuffer size;
+    // its transform turns that into the logical output rectangle for
+    // intersection. `OutputEntry::size` is already transformed for
+    // desktop layout, so feeding it here would swap portrait outputs a
+    // second time and render against the wrong framebuffer dimensions.
+    let size = output.current_mode().map_or_else(
+        || SSize::<i32, Physical>::from((fallback_size.w as i32, fallback_size.h as i32)),
+        |mode| mode.size,
+    );
+    OutputDamageTracker::new(
+        size,
+        1.0,
+        output.current_transform(),
+    )
+}
+
+/// Keep the actual scale for xdg-output's logical geometry. Smithay
+/// rounds only `wl_output.scale` up to its integer fallback, so older
+/// clients still render enough pixels to downsample crisply. Rounding
+/// the whole OutputScale instead made Omarchy clamp panels to a screen
+/// smaller than the layer-shell surface they were drawn inside.
+pub(crate) fn advertised_output_scale(scale: f32) -> OutputScale {
+    let scale = if scale.is_finite() && scale > 0.0 { scale.max(0.125) } else { 1.0 };
+    OutputScale::Fractional(f64::from(scale))
+}
+
+/// (Re-)advertises the session's UI scale on every output. smithay
+/// broadcasts the change to every bound `wl_output` (and its
+/// `xdg_output`) and clients follow with new buffers at the new scale;
+/// the damage trackers stay pinned at 1 (see
+/// [`physical_damage_tracker`]) so the compositor's own composition
+/// never hears about it.
+/// A session-wide scale change: every output's fractional scale moves
+/// to the session's (any per-output value wlr-output-management set is
+/// deliberately superseded — a config reload states the whole desktop's
+/// scale, and honoring half of it would leave no way to say "put
+/// everything back").
+fn advertise_scale(outputs: &mut [OutputEntry], scale: f32) {
+    let advertised = advertised_output_scale(scale);
+    for entry in outputs.iter_mut() {
+        entry.scale = scale.max(0.125) as f64;
+        entry.output.change_current_state(None, None, Some(advertised), None);
+    }
+}
+
+fn advertise_scales(outputs: &mut [OutputEntry], scales: &[f64]) {
+    for (entry, scale) in outputs.iter_mut().zip(scales.iter().copied()) {
+        entry.scale = scale.max(0.125);
+        entry.output.change_current_state(None, None, Some(advertised_output_scale(entry.scale as f32)), None);
+    }
+}
+
+/// Applies the supported, whole `monitor =` lines while real outputs
+/// and their EDID facts are available. Unsupported fields refuse their
+/// entire line so a disabled/mirrored request is never partly honored
+/// as only a scale, orientation, mode, or position change.
+pub(crate) fn apply_monitor_rules(
+    setups: &mut [OutputSetup],
+    rules: &[wm_config::hyprland::directive::Monitor],
+    scale_override: Option<f64>,
+) -> Vec<f64> {
+    apply_monitor_rules_preserving(setups, rules, scale_override, &HashMap::new())
+}
+
+/// A reload preserves the live setup and scale of connectors whose
+/// resolved rule did not change. They still occupy space when placing
+/// an automatic neighbor, but their runtime choices are not reapplied
+/// from configuration.
+fn apply_monitor_rules_preserving(
+    setups: &mut [OutputSetup],
+    rules: &[wm_config::hyprland::directive::Monitor],
+    scale_override: Option<f64>,
+    preserved_scales: &HashMap<String, f64>,
+) -> Vec<f64> {
+    // Both Hyprland and niri treat an omitted output scale as `auto`.
+    // Do the same: an explicit session scale is the common baseline;
+    // otherwise each output gets its own physical-DPI result. This is
+    // initialized before rules because an omitted rule, and an `auto`
+    // rule whose EDID is incomplete, need the same safe answer.
+    let mut scales = setups
+        .iter()
+        .map(|setup| {
+            preserved_scales.get(&setup.output.name()).copied().or(scale_override)
+                .map(|scale| scale.max(0.125))
+                .or_else(|| automatic_output_scale(&setup.output, setup.size))
+                .unwrap_or(1.0)
+        })
+        .collect::<Vec<_>>();
+    let mut auto_x = 0i32;
+    let mut changed_position = false;
+    for (index, setup) in setups.iter_mut().enumerate() {
+        if preserved_scales.contains_key(&setup.output.name()) {
+            auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+            continue;
+        }
+        let exact = rules.iter().rev().find(|rule| monitor_rule_matches(setup, &rule.output));
+        let catch_all = rules.iter().rev().find(|rule| rule.output.trim().is_empty());
+        let Some(rule) = exact.or(catch_all) else {
+            auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+            continue;
+        };
+        let transform = match monitor_intent(rule) {
+            Ok(MonitorIntent::Enabled { transform }) => transform,
+            // A disabled output is parked before this runs. One still
+            // here is the last output in the layout, kept by the
+            // never-zero rule: it takes the automatic slot and no
+            // geometry from a line that asked for none.
+            Ok(MonitorIntent::Disabled) => {
+                auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+                continue;
+            }
+            Ok(MonitorIntent::Mirror { source }) => {
+                tracing::warn!(
+                    output = %setup.output.name(),
+                    source,
+                    "hyprland-config: monitor line refused whole; mirroring an output is not supported yet"
+                );
+                auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+                continue;
+            }
+            Err(field) => {
+                tracing::warn!(
+                    output = %setup.output.name(),
+                    field,
+                    "hyprland-config: monitor line refused whole because this field is unsupported"
+                );
+                auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+                continue;
+            }
+        };
+
+        let mode = rule.mode.trim();
+        let Some(mode_index) = resolve_monitor_mode(&setup.output, &setup.modes, mode) else {
+            let advertised = setup
+                .modes
+                .iter()
+                .map(|mode| format!("{}x{}@{:.3}", mode.size.w, mode.size.h, f64::from(mode.refresh) / 1000.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                output = %setup.output.name(),
+                mode,
+                advertised,
+                "hyprland-config: monitor line refused whole; requested mode is not advertised"
+            );
+            auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+            continue;
+        };
+        let selected_mode = setup.modes[mode_index];
+        let transformed = transform.transform_size(selected_mode.size);
+        let new_size = Size::new(transformed.w.max(0) as u32, transformed.h.max(0) as u32);
+
+        let position = rule.position.trim();
+        let new_position = if position.is_empty() || position.eq_ignore_ascii_case("auto") {
+            Point::new(auto_x, 0)
+        } else if let Some(point) = parse_monitor_position(position) {
+            point
+        } else {
+            tracing::warn!(
+                output = %setup.output.name(),
+                position,
+                "hyprland-config: monitor line refused whole; position must be auto or XxY"
+            );
+            auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+            continue;
+        };
+
+        let requested_scale = rule.scale.trim();
+        let scale = if requested_scale.is_empty() {
+            scales[index]
+        } else if requested_scale.eq_ignore_ascii_case("auto") {
+            automatic_output_scale(&setup.output, new_size).unwrap_or(scales[index])
+        } else {
+            match requested_scale.parse::<f64>() {
+                Ok(scale) if scale.is_finite() && (0.5..=4.0).contains(&scale) => scale,
+                _ => {
+                    tracing::warn!(
+                        output = %setup.output.name(),
+                        scale = requested_scale,
+                        "hyprland-config: monitor line refused whole; scale must be auto or 0.5 through 4"
+                    );
+                    auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+                    continue;
+                }
+            }
+        };
+        setup.size = new_size;
+        setup.position = new_position;
+        setup.transform = transform;
+        setup.requested_mode = Some(mode_index);
+        changed_position = true;
+        auto_x = auto_x.max(setup.position.x.saturating_add(setup.size.w as i32));
+        scales[index] = scale;
+        tracing::info!(
+            output = %setup.output.name(),
+            x = setup.position.x,
+            y = setup.position.y,
+            scale,
+            transform = transform_number(transform),
+            mode = %format!("{}x{}@{:.3}", selected_mode.size.w, selected_mode.size.h, f64::from(selected_mode.refresh) / 1000.0),
+            "hyprland-config: monitor line applied"
+        );
+    }
+    let connectors = setups.iter().map(|setup| setup.output.name()).collect::<Vec<_>>().join(", ");
+    let descriptions = setups
+        .iter()
+        .filter_map(|setup| setup.identity.as_deref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for rule in rules {
+        let selector = rule.output.trim();
+        if selector.is_empty() || setups.iter().any(|setup| monitor_rule_matches(setup, selector)) {
+            continue;
+        }
+        if selector.starts_with("desc:") {
+            tracing::warn!(
+                monitor = selector,
+                connected = %connectors,
+                descriptions = %if descriptions.is_empty() { "none (EDID unavailable)" } else { &descriptions },
+                "hyprland-config: monitor description matched no connected output"
+            );
+        } else {
+            tracing::warn!(
+                monitor = selector,
+                connected = %connectors,
+                "hyprland-config: monitor name matched no connected output"
+            );
+        }
+    }
+    if changed_position {
+        let min_x = setups.iter().map(|setup| setup.position.x).min().unwrap_or(0);
+        let min_y = setups.iter().map(|setup| setup.position.y).min().unwrap_or(0);
+        for setup in setups {
+            setup.position.x -= min_x;
+            setup.position.y -= min_y;
+        }
+    }
+    scales
+}
+
+/// Hyprland's stable selector is the exact human-readable EDID
+/// description printed by `hyprctl monitors`: `make model serial`.
+/// Connector matching remains available for configs that intentionally
+/// target a particular port.
+fn monitor_rule_matches(setup: &OutputSetup, selector: &str) -> bool {
+    selector_matches(&setup.output.name(), setup.identity.as_deref(), selector)
+}
+
+fn selector_matches(name: &str, identity: Option<&str>, selector: &str) -> bool {
+    let selector = selector.trim();
+    if let Some(description) = selector.strip_prefix("desc:") {
+        let description = description.trim();
+        return !description.is_empty() && identity == Some(description);
+    }
+    selector == name
+}
+
+/// The monitor rule that applies to one connector: the last exact match
+/// by name or description, else the last catch-all `monitor=,…` line —
+/// the precedence [`apply_monitor_rules`] uses, shared so the startup,
+/// hotplug and reload paths cannot resolve the same line differently.
+pub(crate) fn resolve_monitor_rule<'a>(
+    name: &str,
+    identity: Option<&str>,
+    rules: &'a [wm_config::hyprland::directive::Monitor],
+) -> Option<&'a wm_config::hyprland::directive::Monitor> {
+    rules
+        .iter()
+        .rev()
+        .find(|rule| selector_matches(name, identity, &rule.output))
+        .or_else(|| rules.iter().rev().find(|rule| rule.output.trim().is_empty()))
+}
+
+/// Whether a connector's rule takes it out of the layout.
+fn rule_disables(name: &str, identity: Option<&str>, rules: &[wm_config::hyprland::directive::Monitor]) -> bool {
+    resolve_monitor_rule(name, identity, rules).is_some_and(|rule| matches!(monitor_intent(rule), Ok(MonitorIntent::Disabled)))
+}
+
+/// Which of `setups` the rules take out of the layout, as ascending
+/// indices, with `others` outputs already in the layout that stay.
+/// Never all of them: the desktop is never without an output, so when
+/// nothing else stays the first is kept and the log says so. Startup
+/// calls this with `others == 0` over every connected output; hotplug
+/// with the outputs that survive the unplug.
+pub(crate) fn disabled_by_rules(
+    setups: &[OutputSetup],
+    rules: &[wm_config::hyprland::directive::Monitor],
+    others: usize,
+) -> Vec<usize> {
+    let mut disabled: Vec<usize> = setups
+        .iter()
+        .enumerate()
+        .filter(|(_, setup)| rule_disables(&setup.output.name(), setup.identity.as_deref(), rules))
+        .map(|(index, _)| index)
+        .collect();
+    if others == 0 && !setups.is_empty() && disabled.len() == setups.len() {
+        let kept = disabled.remove(0);
+        tracing::warn!(
+            output = %setups[kept].output.name(),
+            "hyprland-config: every connected output is disabled by a monitor rule; keeping this one, the desktop is never without an output"
+        );
+    }
+    disabled
+}
+
+/// The connectors — driven or parked — whose resolved monitor rule
+/// differs from the one last applied, which is what a reload acts on.
+/// Every other connector is left exactly as it is: a save of an
+/// unrelated key, or a runtime disable the rule never asked for, must
+/// not cost a modeset or move an output.
+fn changed_monitor_rules<'a>(
+    connectors: impl Iterator<Item = (String, Option<&'a str>)>,
+    rules: &[wm_config::hyprland::directive::Monitor],
+    applied: &HashMap<String, Option<wm_config::hyprland::directive::Monitor>>,
+) -> Vec<String> {
+    connectors
+        .filter(|(name, identity)| {
+            let now = resolve_monitor_rule(name, *identity, rules);
+            applied.get(name).is_none_or(|last| last.as_ref() != now)
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Shifts a layout so its top-left corner sits at the origin. Only the
+/// outputs whose rule set a position are normalized inside
+/// [`apply_monitor_rules`]; when the output at the origin leaves — a
+/// laptop panel disabled with the dock to its right — the survivors
+/// keep their coordinates and the desktop would start at x = 1920.
+fn normalize_setups(setups: &mut [OutputSetup]) {
+    let min_x = setups.iter().map(|setup| setup.position.x).min().unwrap_or(0);
+    let min_y = setups.iter().map(|setup| setup.position.y).min().unwrap_or(0);
+    for setup in setups {
+        setup.position.x -= min_x;
+        setup.position.y -= min_y;
+    }
+}
+
+const MODE_REFRESH_TOLERANCE_MHZ: i32 = 1_000;
+
+/// EDID refresh values are measured millihertz and routinely differ
+/// from their marketing integer by one or two millihertz. Match the
+/// nearest advertised timing, but never round a request to a visibly
+/// different refresh rate.
+pub(crate) fn refresh_matches(advertised: i32, requested: i32) -> bool {
+    requested == 0 || advertised.abs_diff(requested) <= MODE_REFRESH_TOLERANCE_MHZ as u32
+}
+
+pub(crate) fn resolve_monitor_mode(output: &Output, modes: &[Mode], request: &str) -> Option<usize> {
+    if modes.is_empty() {
+        return None;
+    }
+    let request = request.trim().to_ascii_lowercase();
+    let preferred = output.preferred_mode().unwrap_or(modes[0]);
+    let preferred_index = || {
+        modes
+            .iter()
+            .position(|mode| mode.size == preferred.size && mode.refresh == preferred.refresh)
+            .unwrap_or(0)
+    };
+    if request.is_empty() || request == "preferred" {
+        return Some(preferred_index());
+    }
+    if request == "highrr" {
+        return modes
+            .iter()
+            .enumerate()
+            .filter(|(_, mode)| mode.size == preferred.size)
+            .max_by_key(|(_, mode)| mode.refresh)
+            .map(|(index, _)| index);
+    }
+    if request == "highres" {
+        return modes
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, mode)| (i64::from(mode.size.w) * i64::from(mode.size.h), mode.refresh))
+            .map(|(index, _)| index);
+    }
+
+    let (size_part, refresh_part) = request.split_once('@').map_or((request.as_str(), None), |(size, rate)| {
+        (size, Some(rate))
+    });
+    let (width, height) = if size_part == "preferred" {
+        (preferred.size.w, preferred.size.h)
+    } else {
+        let (width, height) = size_part.split_once('x')?;
+        (width.parse::<i32>().ok()?, height.parse::<i32>().ok()?)
+    };
+    let requested_refresh = refresh_part.and_then(|rate| rate.parse::<f64>().ok()).and_then(|rate| {
+        (rate.is_finite() && rate > 0.0 && rate <= f64::from(i32::MAX) / 1000.0)
+            .then_some((rate * 1000.0).round() as i32)
+    });
+    if refresh_part.is_some() && requested_refresh.is_none() {
+        return None;
+    }
+    let candidate = modes
+        .iter()
+        .enumerate()
+        .filter(|(_, mode)| mode.size.w == width && mode.size.h == height)
+        .min_by_key(|(_, mode)| requested_refresh.map_or(i32::MAX - mode.refresh, |rate| mode.refresh.abs_diff(rate) as i32));
+    match (candidate, requested_refresh) {
+        (Some((index, mode)), Some(rate)) if refresh_matches(mode.refresh, rate) => Some(index),
+        (Some((index, _)), None) => Some(index),
+        _ => None,
+    }
+}
+
+/// What one `monitor =` line asks of its output, beyond mode, position
+/// and scale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MonitorIntent {
+    /// In the layout, at this orientation.
+    Enabled { transform: Transform },
+    /// Out of the layout: conf `monitor = NAME, disable`, Lua
+    /// `hl.monitor({ output = NAME, disabled = true })`.
+    Disabled,
+    /// A copy of another output. Refused until mirroring exists
+    /// (<https://github.com/iconidentify/chonkstep/issues/186>).
+    Mirror { source: String },
+}
+
+/// Reads the whole of a monitor line's intent, refusing any field it
+/// does not know as it did before: half a line is never applied.
+///
+/// `1`/`3` map directly onto Smithay's `_90`/`_270`. The rendered
+/// direction still needs native DRM validation; the nested test backend
+/// refuses non-normal transforms. See the outstanding hardware check in
+/// <https://github.com/iconidentify/chonkstep/issues/144>.
+pub(crate) fn monitor_intent(rule: &wm_config::hyprland::directive::Monitor) -> Result<MonitorIntent, &str> {
+    let mode = rule.mode.trim();
+    if mode.eq_ignore_ascii_case("disable") || mode.eq_ignore_ascii_case("disabled") {
+        return Ok(MonitorIntent::Disabled);
+    }
+    if mode.eq_ignore_ascii_case("mirror") {
+        return Ok(MonitorIntent::Mirror { source: rule.position.trim().to_string() });
+    }
+    let mut transform = Transform::Normal;
+    let mut disabled = false;
+    let mut mirror = None;
+    let mut extra = rule.extra.iter();
+    while let Some(key) = extra.next() {
+        let Some(value) = extra.next().map(|value| value.trim()) else {
+            return Err(key.as_str());
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "transform" => {
+                transform = match value {
+                    "0" => Transform::Normal,
+                    "1" => Transform::_90,
+                    "2" => Transform::_180,
+                    "3" => Transform::_270,
+                    _ => return Err(value),
+                }
+            }
+            // The Lua reader spells a boolean `on`/`off`; a conf line
+            // written by hand says `true`/`false`.
+            "disabled" | "disable" => match value.to_ascii_lowercase().as_str() {
+                "true" | "on" | "yes" | "1" => disabled = true,
+                "false" | "off" | "no" | "0" => {}
+                _ => return Err(value),
+            },
+            "mirror" => mirror = Some(value.to_string()),
+            _ => return Err(key.as_str()),
+        }
+    }
+    if disabled {
+        Ok(MonitorIntent::Disabled)
+    } else if let Some(source) = mirror {
+        Ok(MonitorIntent::Mirror { source })
+    } else {
+        Ok(MonitorIntent::Enabled { transform })
+    }
+}
+
+pub(crate) fn transform_number(transform: Transform) -> i32 {
+    match transform {
+        Transform::Normal => 0,
+        Transform::_90 => 1,
+        Transform::_180 => 2,
+        Transform::_270 => 3,
+        Transform::Flipped => 4,
+        Transform::Flipped90 => 5,
+        Transform::Flipped180 => 6,
+        Transform::Flipped270 => 7,
+    }
+}
+
+/// Mirrors a DRM connector delta into every positional output ledger.
+/// Session outputs have already been inserted/removed when this is
+/// called; this half owns protocol globals, monitor policy, shell
+/// resize, and the index-bearing layer/lock records.
+/// Where an index into `Compositor::outputs` points once entry `removed`
+/// has left: nowhere for the removed entry itself, one lower for every
+/// later one.
+fn reindex_after_removal(output: Option<usize>, removed: usize) -> Option<usize> {
+    match output {
+        Some(at) if at == removed => None,
+        Some(at) if at > removed => Some(at - 1),
+        other => other,
+    }
+}
+
+/// Where `output` sits in `outputs`, by identity, or `None` once it has
+/// left. The pure half of [`Compositor::output_index_of`], taking any
+/// list of outputs so a ledger's tests can drive it without a
+/// compositor.
+pub(crate) fn output_index_in<'a>(
+    outputs: impl IntoIterator<Item = &'a Output>,
+    output: &smithay::output::WeakOutput,
+) -> Option<usize> {
+    let output = output.upgrade()?;
+    outputs.into_iter().position(|candidate| *candidate == output)
+}
+
+/// The monitor rules and scale override the running session holds, from
+/// its last successful load, reload or Hyprland-file follow. Every
+/// output change reads them from here rather than from the file: a
+/// `config.toml` that stopped parsing must not replace every rule with
+/// the defaults, and an edit nobody reloaded must wait for the reload.
+fn session_rules(comp: &Compositor) -> (Vec<wm_config::hyprland::directive::Monitor>, Option<f64>) {
+    let session = comp.shell.session_state();
+    (session.monitor_rules.clone(), session.scale_override.map(f64::from))
+}
+
+/// An [`OutputSetup`] describing a driven output as it stands, the form
+/// [`apply_monitor_rules`] lays out and a parked output is kept in.
+fn setup_from_entry(entry: &OutputEntry) -> OutputSetup {
+    OutputSetup {
+        output: entry.output.clone(),
+        identity: entry.identity.clone(),
+        serial: entry.serial.clone(),
+        position: entry.position,
+        size: entry.size,
+        transform: entry.transform,
+        requested_mode: None,
+        modes: entry.modes.clone(),
+        powered: entry.powered,
+        vrr_supported: entry.vrr_supported,
+        vrr_requested: entry.vrr_requested,
+        vrr_enabled: entry.vrr_enabled,
+    }
+}
+
+/// Remembers, per connector, the monitor rule the layout was last built
+/// from, so a reload can act on the connectors whose rule changed and
+/// leave the rest alone. Rebuilt whole from the connectors present so an
+/// unplugged one leaves no stale record.
+fn record_applied_monitor_rules(comp: &mut Compositor, rules: &[wm_config::hyprland::directive::Monitor]) {
+    comp.applied_monitor_rules = comp
+        .outputs
+        .iter()
+        .map(|entry| (entry.output.name(), entry.identity.as_deref()))
+        .chain(comp.parked_outputs.iter().map(|parked| (parked.setup.output.name(), parked.setup.identity.as_deref())))
+        .map(|(name, identity)| {
+            let rule = resolve_monitor_rule(&name, identity, rules).cloned();
+            (name, rule)
+        })
+        .collect();
+}
+
+/// Mirrors a DRM connector delta into the compositor. Session outputs
+/// have already been inserted/removed when this is called. A newly
+/// plugged connector whose monitor rule disables it is parked here,
+/// before it ever gets a `wl_output`, so a docked laptop's closed panel
+/// coming back from a rescan lands outside the layout as it did at
+/// startup. Everything else is [`apply_output_change`].
+pub(crate) fn apply_connector_hotplug(
+    comp: &mut Compositor,
+    removed: &[usize],
+    added: Vec<OutputSetup>,
+) {
+    let (rules, _) = session_rules(comp);
+    let surviving = comp.outputs.len() - removed.iter().filter(|&&index| index < comp.outputs.len()).count();
+    let park = disabled_by_rules(&added, &rules, surviving);
+    let mut added: Vec<Option<OutputSetup>> = added.into_iter().map(Some).collect();
+    // The session backend already holds the added outputs after the
+    // survivors, so `added[j]` sits at session index `surviving + j`
+    // until one is parked; walking down keeps every lower index valid.
+    for j in (0..added.len()).rev() {
+        if !park.contains(&j) {
+            continue;
+        }
+        match crate::session::park_output(&mut comp.graphics, surviving + j) {
+            Ok(()) => {
+                let Some(setup) = added[j].take() else { continue };
+                tracing::info!(output = %setup.output.name(), "hyprland-config: monitor line disables this output; parked as it was plugged in");
+                comp.parked_outputs.push(ParkedOutput { setup });
+            }
+            Err(error) => {
+                let name = added[j].as_ref().map(|setup| setup.output.name()).unwrap_or_default();
+                tracing::warn!(output = %name, %error, "could not park the plugged output; it stays in the layout");
+            }
+        }
+    }
+    apply_output_change(comp, removed, added.into_iter().flatten().collect(), None);
+}
+
+/// Takes one output out of the layout: the session backend clears its
+/// crtc and keeps the connector, the compositor keeps its [`OutputSetup`]
+/// and runs the unplug half of the hotplug path — global withdrawn,
+/// layer and lock records reindexed, windows rescued, rules reapplied
+/// to what remains. The last output in the layout is never parked: the
+/// desktop is never without an output, and a caller that asks is told
+/// so and logged.
+pub(crate) fn park_output(comp: &mut Compositor, index: usize) -> Result<(), String> {
+    let Some(entry) = comp.outputs.get(index) else {
+        return Err(format!("no output at index {index}"));
+    };
+    let name = entry.output.name();
+    if comp.outputs.len() <= 1 {
+        tracing::warn!(output = %name, "refusing to disable the last output in the layout");
+        return Err(format!("refusing to disable {name}: it is the last output in the layout"));
+    }
+    crate::session::park_output(&mut comp.graphics, index)?;
+    let setup = setup_from_entry(&comp.outputs[index]);
+    comp.parked_outputs.push(ParkedOutput { setup });
+    apply_output_change(comp, &[index], Vec::new(), None);
+    tracing::info!(output = %name, outputs = comp.outputs.len(), parked = comp.parked_outputs.len(), "output disabled: out of the layout");
+    Ok(())
+}
+
+/// Puts a parked output back through the plug half of the hotplug
+/// path, at the end of the layout, where the rules the session holds
+/// place it. While the session is locked that path presents the locked
+/// scene on the returning output before any client content, as it does
+/// for a plugged connector.
+pub(crate) fn unpark_output(comp: &mut Compositor, name: &str) -> Result<(), String> {
+    let at = comp
+        .parked_outputs
+        .iter()
+        .position(|parked| parked.setup.output.name() == name)
+        .ok_or_else(|| format!("{name} is not a disabled output"))?;
+    let fresh = crate::session::unpark_output(&mut comp.graphics, name)?;
+    let parked = comp.parked_outputs.remove(at);
+    let mut setup = fresh.unwrap_or(parked.setup);
+    setup.powered = true;
+    apply_output_change(comp, &[], vec![setup], None);
+    tracing::info!(output = %name, outputs = comp.outputs.len(), parked = comp.parked_outputs.len(), "output enabled: back in the layout");
+    Ok(())
+}
+
+/// Forgets parked outputs whose connectors were unplugged: no layout
+/// work, only the records that listed them as disabled.
+pub(crate) fn drop_parked_outputs(comp: &mut Compositor, names: &[String]) {
+    comp.parked_outputs.retain(|parked| !names.contains(&parked.setup.output.name()));
+    for name in names {
+        comp.applied_monitor_rules.remove(name);
+    }
+    comp.sync_monitor_outputs();
+    comp.output_mgmt.mark_dirty();
+    comp.hyprland_state_dirty = true;
+}
+
+/// Brings the outputs into line with the monitor rules an explicit
+/// reload resolved, touching only the connectors whose rule changed:
+/// those a changed rule now disables are parked, those a changed rule
+/// no longer disables come back, and one pass of the hotplug tail
+/// re-lays the layout by the new rules. Nothing changed means nothing
+/// happens — no modeset, no output moved — which is what lets a reload
+/// after a save of an unrelated key cost the desk nothing.
+pub(crate) fn reconcile_monitor_rules(comp: &mut Compositor) {
+    let (rules, _) = session_rules(comp);
+    let changed = changed_monitor_rules(
+        comp.outputs
+            .iter()
+            .map(|entry| (entry.output.name(), entry.identity.as_deref()))
+            .chain(comp.parked_outputs.iter().map(|parked| (parked.setup.output.name(), parked.setup.identity.as_deref()))),
+        &rules,
+        &comp.applied_monitor_rules,
+    );
+    if changed.is_empty() {
+        tracing::debug!("reload changed no monitor rule; outputs left as they are");
+        return;
+    }
+    // Enables first, so a reload that swaps which output is disabled
+    // never meets the last-output refusal on the way.
+    let returning: Vec<String> = comp
+        .parked_outputs
+        .iter()
+        .filter(|parked| changed.contains(&parked.setup.output.name()))
+        .filter(|parked| !rule_disables(&parked.setup.output.name(), parked.setup.identity.as_deref(), &rules))
+        .map(|parked| parked.setup.output.name())
+        .collect();
+    let mut added = Vec::new();
+    for name in &returning {
+        let Some(at) = comp.parked_outputs.iter().position(|parked| parked.setup.output.name() == *name) else { continue };
+        match crate::session::unpark_output(&mut comp.graphics, name) {
+            Ok(fresh) => {
+                let parked = comp.parked_outputs.remove(at);
+                let mut setup = fresh.unwrap_or(parked.setup);
+                setup.powered = true;
+                added.push(setup);
+            }
+            Err(error) => tracing::warn!(output = %name, %error, "reload could not re-enable this output"),
+        }
+    }
+    let leaving: Vec<usize> = comp
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| changed.contains(&entry.output.name()))
+        .filter(|(_, entry)| rule_disables(&entry.output.name(), entry.identity.as_deref(), &rules))
+        .map(|(index, _)| index)
+        .collect();
+    let mut removed = Vec::new();
+    for index in leaving.into_iter().rev() {
+        let name = comp.outputs[index].output.name();
+        if comp.outputs.len() - removed.len() + added.len() <= 1 {
+            tracing::warn!(output = %name, "refusing to disable the last output in the layout");
+            continue;
+        }
+        match crate::session::park_output(&mut comp.graphics, index) {
+            Ok(()) => {
+                let setup = setup_from_entry(&comp.outputs[index]);
+                comp.parked_outputs.push(ParkedOutput { setup });
+                removed.push(index);
+            }
+            Err(error) => tracing::warn!(output = %name, %error, "reload could not disable this output"),
+        }
+    }
+    let (parked, unparked) = (removed.len(), added.len());
+    apply_output_change(comp, &removed, added, Some(&changed));
+    tracing::info!(
+        changed = %changed.join(", "),
+        parked,
+        unparked,
+        "monitor rules reconciled after reload"
+    );
+}
+
+/// Mirrors an output delta into every positional ledger: session
+/// outputs have already been inserted/removed when this is called; this
+/// half owns protocol globals, monitor policy, shell resize, and the
+/// index-bearing layer/lock records. Connector hotplug, parking and
+/// unparking, and a reload's reconcile all end here.
+fn apply_output_change(
+    comp: &mut Compositor,
+    removed: &[usize],
+    added: Vec<OutputSetup>,
+    changed_rules: Option<&[String]>,
+) {
+    // Retire gesture-owned output geometry before changing any output indices.
+    crate::input::gestures::cancel(comp);
+    comp.dmabuf.invalidate();
+    comp.surface_outputs.reset_feedback(comp.dmabuf.default_feedback());
+    comp.wm.backend_mut().native_frame_stats = crate::session::native_frame_stats(&comp.graphics);
+    let mut departed = Vec::new();
+    for &index in removed {
+        if index >= comp.outputs.len() {
+            continue;
+        }
+        let geometry = Rect::new(comp.outputs[index].position, comp.outputs[index].size);
+        let name = comp.outputs[index].output.name();
+        let identity = comp.outputs[index].identity.clone();
+        departed.push((geometry, name, identity));
+        let entry = comp.outputs.remove(index);
+        comp.surface_outputs.remove_output(&entry.output);
+        // Registry clients see global_remove immediately. Keep the disabled
+        // server-side record rather than freeing it in the same dispatch,
+        // which avoids the bind-vs-removal race documented by wayland-server.
+        comp.display_handle.disable_global::<Compositor>(entry.global);
+
+        let backend = comp.wm.backend_mut();
+        backend.layers.iter_mut().for_each(|layer| {
+            if layer.output == index {
+                layer.output = 0;
+            } else if layer.output > index {
+                layer.output -= 1;
+            }
+        });
+        // A lock surface on the removed output stays its client's until
+        // the client destroys it; it simply names no output any more.
+        for surface in &mut backend.lock_surfaces {
+            surface.output = reindex_after_removal(surface.output, index);
+        }
+    }
+
+    for setup in added {
+        comp.outputs.push(OutputEntry::new(setup, &comp.display_handle));
+    }
+
+    // Place the new connector set by the monitor rules the running
+    // session already holds (see `session_rules`).
+    let (monitor_rules, scale_override) = session_rules(comp);
+    let mut setups: Vec<OutputSetup> = comp.outputs.iter().map(setup_from_entry).collect();
+    let preserved_scales = comp.outputs.iter()
+        .filter(|entry| changed_rules.is_some_and(|changed| !changed.contains(&entry.output.name())))
+        .map(|entry| (entry.output.name(), entry.scale))
+        .collect();
+    let scales = apply_monitor_rules_preserving(&mut setups, &monitor_rules, scale_override, &preserved_scales);
+    normalize_setups(&mut setups);
+    crate::session::apply_output_setups(&mut comp.graphics, &mut setups);
+    for ((entry, setup), scale) in comp.outputs.iter_mut().zip(setups).zip(scales) {
+        entry.position = setup.position;
+        entry.size = setup.size;
+        entry.transform = setup.transform;
+        entry.scale = scale;
+        entry.output.change_current_state(
+            None,
+            matches!(comp.graphics, Graphics::Session(_)).then_some(entry.transform),
+            Some(advertised_output_scale(scale as f32)),
+            Some((entry.position.x, entry.position.y).into()),
+        );
+    }
+
+    let layout: Vec<(Point, Size)> = comp.outputs.iter().map(|entry| (entry.position, entry.size)).collect();
+    crate::session::sync_positions(&mut comp.graphics, &layout);
+    let monitors: Vec<MonitorInfo> = comp
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| MonitorInfo {
+            geometry: Rect::new(entry.position, entry.size),
+            name: entry.output.name(),
+            identity: entry.identity.clone(),
+            primary: index == 0,
+        })
+        .collect();
+    let monitor_scales: Vec<f64> = comp.outputs.iter().map(|entry| entry.scale).collect();
+    {
+        let backend = comp.wm.backend_mut();
+        backend.monitors = monitors;
+        backend.monitor_scales = monitor_scales;
+        backend.output_size = union_size(&backend.monitors);
+        backend.pending_resize = Some(backend.output_size);
+        backend.mark_damaged();
+        backend.layer_layout_dirty = true;
+        backend.idle_policy_dirty = true;
+    }
+    // The IPC mirror of each output's identity and mode list is indexed
+    // like `monitors`; left alone it would describe the pre-hotplug set,
+    // so `monitors -j` would list another output's modes and `hl.monitor`
+    // would check a request against them.
+    comp.sync_monitor_outputs();
+    if comp.wm.spaces_mode() && comp.wm.interaction_config().separate_spaces {
+        comp.wm.reconcile_display_spaces();
+    } else {
+        for (geometry, name, identity) in &departed {
+            comp.wm.rescue_departed_output(*geometry, name, identity.as_deref());
+        }
+        comp.wm.restore_evacuated_clients();
+    }
+    crate::input::reconcile_pointer_after_output_change(comp);
+    crate::gamma::outputs_changed(comp);
+    crate::output_power::outputs_changed(comp);
+    comp.output_mgmt.mark_dirty();
+    comp.session_lock.mark_dirty();
+    comp.layer_shell.needs_arrange = true;
+    comp.hyprland_state_dirty = true;
+    comp.foreign_toplevel_dirty = true;
+    record_applied_monitor_rules(comp, &monitor_rules);
+    tracing::info!(outputs = comp.outputs.len(), parked = comp.parked_outputs.len(), "connector hotplug reconciled across the desktop");
+}
+
+pub(crate) fn parse_monitor_position(value: &str) -> Option<Point> {
+    let (x, y) = value.split_once(['x', 'X'])?;
+    Some(Point::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+fn automatic_output_scale(output: &Output, size: Size) -> Option<f64> {
+    let physical = output.physical_properties().size;
+    if physical.w <= 0 || physical.h <= 0 {
+        return internal_panel_scale(output.name().as_str(), size);
+    }
+    let dpi_x = size.w as f64 * 25.4 / physical.w as f64;
+    let dpi_y = size.h as f64 * 25.4 / physical.h as f64;
+    let dpi = dpi_x.max(dpi_y);
+    Some(if dpi >= 200.0 {
+        2.0
+    } else if dpi >= 140.0 {
+        1.5
+    } else {
+        1.0
+    })
+}
+
+/// Conservative fallback for laptop panels whose DRM driver does not
+/// publish physical millimetres. This is common on Apple Silicon's DCP
+/// path: the 2560x1600 M1 Air panel is unmistakably HiDPI, but a zero
+/// millimetre size previously made `auto` collapse to 1x.
+///
+/// External displays deliberately get no resolution-only guess: a 4K
+/// television and a 4K desktop monitor can need very different scales.
+/// Internal connector names are stable kernel ABI (`eDP`, `LVDS`, or
+/// `DSI`), and the thresholds keep ordinary 1080p laptop panels at 1x.
+fn internal_panel_scale(name: &str, size: Size) -> Option<f64> {
+    let internal = name.starts_with("eDP-") || name.starts_with("LVDS-") || name.starts_with("DSI-");
+    if !internal {
+        return None;
+    }
+    let short = size.w.min(size.h);
+    let long = size.w.max(size.h);
+    Some(if short >= 1600 && long >= 2400 {
+        2.0
+    } else if short >= 1200 && long >= 1900 {
+        1.5
+    } else {
+        1.0
+    })
+}
+
+/// The hardware facts of one output as the IPC snapshot reports them,
+/// read straight off the `Output` that answers `wl_output`.
+fn monitor_output_of(
+    output: &Output,
+    serial: &str,
+    transform: Transform,
+    modes: &[Mode],
+    powered: bool,
+    vrr_supported: bool,
+    vrr_enabled: bool,
+) -> MonitorOutput {
+    let properties = output.physical_properties();
+    MonitorOutput {
+        make: properties.make,
+        model: properties.model,
+        serial: serial.to_string(),
+        refresh_millihertz: output.current_mode().and_then(|mode| u32::try_from(mode.refresh).ok()).unwrap_or(0),
+        transform: transform_number(transform),
+        modes: modes
+            .iter()
+            .map(|mode| MonitorMode {
+                width: mode.size.w,
+                height: mode.size.h,
+                refresh_millihertz: u32::try_from(mode.refresh).unwrap_or(0),
+            })
+            .collect(),
+        powered,
+        vrr_supported,
+        vrr_enabled,
+    }
+}
+
+/// Re-advertises ONE output's own fractional scale: the integer ceiling
+/// on its `wl_output`, the exact fraction to every fractional-scale
+/// client. The per-output half of what [`advertise_scale`] does for the
+/// session; wlr-output-management's apply path is the caller.
+pub(crate) fn advertise_output_scale_change(entry: &OutputEntry) {
+    let advertised = advertised_output_scale(entry.scale as f32);
+    entry.output.change_current_state(None, None, Some(advertised), None);
+}
+
+/// The union bounding box of every monitor: what `Backend::screen_size`
+/// answers, and the extent of the coordinate space the ledger, the
+/// renderer and the pointer all share.
+///
+/// Only the far corner is measured because outputs are laid out from
+/// the origin rightwards (see `session::init`). A layout that ever put
+/// an output at a negative coordinate — a monitor placed to the *left*
+/// of the primary, which is exactly what an output-management protocol
+/// would let a user ask for — would need the near corner too, and would
+/// need `wm-core` and the shell to stop assuming the screen starts at
+/// (0, 0). Moving that assumption is the real cost of arbitrary output
+/// positioning; the layout code is the easy half.
+/// The pure half of [`WaylandBackend::scale_at`]: the scale of the
+/// monitor containing `rect`'s center, else the primary's (index 0),
+/// else 1.0. The center rather than a corner because a window
+/// straddling two screens has to be measured by ONE factor, and the
+/// monitor holding most of it is the least surprising choice.
+pub(crate) fn scale_for_rect(monitors: &[MonitorInfo], scales: &[f64], rect: Rect) -> f64 {
+    let center = Point::new(rect.pos.x + (rect.size.w / 2) as i32, rect.pos.y + (rect.size.h / 2) as i32);
+    let index = monitors.iter().position(|monitor| monitor.geometry.contains(center)).unwrap_or(0);
+    scales.get(index).copied().unwrap_or(1.0)
+}
+
+pub(crate) fn union_size(monitors: &[MonitorInfo]) -> Size {
+    let mut width: i32 = 0;
+    let mut height: i32 = 0;
+    for monitor in monitors {
+        width = width.max(monitor.geometry.pos.x + monitor.geometry.size.w as i32);
+        height = height.max(monitor.geometry.pos.y + monitor.geometry.size.h as i32);
+    }
+    Size::new(width.max(0) as u32, height.max(0) as u32)
+}
+
+pub struct Compositor {
+    /// The policy brain, owning the [`WaylandBackend`] ledger. Protocol
+    /// handlers reach the ledger through `self.wm.backend_mut()`.
+    pub wm: WindowManager<WaylandBackend>,
+    pub shell: Shell<WaylandBackend>,
+
+    pub display_handle: DisplayHandle,
+    pub loop_handle: LoopHandle<'static, Compositor>,
+    ipc_sources: Vec<(RawFd, RegistrationToken)>,
+    /// Reused storage for the desired source set. Taking and returning
+    /// it in `sync_ipc_sources` keeps the hot dispatch path allocation
+    /// free after the largest set seen so far establishes its capacity.
+    source_scratch: Vec<RawFd>,
+    /// Reused set for desired membership during pruning, then for the
+    /// registered set during insertion. That makes each reconciliation
+    /// linear instead of nesting a scan of one descriptor list inside
+    /// every element of the other.
+    source_membership_scratch: HashSet<RawFd>,
+    /// Which entries in `source_scratch` belong to Hyprland IPC. The
+    /// callback needs this bit; collecting it once avoids a nested
+    /// ownership scan for every descriptor.
+    hyprland_source_scratch: HashSet<RawFd>,
+    hyprland_ipc: Option<chonk_hyprland_ipc::Server>,
+    /// `ext_workspace_v1`: the workspace row as native Wayland clients
+    /// see it. See `workspace.rs`.
+    pub(crate) workspaces: crate::workspace::WorkspaceState,
+    /// Set by the callback for one of the server's registered file
+    /// descriptors. A quiet subscriber is deliberately not serviced
+    /// on timer-only wakeups; there is no request to answer and no
+    /// socket maintenance to perform.
+    hyprland_ipc_ready: bool,
+    /// The same, for the shell's control socket: set by the callback
+    /// for its listener or any of its clients, taken by the shell tick,
+    /// so a quiet pass asks no per-client question of the kernel.
+    control_ready: bool,
+    /// Whether work since the last publish may have changed anything
+    /// represented by the Hyprland event stream. Kept separate from
+    /// socket readiness: a desktop mutation must be published even
+    /// when the subscriber itself has said nothing.
+    pub(crate) hyprland_state_dirty: bool,
+    /// Whether the wlr foreign-toplevel snapshot can differ from its
+    /// last publication. Separate from Hyprland IPC because either
+    /// protocol can be disabled or have no clients without preventing
+    /// the other from consuming its own invalidation edge.
+    pub(crate) foreign_toplevel_dirty: bool,
+    /// Last wm-core semantic revision observed by the two publishers.
+    /// Comparing this once after mutation drains makes ordinary input
+    /// events allocation-free when they changed no published state.
+    observed_wm_protocol_revision: u64,
+    pub(crate) protocol_publish_metrics: ProtocolPublishMetrics,
+    /// Fixed-size timing counters exposed through the opt-in test door.
+    /// Reading them resets the bracket, so a harness can measure one
+    /// interaction without parsing tracing output or wall-clock sleeps.
+    pub(crate) gpu_timer: crate::gpu_timer::GpuTimer,
+    pub(crate) frame_stats: FrameStats,
+
+    // Per-protocol smithay state. Constructed once in `run`; the
+    // handler impls in `xdg.rs`/`input.rs`/`xwayland.rs` return these
+    // from their `*_state()` accessors.
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub xdg_decoration_state: XdgDecorationState,
+    /// KDE's older `org_kde_kwin_server_decoration`, advertised beside
+    /// the xdg one because GTK — GTK3 and GTK4 alike — implements only
+    /// this interface and never binds the standard one. Offering only
+    /// xdg-decoration made every GTK application on the system a silent
+    /// client, which is what put two titlebars on LibreOffice. KWin,
+    /// Sway, labwc and Hyprland all advertise it too. See
+    /// `crate::decoration`.
+    pub kde_decoration: KdeDecorationState,
+    pub shm_state: ShmState,
+    pub seat_state: SeatState<Compositor>,
+    /// Last successfully installed settings, not merely the latest request.
+    /// `None` after startup fallback so a later valid edit still installs.
+    pub(crate) keyboard_config: Option<ResolvedKeyboard>,
+    pub(crate) clipboard_persistence: crate::selection::persistence::Persistence,
+    pub(crate) mac_keyboard: crate::input::keyboard::mac::MacKeyboard,
+    pub(crate) mac_copy_order: crate::input::keyboard::copy_order::CopyOrder,
+    pub output_manager_state: OutputManagerState,
+    pub data_device_state: DataDeviceState,
+    /// The middle-click clipboard. Advertised because the X11 half of
+    /// the session has always had one — PRIMARY is an X server concept
+    /// that XWayland clients use whether or not the Wayland side knows
+    /// about it — and the XWayland selection bridge in `xwayland.rs`
+    /// needs somewhere to put an X selection it is handed and somewhere
+    /// to read one from. Without the global, selecting text in xterm and
+    /// middle-clicking into a Wayland editor has nothing to travel
+    /// through.
+    pub primary_selection_state: PrimarySelectionState,
+    /// The clipboard-manager protocols, wlr and ext alike: the only way
+    /// a client that does not have keyboard focus can read or write the
+    /// two selections above. Without them `wl-paste --watch` refuses to
+    /// run and nothing keeps a clipboard history — see
+    /// `crate::data_control`.
+    pub(crate) data_control: crate::data_control::DataControl,
+    pub xwayland_shell_state: XWaylandShellState,
+    /// fractional-scale-v1: the channel that can say "1.5" to a client,
+    /// where `wl_output.scale` can only say its ceiling. Serving it is
+    /// most of what makes a fractional session scale first-class — see
+    /// `xdg.rs`'s commit handler and `xdg::committed_surface_scale`.
+    pub fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    /// wp_viewporter: how a fractional-scale client actually commits at
+    /// 1.5x — a `round(w × 1.5)` px buffer with a viewport destination
+    /// of `w` logical. smithay's surface state resolves the viewport;
+    /// the ledger recovers the factor from the ratio.
+    pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
+    /// Standard desktop protocols grouped behind Smithay's helpers.
+    pub(crate) core_protocols: crate::core_protocols::CoreProtocols,
+    /// Tracks xdg popups (client menus, tooltips) so the renderer can
+    /// draw them above their parent window — `wm-core` never learns
+    /// about them, exactly as it never learns about X11
+    /// override-redirect windows.
+    pub popups: PopupManager,
+
+    pub seat: Seat<Compositor>,
+    /// Every output, primary first — see [`OutputEntry`] for what that
+    /// order binds together. Startup requires one, though DRM hot-unplug
+    /// may leave this briefly empty until a connector returns.
+    pub(crate) outputs: Vec<OutputEntry>,
+    /// Connected outputs a monitor rule, an IPC request or
+    /// wlr-output-management took out of the layout. Not indexed by
+    /// anything: every positional ledger covers `outputs` alone.
+    pub(crate) parked_outputs: Vec<ParkedOutput>,
+    /// Per connector, the monitor rule the layout was last built from;
+    /// what a reload diffs the freshly resolved rules against. See
+    /// [`reconcile_monitor_rules`].
+    pub(crate) applied_monitor_rules: HashMap<String, Option<wm_config::hyprland::directive::Monitor>>,
+    /// Every live `wl_surface`, including role-less surfaces and hidden
+    /// subsurfaces. Commit-timing blockers can be installed before a role is
+    /// assigned, so the ordinary scene ledgers are not a complete registry.
+    pub(crate) surface_outputs: crate::surface_outputs::SurfaceOutputs,
+    pub(crate) pacing_surfaces: HashMap<ObjectId, WlSurface>,
+    pub(crate) pacing_scratch: crate::xdg::PacingScratch,
+    /// Bounded escape for a FIFO barrier whose presentation never completes.
+    /// Retaining the barrier identity gives each replacement a fresh deadline.
+    pub(crate) pacing_fifo_deadlines:
+        HashMap<ObjectId, (smithay::wayland::compositor::Barrier, Instant)>,
+
+    /// Generation-owned X11 connections and the bounded restart policy.
+    /// Startup, readiness and retirement live together in xwayland/lifecycle.
+    /// Missing X11 support never prevents native Wayland clients from working.
+    pub(crate) xwayland: crate::xwayland::State,
+    /// The UI scale everything in this session is drawn at.
+    ///
+    /// Held here because two things outside the theme engine are sized
+    /// from it and neither can ask anyone else: the compositor's own
+    /// pointer (rebuilt in [`Compositor::dispatch_pending`]) and the
+    /// XSETTINGS properties above, which have to be publishable at
+    /// XWayland-ready time — a moment that arrives asynchronously, long
+    /// after `run` has handed its `SessionState` to the shell and
+    /// dropped it.
+    pub(crate) ui_scale: f32,
+
+    /// The graphics stack: a host window, or the hardware itself.
+    pub(crate) graphics: Graphics,
+    /// Cached marker path and deadline for compositor-native PNG
+    /// requests. Kept beside the renderer because servicing one needs
+    /// the live graphics context even when the scene is otherwise idle.
+    pub(crate) snapshot_downloads: crate::capture::SnapshotDownloads,
+    pub(crate) screenshot_poller: crate::capture::ScreenshotRequestPoller,
+    pub(crate) capture_tool: crate::capture_tool::Service,
+    /// linux-dmabuf: the format set we advertise and the protocol
+    /// state behind it. Always present; "this renderer cannot do
+    /// dmabuf" is represented inside, not by an `Option`, so protocol
+    /// dispatch in a login session never has an unreachable panic on
+    /// a screen with no console to read it from.
+    pub(crate) dmabuf: crate::dmabuf::DmabufSupport,
+    /// Explicit sync (`wp_linux_drm_syncobj_v1`), present only when a
+    /// DRM session backend's device can wait on syncobj timelines.
+    /// `None` on the nested backend and on devices without
+    /// `syncobj_eventfd` — see `dmabuf::init_syncobj` for why the
+    /// global is the difference between Edge flickering and not on
+    /// NVIDIA.
+    pub(crate) syncobj: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    /// The wlr protocol surface external tools bind: the
+    /// foreign-toplevel window list and screencopy capture. The
+    /// Wayland counterpart to the X11 session's EWMH properties.
+    pub(crate) protocols: crate::protocols::ProtocolState,
+    /// ext-image-copy-capture sessions and their output/toplevel source
+    /// factories. Kept beside the legacy wlr protocol state because both
+    /// intentionally share its shm pixel writer.
+    pub(crate) image_capture: crate::image_capture::ImageCapture,
+    pub(crate) _toplevel_mapping: crate::toplevel_mapping::ToplevelMapping,
+    /// wlr-output-management: what `wlr-randr` and `kanshi` list and
+    /// configure outputs through — see `output_mgmt.rs`.
+    pub(crate) output_mgmt: crate::output_mgmt::OutputManagement,
+    /// Exclusive DPMS controls plus observers for each output.
+    pub(crate) output_power: crate::output_power::OutputPower,
+    /// wlr-gamma-control: the per-output gamma ramps `wlsunset`,
+    /// `gammastep` and `redshift` warm the screen through, with the
+    /// exclusivity that stops two of them fighting and the captured
+    /// originals a crashed one is undone from. Advertised only where
+    /// there is a crtc to program — see `gamma.rs`.
+    pub(crate) gamma: crate::gamma::GammaControl,
+    pub(crate) _ctm: crate::ctm::CtmControl,
+    /// wlr-layer-shell: launchers, bars, notification daemons, OSDs —
+    /// protocol state plus the focus/reservation bookkeeping in
+    /// `layers.rs` (the surface records themselves live on the ledger).
+    pub(crate) layer_shell: crate::layers::LayerShell,
+    /// ext-session-lock: the lock lifecycle machine and the
+    /// confirmation owed to a locking client — see `lock.rs`.
+    pub(crate) session_lock: crate::lock::SessionLock,
+    /// hyprland-focus-grab-v1: the surface whitelists a shell asks the
+    /// compositor to enforce so a click away dismisses its popups.
+    /// Omarchy's Quickshell uses one per popout; without the global it
+    /// disables the feature and the popouts never close. See
+    /// `focus_grab.rs`.
+    pub(crate) focus_grab: crate::focus_grab::FocusGrab,
+    /// Registered portal shortcut objects keyed by `app_id:id`.
+    pub(crate) global_shortcuts: crate::global_shortcuts::GlobalShortcuts,
+    /// ext-idle-notify + idle-inhibit: the timers `swayidle` runs on,
+    /// reset from the input path — see `idle.rs`.
+    pub(crate) idle: crate::idle::Idle,
+    /// virtual-keyboard-v1: the global `wtype` looks for, and with it
+    /// paste-as-keystrokes, emoji insertion and voice dictation. Held
+    /// so the global's id outlives `run`, never read again — a virtual
+    /// keyboard's whole state lives on its own protocol object, so
+    /// there is nothing here to reconcile per pass. Same shape as
+    /// `Idle::_inhibit`. See `virtual_keyboard.rs`.
+    pub(crate) _virtual_keyboard: smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState,
+    /// wlr virtual pointer v2, lowering synthetic motion/buttons/axis
+    /// through the same funnel as physical input.
+    pub(crate) _virtual_pointer: crate::virtual_pointer::VirtualPointerState,
+
+    /// Latest pointer position in compositor space, maintained by
+    /// `input.rs` — the renderer draws the cursor here, and hit-tests
+    /// run against it.
+    pub pointer_location: SPoint<f64, Logical>,
+    /// Last pointer-capture policy applied to physical touchpads.
+    pub(crate) touchpad_pointer_captured: bool,
+    /// What the cursor should look like, per the focused client's
+    /// `wl_pointer.set_cursor` (maintained by `input.rs`'s
+    /// `SeatHandler::cursor_image`). Honored only while the pointer is
+    /// over client content, where a `Named` shape is drawn from the
+    /// Xcursor theme; everywhere else the renderer draws
+    /// `Compositor::cursors`' own set (see `push_cursor_elements`).
+    pub cursor_status: CursorImageStatus,
+    /// The worker that loads named cursor shapes from the Xcursor theme,
+    /// or `None` when it could not be started (see `cursor_theme`).
+    pub(crate) cursor_theme: Option<crate::cursor_theme::ThemeLoader>,
+    /// Tablet tools in proximity, with their positions and requested
+    /// images, drawn like the pointer (see `input::TabletCursor`).
+    pub(crate) tablet_cursors: Vec<crate::input::TabletCursor>,
+    /// The compositor's own pointer images — the arrow, and the resize
+    /// double-arrows shown over frame edges — drawn whenever no client
+    /// cursor surface applies: a compositor draws its own cursor, there
+    /// is no server to inherit one from. Also holds the theme images
+    /// drawn for a client's named shapes (`CursorSet::themed`). Which
+    /// member is drawn is the renderer's per-frame decision (see
+    /// `push_cursor_elements`), fed by what the pointer is over and what
+    /// `Backend::set_frame_cursor` recorded on the ledger.
+    pub(crate) cursors: CursorSet,
+
+    /// Monotonic session clock for frame-callback timestamps.
+    pub start_time: Instant,
+    /// Cleared to exit the dispatch loop (root-menu Exit, host window
+    /// closed, display teardown).
+    pub running: bool,
+    /// Set (with `running` cleared) to re-exec the on-disk binary
+    /// after teardown — the theme-menu / `scripts/restart.sh` hot
+    /// restart. Unlike X11 there is no SaveSet: Wayland clients die
+    /// with the compositor's socket, so a restart costs the session's
+    /// clients. That matches what a compositor *can* do today; a
+    /// future session handoff could improve it.
+    pub restart: bool,
+}
+
+/// Removes registrations whose descriptor is no longer wanted without
+/// allocating a replacement vector. Source order has no meaning to
+/// calloop, so `swap_remove` is the constant-time erasure that keeps
+/// the capacity established by the largest connection set.
+fn retain_wanted_sources<T>(
+    registered: &mut Vec<(RawFd, T)>,
+    wanted: &HashSet<RawFd>,
+    mut remove: impl FnMut(T),
+) {
+    let mut index = 0;
+    while index < registered.len() {
+        if wanted.contains(&registered[index].0) {
+            index += 1;
+        } else {
+            let (_, token) = registered.swap_remove(index);
+            remove(token);
+        }
+    }
+}
+
+impl Compositor {
+    /// Installs a pointer configuration: the scroll factors, the pointer's
+    /// hide policy, and every libinput device, with live `hl.device`
+    /// requests folded into its device rules. Whatever a device this
+    /// switches off was holding is released before libinput stops it.
+    pub(crate) fn apply_pointer_config(&mut self, mut config: wm_core::PointerConfig, now: Instant) {
+        let backend = self.wm.backend_mut();
+        config.devices = backend.input_device_states.rules();
+        backend.pointer_config.devices.clone_from(&config.devices);
+        backend.pointer_scroll_factor = config.pointer.scroll_factor.unwrap_or(1.0);
+        backend.touchpad_scroll_factor = config.touchpad.scroll_factor.unwrap_or(1.0);
+        if backend.cursor_visibility.configure(&config.cursor, now) {
+            backend.mark_damaged();
+        }
+        crate::input::devices::release_newly_disabled(self);
+        crate::session::apply_pointer_config(&mut self.graphics, &config, self.touchpad_pointer_captured);
+    }
+}
+
+impl Compositor {
+    /// Drains everything the protocol handlers queued since the last
+    /// pass, in exactly the X11 binary loop's order — keymap
+    /// interception before dispatch, motion coalescing, notification
+    /// and resize drains, shell-click routing, `Shell::tick` — then
+    /// applies deferred focus and renders if anything was damaged.
+    /// Called once per calloop wakeup from [`run`]'s loop; keeping the
+    /// order identical to `crates/chonkstep/src/main.rs` is what makes
+    /// "the desktop behaves identically" a structural property rather
+    /// than a porting promise, so change that file first if this order
+    /// ever needs to move.
+    #[cfg_attr(feature = "profile", profiling::function)]
+    pub(crate) fn dispatch_pending(&mut self) {
+        crate::input::keyboard::copy_order::service(self);
+        crate::selection::persistence::tick(self);
+        crate::capture::service_snapshots(self);
+        crate::capture_tool::tick(self);
+        let dispatch_span = tracing::info_span!("dispatch_pass");
+        let _dispatch_guard = dispatch_span.enter();
+        let dispatch_started = Instant::now();
+        // Spring commits join the ordinary notification/focus/protocol drain
+        // below, so a workspace settles and receives keyboard focus together.
+        crate::gesture_scene::tick(self);
+        crate::layout_scene::tick(self);
+        self.apply_pending_keyboard();
+        self.apply_shortcut_inhibit_policy();
+        if self.wm.backend_mut().cursor_visibility.tick(dispatch_started) {
+            self.wm.backend_mut().mark_damaged();
+        }
+        if let Some(config) = self.wm.backend_mut().pending_pointer.take() {
+            self.apply_pointer_config(config, dispatch_started);
+        }
+        crate::input::flush_pointer_warp(self);
+        tracing::debug_span!("dispatch_phase", phase = "connector_hotplug")
+            .in_scope(|| crate::session::service_connector_hotplug(self));
+        // Drained here, in the dispatch pass, and not inside
+        // `service_hyprland_ipc`: that returns early with no IPC server
+        // or client, and a reload from the marker file has neither.
+        if self.shell.take_monitor_rules_pending() {
+            tracing::debug_span!("dispatch_phase", phase = "monitor_rules").in_scope(|| reconcile_monitor_rules(self));
+        }
+        let phase_started = Instant::now();
+        tracing::debug_span!("dispatch_phase", phase = "input")
+            .in_scope(|| crate::input::tick_repeating_binding(self));
+        // Switch toggles resolve beside key bindings and run through the
+        // same `run_action`; on the lock screen only `locked` ones answer.
+        for (device, on) in std::mem::take(&mut self.wm.backend_mut().pending_switches) {
+            let locked = self.wm.backend().locked;
+            let actions = self.shell.switch_actions(&device, on, locked);
+            tracing::info!(?device, on, locked, actions = actions.len(), "switch toggle resolved");
+            for action in actions {
+                let outcome = self.shell.run_action(&mut self.wm, &action);
+                self.note_outcome(outcome);
+            }
+        }
+        // Consecutive `PointerMotion` events coalesce to the most
+        // recent one — same rationale as the X11 loop: during a fast
+        // drag every intermediate position is stale by the time it
+        // would draw, and the held-back motion still commits before
+        // any later non-motion event in the same burst.
+        let mut pending_motion = None;
+        while let Some(event) = self.wm.backend_mut().poll_event() {
+            if matches!(event, BackendEvent::ShutdownRequested) {
+                // The display is going away for good; nothing below
+                // can succeed.
+                self.running = false;
+                return;
+            }
+            if matches!(event, BackendEvent::PointerMotion { .. }) {
+                pending_motion = Some(event);
+                continue;
+            }
+            // Configured keybindings resolve BEFORE `wm.dispatch`, and
+            // misses MUST keep flowing through unchanged — during a
+            // modal Alt+Tab session every key arrives here as a
+            // `KeyPress`, and swallowing unbound ones would wedge the
+            // switcher open (see the X11 loop's longer commentary;
+            // `KeyRelease` is never intercepted at all).
+            if let BackendEvent::KeyPress(combo) = &event {
+                let overview_motion = self.wm.backend().gesture_scene.as_ref()
+                    .is_some_and(|scene| !scene.horizontal() && self.wm.backend().overview.is_some());
+                if self.wm.backend().gesture_scene.is_some() && !overview_motion {
+                    crate::input::gestures::cancel(self);
+                }
+                if crate::capture_tool::key(self, combo) {
+                    continue;
+                }
+                if let Some(resolution) = self.shell.keymap_action(combo) {
+                    if overview_motion && !matches!(&resolution, chonk_shell::shell::KeyResolution::Consumed) {
+                        crate::input::gestures::keyboard_takeover(self);
+                    }
+                    if let Some(motion) = pending_motion.take() {
+                        self.dispatch_motion(motion);
+                    }
+                    let outcome = match resolution {
+                        chonk_shell::shell::KeyResolution::Action(
+                            wm_config::Action::GlobalShortcut(target),
+                        ) => {
+                            self.global_shortcuts
+                                .trigger(&target, true, self.start_time.elapsed());
+                            chonk_shell::shell::ShellOutcome::Continue
+                        }
+                        chonk_shell::shell::KeyResolution::Action(action) => {
+                            self.shell.run_action(&mut self.wm, &action)
+                        }
+                        chonk_shell::shell::KeyResolution::Menu(key) => {
+                            self.shell.run_menu_key(&mut self.wm, key)
+                        }
+                        chonk_shell::shell::KeyResolution::Consumed => {
+                            chonk_shell::shell::ShellOutcome::Continue
+                        }
+                    };
+                    self.note_outcome(outcome);
+                    continue;
+                }
+            }
+            if let BackendEvent::KeyRelease(combo) = &event {
+                if let Some(action) = self.shell.keymap_release_action(combo) {
+                    if let Some(motion) = pending_motion.take() {
+                        self.dispatch_motion(motion);
+                    }
+                    let outcome = match action {
+                        wm_config::Action::GlobalShortcut(target) => {
+                            self.global_shortcuts.trigger(
+                                &target,
+                                false,
+                                self.start_time.elapsed(),
+                            );
+                            chonk_shell::shell::ShellOutcome::Continue
+                        }
+                        action => self.shell.run_action(&mut self.wm, &action),
+                    };
+                    self.note_outcome(outcome);
+                    continue;
+                }
+            }
+            if let Some(motion) = pending_motion.take() {
+                self.dispatch_motion(motion);
+            }
+            if let BackendEvent::ClientSizeCommitted { window, size } = &event {
+                // Several commits can arrive in one dispatch, or an earlier
+                // input event can request another resize. Only adopt pixels
+                // that still answer the current request when the WM sees them.
+                let backend = self.wm.backend();
+                let current = backend.windows.get(window).is_some_and(|record| {
+                    record.surface.wl_surface().is_some_and(|root| {
+                        !crate::xdg::resize_pending(backend, *window, &root)
+                            && crate::xdg::committed_content_size(&root,
+                                backend.window_surface_scale(record), backend.output_size) == Some(*size)
+                    })
+                });
+                if !current { continue; }
+            }
+            self.wm.dispatch(event);
+        }
+        if let Some(motion) = pending_motion.take() {
+            self.dispatch_motion(motion);
+        }
+
+        self.frame_stats.input.record(phase_started.elapsed());
+        let phase_started = Instant::now();
+
+        while let Some(notification) = self.wm.take_notification() {
+            self.shell.on_notification(&mut self.wm, notification);
+        }
+
+        if let Some(new_size) = self.wm.backend_mut().take_screen_resize() {
+            self.hyprland_state_dirty = true;
+            self.foreign_toplevel_dirty = true;
+            tracing::info!(width = new_size.w, height = new_size.h, "output resized");
+            self.shell.on_screen_resize(&mut self.wm, new_size);
+            self.wm.set_workarea(self.shell.workarea(new_size));
+        }
+
+        // Shell-surface clicks drain to the shell, with background
+        // presses split off to `on_root_press` under the [`ROOT_SHELL`]
+        // sentinel — the same press/release routing asymmetry as the
+        // X11 loop (root reacts on press; releases still flow through
+        // `on_shell_click` so an in-progress launcher-strip drag sees
+        // them).
+        while let Some((surface, local, button, pressed)) = self.wm.backend_mut().take_shell_click() {
+            let outcome = if surface == ROOT_SHELL && pressed {
+                self.shell.on_root_press(&mut self.wm, local, button)
+            } else {
+                self.shell.on_shell_click(&mut self.wm, surface, local, button, pressed)
+            };
+            self.note_outcome(outcome);
+        }
+        while let Some((surface, _, delta)) = self.wm.backend_mut().take_shell_scroll() {
+            self.shell.on_shell_scroll(&mut self.wm, surface, delta);
+        }
+
+        if !self.running {
+            self.sync_ipc_sources();
+            return;
+        }
+
+        // No separate shell-motion drain, same as X11: the shell
+        // drains `take_shell_motion` itself inside `on_motion`, which
+        // every coalesced `PointerMotion` above passes through.
+
+        self.shell.note_control_readable(std::mem::take(&mut self.control_ready));
+        self.shell.tick(&mut self.wm);
+        self.frame_stats.shell.record(phase_started.elapsed());
+        let phase_started = Instant::now();
+
+        // State, not the shape of the event that reached it, drives
+        // protocol invalidation. A press/release inside the already-focused
+        // window leaves the revision still and pays no snapshot allocation.
+        self.notice_wm_protocol_changes();
+
+        // Wayland-side housekeeping with no X11 counterpart: a popup
+        // whose parent was resized is retired before its old anchor can
+        // be presented, dead xdg popups age out, and the focus intent a
+        // backend verb recorded lands on the seat (see
+        // `WaylandBackend::pending_focus` for why it cannot land
+        // inline).
+        self.dismiss_popups_after_parent_resize();
+        self.popups.cleanup();
+        self.wm.backend_mut().reconcile_popup_roots();
+        self.reconcile_cursor_visibility();
+        self.wm.backend_mut().sweep_activation_tokens(Instant::now());
+        self.apply_pending_focus();
+        // Beside the focus intent and for the same reason: a drag that
+        // began or ended anywhere above has to reach the seat, and only
+        // this side of the loop can reach one. Before the flush at the
+        // bottom of this pass, so the leave a starting drag owes its
+        // client — and the enter an ending one owes whoever is under
+        // the pointer now — travels with everything else this pass
+        // decided rather than waiting for the next event.
+        crate::input::apply_pointer_grab_change(self);
+        // Publish the window list and serve screencopy requests: after
+        // the event and notification drains so external tools see the
+        // same state the desktop just settled into, before the damage
+        // test so a capture request can mark the frame it needs.
+        crate::protocols::refresh(self);
+        if std::mem::take(&mut self.wm.backend_mut().workspaces_dirty) {
+            self.workspaces.mark_dirty();
+        }
+        crate::workspace::refresh(self);
+        // Output management settles beside the other protocol
+        // reconciliations and before the damage test, so an applied
+        // configuration's re-layout renders on this very pass.
+        crate::output_mgmt::refresh(self);
+        // Long-lived ext capture sessions observe the settled toplevel and
+        // output geometry above, re-advertise changed constraints, and answer
+        // frame requests through the shared offscreen path.
+        crate::image_capture::refresh(self);
+        // Gamma ramps settle beside the other protocol reconciliations
+        // and for a reason of their own: this is the only place the
+        // blocking legacy-gamma ioctl is called from, so a client
+        // hammering `set_gamma` costs one wait per pass rather than one
+        // per request (see `gamma.rs`).
+        crate::gamma::refresh(self);
+        // The X11 tools' equivalent of the wlr window list above rides
+        // the same timing: flush the buffered EWMH publishes to the
+        // XWayland root after the drains, so `xprop`/`wmctrl` read the
+        // state the desktop just settled into, never a half-applied
+        // pass. A no-op until XWayland is ready (see `xewmh::flush`).
+        // The X server's own stacking, before the EWMH publish that
+        // rewrites `_NET_CLIENT_LIST_STACKING` from it — so the list a
+        // pager reads and the order the server holds are settled in
+        // that order and cannot disagree within a pass.
+        crate::xwayland::sync_stacking_order(self);
+        crate::xewmh::flush(self);
+        // Layer surfaces settle beside them and before the damage test
+        // for the same reason: a bar that just changed its exclusive
+        // zone must reflow the workareas and render on this frame, not
+        // the next. After `Shell::tick` and the drains deliberately —
+        // anything in this pass that re-applied the shell's baseline
+        // workareas has already run, so the layer-composed rects land
+        // last (see `layers::apply_workareas`).
+        crate::layers::refresh(self);
+        // Focus grabs settle after the layer pass and before the lock
+        // one, which is the ordering their own module documents read as
+        // a sequence: the layer surfaces a grab whitelists have just
+        // been arranged and had their exclusive-focus claim resolved,
+        // so the keyboard decision here sees the settled answer; and
+        // `lock::refresh` runs later in this same pass, so a lock still
+        // lands on top of a grab this one just ended.
+        crate::focus_grab::refresh(self);
+        crate::input::keyboard::sync_modal_focus(self);
+        // Idle inhibition follows visibility, which everything above
+        // may have changed.
+        crate::idle::refresh(self);
+        self.frame_stats.protocols.record(phase_started.elapsed());
+        let phase_started = Instant::now();
+
+        // The UI scale moved: rebuild the built-in pointer, the one
+        // thing this session draws that is sized from that scale and
+        // does not come out of the theme engine (see
+        // `build_default_cursor`). Damage because the arrow that is
+        // already on screen is the wrong size until it is redrawn, and
+        // a pointer sitting still over an idle desktop produces none of
+        // its own.
+        //
+        // Drained here, every pass, rather than rebuilt next to
+        // wherever a reload was noticed. A scale change reaches the
+        // session from at least two directions — the `reload` marker
+        // `run`'s loop polls, and an `Action::Reload` keybinding that
+        // `Shell::run_action` applies without ever passing through that
+        // poll — and both of them end in
+        // `Shell::apply_session_state`, which tells the backend and
+        // nothing else. So the announcement is the only point both
+        // paths cross, and a rebuild written into either one of them is
+        // a pointer that silently stays the wrong size on the other.
+        //
+        // The XSETTINGS republish rides the same drain, for the same
+        // reason and not merely out of convenience: it answers the same
+        // question ("what is sized from the scale and cannot ask the
+        // theme engine?") for X clients that the pointer rebuild answers
+        // for this compositor, and it has the identical hazard of being
+        // written next to one of the two paths a scale change arrives
+        // by. One announcement, one drain, both consumers.
+        // Before the drain below, so a republish is never attempted on a
+        // selection this session has just been told it no longer owns.
+        self.poll_xsettings();
+        if let Some(scale) = self.wm.backend_mut().pending_cursor_scale.take() {
+            tracing::info!(scale, "rebuilding the compositor's own pointer for the new UI scale");
+            self.ui_scale = scale;
+            // The theme's named shapes are sized per output rather than
+            // by the UI scale, so they survive the rebuild;
+            // `cursor_theme::reconcile` below retires any size no output
+            // needs any more and requests the new ones.
+            let themed = std::mem::take(&mut self.cursors.themed);
+            self.cursors = CursorSet::build(scale);
+            self.cursors.themed = themed;
+            self.wm.backend_mut().mark_damaged();
+            self.republish_xsettings();
+            // Native Wayland clients ride the same drain, through the
+            // one channel they listen on: the outputs re-advertise the
+            // scale (broadcast to every bound `wl_output`), and every
+            // managed surface is told its new preferred buffer scale
+            // directly, because `send_surface_state` only sends on
+            // change *per surface* and a window idling in the
+            // background commits nothing that would make the
+            // commit-time send in `xdg.rs` fire. Clients answer with
+            // rescaled buffers; the ledger reflows around those commits
+            // exactly as it does around any client resize.
+            advertise_scale(&mut self.outputs, scale);
+            self.output_mgmt.mark_dirty();
+            self.session_lock.mark_dirty();
+            self.sync_monitor_scales();
+            self.layer_shell.needs_arrange = true;
+            let advertised = advertised_output_scale(scale).integer_scale();
+            let surfaces: Vec<WlSurface> = self
+                .wm
+                .backend()
+                .windows
+                .values()
+                // Xdg only: an Xwayland window's wl_surface belongs to
+                // the Xwayland server, which is told the scale through
+                // XSETTINGS/XCURSOR_SIZE above and must keep committing
+                // 1x buffers over the ledger's 1x rectangles.
+                .filter(|record| matches!(record.surface, ManagedSurface::Xdg(_)))
+                .filter(|record| record.surface.alive())
+                .filter_map(|record| record.surface.wl_surface())
+                .collect();
+            for surface in surfaces {
+                smithay::wayland::compositor::with_states(&surface, |states| {
+                    smithay::wayland::compositor::send_surface_state(&surface, states, advertised, Transform::Normal);
+                    // The exact fraction, for clients that bound
+                    // fractional-scale-v1 — the integer above is only
+                    // their fallback. Dedup'd per surface by smithay.
+                    smithay::wayland::fractional_scale::with_fractional_scale(states, |fractional| {
+                        fractional.set_preferred_scale(scale.max(0.125) as f64);
+                    });
+                });
+            }
+        }
+
+        // After the scale drain, so a rescale requests its cursor sizes in
+        // the same pass. Every other route to a new output scale (IPC,
+        // output management, hotplug) lands in `monitor_scales` too.
+        crate::cursor_theme::reconcile(self);
+
+        // Lock upkeep comes after the scale drain so a lock surface is
+        // reconfigured to a newly advertised scale in this same pass,
+        // before rendering. It is event-driven: without a new surface,
+        // output change, or surface death this returns immediately.
+        crate::lock::refresh(self);
+        crate::gesture_scene::apply_overview_target(self);
+        crate::gesture_scene::validate(self);
+        crate::input::keyboard::sync_modal_focus(self);
+        crate::input::sync_touchpad_typing(self);
+
+        // Timed commits are independent of presentation, and an invisible
+        // surface cannot ever satisfy a FIFO presentation barrier. Visibility
+        // has settled at this point, so release both before the scene build.
+        self.service_surface_pacing();
+
+        // Chrome dirtied by a whole burst of pointer motion becomes pixels
+        // once, immediately before the scene is built.
+        self.wm.flush_decorations();
+
+        // Everything above that changed a toplevel's size or state
+        // staged it and booked a configure; this is where those go out,
+        // one per toplevel, carrying the settled answer. It has to be
+        // the last thing before the frame: every pass above it — the
+        // event drain, the shell tick, the layer and lock passes, the
+        // scale drain — can still move a window, and a configure sent
+        // before the last of them would state a configuration this pass
+        // was about to change. See `xdg::flush_configures` for the
+        // invariant, and the stuck-fullscreen desktop that made it one.
+        self.wm.backend_mut().flush_configures();
+
+        // Screenshot markers are a compositor service, not scene
+        // damage. Poll before the render decision so an idle desktop
+        // can answer one without waiting for unrelated client pixels.
+        crate::capture::poll_screenshot_marker(self);
+        self.frame_stats.layout.record(phase_started.elapsed());
+
+        // Damage means the scene changed; `redraw_pending` means a
+        // change already accounted for has not reached every screen yet
+        // (a page flip was still in flight on one of them last pass).
+        // The second condition only ever fires on the session backend
+        // with more than one output — see `session::redraw_pending`.
+        let mut frame_presented = false;
+        if self.wm.backend().damage || crate::session::redraw_pending(&self.graphics) {
+            self.frame_stats.render_attempts = self.frame_stats.render_attempts.saturating_add(1);
+            let render_started = Instant::now();
+            if crate::renderer::render_frame(self) {
+                frame_presented = true;
+                self.frame_stats.record_render(render_started.elapsed());
+            }
+        }
+        crate::protocols::frame_presented(self, frame_presented);
+        // Visible FIFO barriers are signalled by the completed presentation
+        // path. Poll Smithay's client queues now so the next commit becomes
+        // current without waiting for another request from that client.
+        self.service_surface_pacing();
+
+        // A locking client is owed its `locked` event only after a
+        // frame built under the lock has been presented — which, if it
+        // happened at all this pass, happened just above.
+        crate::lock::confirm_after_frame(self);
+
+        // Protocol replies queued by everything above (configures,
+        // frame callbacks, focus enter/leave) only reach clients on a
+        // flush.
+        let phase_started = Instant::now();
+        let _ = self.display_handle.flush_clients();
+        self.frame_stats.flush.record(phase_started.elapsed());
+
+        // Hyprland IPC, before the source reconciliation below so that
+        // a connection accepted or dropped in this pass is registered
+        // or unregistered in the same one.
+        let phase_started = Instant::now();
+        self.service_hyprland_ipc();
+
+        // Last, after every socket this pass was going to close has
+        // been closed. See `sync_ipc_sources` for why that ordering is
+        // the safety argument and not a tidiness one.
+        self.sync_ipc_sources();
+        self.frame_stats.ipc.record(phase_started.elapsed());
+
+        // Test-door barriers ack only after the frame above has landed
+        // and the flush has gone out — a no-op in a user session (the
+        // door never opens without CHONKSTEP_TEST_SOCKET).
+        crate::test_door::after_frame(self);
+        self.frame_stats.record_dispatch(dispatch_started.elapsed());
+    }
+
+    /// Restores a cursor hidden on behalf of a client that has gone
+    /// away without running its cleanup command. The compatibility
+    /// socket is one-shot, so ownership follows the focused Wayland
+    /// surface rather than the short-lived `hyprctl` process.
+    fn reconcile_cursor_visibility(&mut self) {
+        let owner_died = self
+            .wm
+            .backend()
+            .cursor_hidden_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.is_alive());
+        if owner_died {
+            let backend = self.wm.backend_mut();
+            backend.cursor_hidden = false;
+            backend.cursor_hidden_owner = None;
+            backend.mark_damaged();
+            tracing::info!("restored cursor after the client that hid it disconnected");
+        }
+    }
+
+    /// Dismiss popup trees whose native parent changed size.
+    ///
+    /// `xdg_positioner` coordinates describe an anchor inside the
+    /// parent's surface. They do not describe how that anchor moves
+    /// when the application's own layout changes. A reactive
+    /// positioner lets the compositor send a fresh configure and an
+    /// explicit `xdg_popup.reposition` gives it a replacement anchor;
+    /// absent either, the protocol deliberately provides no way to
+    /// infer the new location. Chromium 140's application menu is one
+    /// such non-reactive client: after a parent configure it redraws
+    /// the toplevel but sends neither `set_reactive` nor `reposition`.
+    /// Leaving that surface mapped produces a visibly detached popup
+    /// whose hit region is just as stale.
+    ///
+    /// A compositor may dismiss a popup whenever it is no longer
+    /// suitable. After waiting through the parent's configure/commit
+    /// round trip, sending `popup_done` is therefore the only
+    /// protocol-correct fallback: the client can recreate it from its
+    /// now-current layout. Reactive popups and popups that explicitly
+    /// repositioned survive. Pure parent moves never enter this queue;
+    /// popup coordinates are parent-relative and remain correct across
+    /// them.
+    fn dismiss_popups_after_parent_resize(&mut self) {
+        while let Some(root) = self.wm.backend_mut().take_ready_popup_parent_resize() {
+            // One root can technically own multiple sibling popup
+            // trees. Dismissing a root popup recursively dismisses its
+            // descendants and mutates the tree, so re-query after each
+            // one rather than retaining stale handles.
+            loop {
+                let popup = PopupManager::popups_for_surface(&root).find_map(|(popup, _)| {
+                    let PopupKind::Xdg(xdg) = &popup else {
+                        return None;
+                    };
+                    if xdg.get_parent_surface().as_ref() != Some(&root) {
+                        return None;
+                    }
+                    // A reactive positioner explicitly asks the
+                    // compositor to keep this popup live as its parent
+                    // changes. Reading through the pending-state API is
+                    // the only public smithay accessor; an unchanged
+                    // read does not produce a configure debt.
+                    let reactive = xdg.with_pending_state(|state| state.positioner.reactive);
+                    (!reactive).then_some(popup)
+                });
+                let Some(popup) = popup else {
+                    break;
+                };
+                if let Err(error) = PopupManager::dismiss_popup(&root, &popup) {
+                    tracing::debug!(?error, "popup parent disappeared while dismissing its stale popup tree");
+                    break;
+                }
+            }
+        }
+    }
+
+
+    /// Accept, answer and stream on the Hyprland IPC sockets.
+    ///
+    /// When requests are actually present, the two-snapshot discipline
+    /// is the same one `Shell::service_control` uses and is
+    /// load-bearing: requests are answered against the state as it was,
+    /// their actions are applied, and events are derived from the state
+    /// those actions produced. A subscription-only pass needs only the
+    /// latter snapshot; manufacturing the unused "before" state on
+    /// every client frame was pure allocation and cloning.
+    fn service_hyprland_ipc(&mut self) {
+        let Some(mut server) = self.hyprland_ipc.take() else {
+            return;
+        };
+        let socket_ready = std::mem::take(&mut self.hyprland_ipc_ready);
+        let mut publish = self.hyprland_state_dirty;
+        let had_event_clients = server.has_event_clients();
+        if socket_ready {
+            server.accept();
+        }
+        let first_event_client = !had_event_clients && server.has_event_clients();
+        if !server.has_clients() {
+            // There is no observer to retain history for. A later
+            // first subscriber establishes a fresh baseline below.
+            self.hyprland_state_dirty = false;
+            self.hyprland_ipc = Some(server);
+            return;
+        }
+
+        let mut first_event_baselined = false;
+        if socket_ready && server.has_request_clients() {
+            let shortcut_inhibit = self.shortcut_inhibit_report();
+            let before = crate::hyprland_ipc::snapshot(
+                &self.wm,
+                self.session_lock.machine.locked(),
+                self.shell.session_state(),
+                &shortcut_inhibit,
+                self.shell.autoreload_paused(),
+            );
+            if first_event_client {
+                // The event and request listeners can become readable
+                // in one calloop dispatch. Establish the newcomer's
+                // baseline before applying that request, or the first
+                // owned publish below would establish it *after* the
+                // mutation and silently swallow the first event.
+                server.reset_diff();
+                server.publish(&before);
+                first_event_baselined = true;
+            }
+            let _ = server.service(&before, |action| crate::hyprland_ipc::apply(self, action));
+            self.notice_wm_protocol_changes();
+            publish |= self.hyprland_state_dirty;
+        }
+
+        let config_reloaded = self.shell.take_config_reloaded();
+        publish |= config_reloaded || first_event_client;
+        if server.has_event_clients() {
+            if config_reloaded {
+                server.broadcast(&chonk_hyprland_ipc::event::config_reloaded());
+                server.reset_diff();
+            }
+            if first_event_client && !first_event_baselined {
+                // No subscriber was present while the desktop may
+                // have changed. The newcomer obtains current state
+                // from its queries; establish that same instant as the
+                // delta baseline instead of replaying old history.
+                server.reset_diff();
+            }
+            if publish {
+                self.protocol_publish_metrics.hyprland_event_snapshots = self
+                    .protocol_publish_metrics
+                    .hyprland_event_snapshots
+                    .wrapping_add(1);
+                let after = crate::hyprland_ipc::event_snapshot(
+                    &self.wm,
+                    self.session_lock.machine.locked(),
+                    self.shell.session_state(),
+                    self.shell.autoreload_paused(),
+                );
+                server.publish_owned(after);
+            }
+        }
+        // Exactly once per compositor pass: retry bounded output,
+        // prune readable hangups, and advance the silent one-shot
+        // request timeout even on an otherwise quiet desktop. None of
+        // those jobs needs a snapshot.
+        server.maintain();
+        self.hyprland_state_dirty = false;
+        self.hyprland_ipc = Some(server);
+    }
+
+    /// Invalidate the retained Hyprland event baseline after a state
+    /// transition which does not travel through wm-core's backend
+    /// event queue (currently input hotplug and unlock).
+    pub(crate) fn mark_hyprland_state_dirty(&mut self) {
+        self.hyprland_state_dirty = true;
+        self.foreign_toplevel_dirty = true;
+    }
+
+    /// Observes wm-core's semantic revision at a reconciliation boundary.
+    /// The revision may advance several times in one pass; publishers need
+    /// only know that it differs from the value they last consumed.
+    pub(crate) fn notice_wm_protocol_changes(&mut self) {
+        let revision = self.wm.protocol_state_revision();
+        if revision == self.observed_wm_protocol_revision {
+            return;
+        }
+        self.observed_wm_protocol_revision = revision;
+        self.hyprland_state_dirty = true;
+        self.foreign_toplevel_dirty = true;
+    }
+
+    /// Current and registered Hyprland IPC source counts for the
+    /// opt-in E2E door. Counting the owned source set directly keeps a
+    /// connection-storm assertion independent of unrelated compositor
+    /// descriptors such as render fences and notification helpers.
+    pub(crate) fn hyprland_ipc_source_counts(&self) -> (usize, usize) {
+        let desired = self.hyprland_ipc.as_ref().map_or(0, |server| server.poll_fds().len());
+        let registered = self
+            .ipc_sources
+            .iter()
+            .filter(|(fd, _)| self.hyprland_source_scratch.contains(fd))
+            .count();
+        (desired, registered)
+    }
+
+    /// Reconcile control and Hyprland IPC descriptors after servicing them.
+    /// Closed descriptors are unregistered before calloop can poll again.
+    fn sync_ipc_sources(&mut self) {
+        let mut wanted = std::mem::take(&mut self.source_scratch);
+        let mut membership = std::mem::take(&mut self.source_membership_scratch);
+        let mut hyprland = std::mem::take(&mut self.hyprland_source_scratch);
+        wanted.clear();
+        membership.clear();
+        hyprland.clear();
+        self.shell.extend_extra_poll_fds(&mut wanted);
+        // The Hyprland IPC sockets ride the same reconciliation rather
+        // than owning calloop sources of their own, because they have
+        // exactly the property this pass was built for: descriptors
+        // that come and go as clients connect, owned by something other
+        // than the event loop. The safety argument below covers them
+        // unchanged — the source is removed on the same pass that drops
+        // the owner, and before calloop next polls.
+        if let Some(server) = &self.hyprland_ipc {
+            let first = wanted.len();
+            server.extend_poll_fds(&mut wanted);
+            hyprland.extend(wanted[first..].iter().copied());
+        }
+        membership.extend(wanted.iter().copied());
+        // Removals first, so a descriptor that was closed this pass is
+        // unregistered before anything else can be inserted at the same
+        // number.
+        let loop_handle = &self.loop_handle;
+        retain_wanted_sources(&mut self.ipc_sources, &membership, |token| loop_handle.remove(token));
+
+        membership.clear();
+        membership.extend(self.ipc_sources.iter().map(|(fd, _)| *fd));
+        for &fd in &wanted {
+            if !membership.insert(fd) {
+                continue;
+            }
+            let is_hyprland_ipc = hyprland.contains(&fd);
+            // SAFETY: `fd` is owned by a `Seqpacket` or
+            // `SeqpacketListener` inside the shell, and the source is
+            // removed above on the same pass that drops the owner and
+            // before calloop next polls — see the ordering argument in
+            // this method's docs.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let source = Generic::new(borrowed, Interest::READ, TriggerMode::Level);
+            match self.loop_handle.insert_source(source, move |_, _, comp| {
+                if is_hyprland_ipc {
+                    comp.hyprland_ipc_ready = true;
+                } else {
+                    comp.control_ready = true;
+                }
+                Ok(PostAction::Continue)
+            }) {
+                Ok(token) => self.ipc_sources.push((fd, token)),
+                Err(error) => {
+                    // Not fatal, and worth being precise about why: the
+                    // loop still has a 100 ms maximum idle bound, so an
+                    // unregistered IPC fd costs the request up to that
+                    // much frame latency and nothing else. This
+                    // is a latency optimisation, not a correctness
+                    // requirement.
+                    tracing::warn!(
+                        fd,
+                        ?error,
+                        "could not watch an IPC socket; requests will be handled on the housekeeping tick instead"
+                    );
+                }
+            }
+        }
+        self.source_scratch = wanted;
+        self.source_membership_scratch = membership;
+        self.hyprland_source_scratch = hyprland;
+    }
+
+    /// Feeds one already-coalesced `PointerMotion` to the shell's drag
+    /// trackers and then to `wm-core` — identical to the X11 binary's
+    /// `dispatch_motion`, and split out for the same two call sites
+    /// (mid-burst before a non-motion event, and once after the burst).
+    fn dispatch_motion(&mut self, event: BackendEvent<WlWindowId, WlFrameId>) {
+        let dragged = self.wm.interactive_drag_client();
+        if let BackendEvent::PointerMotion { root, .. } = &event {
+            self.shell.on_motion(&mut self.wm, *root);
+        }
+        self.wm.dispatch(event);
+        if let Some(client) = dragged {
+            crate::protocols::sync_dragged_toplevel_outputs(self, client);
+        }
+    }
+
+    /// Applies a [`ShellOutcome`] to the session. `Exit` and `Restart`
+    /// both end the dispatch loop; `Restart` additionally asks [`run`]
+    /// to re-exec the on-disk binary after teardown, which is the
+    /// config/theme hot-reload gesture on both stacks.
+    pub(crate) fn note_outcome(&mut self, outcome: ShellOutcome) {
+        match outcome {
+            ShellOutcome::Continue => {}
+            ShellOutcome::Capture(mode) => crate::capture_tool::begin(self, mode),
+            ShellOutcome::Exit => self.running = false,
+            ShellOutcome::Restart => {
+                self.restart = true;
+                self.running = false;
+            }
+        }
+    }
+
+    /// The host winit window changed size: retune the wayland output's
+    /// mode and queue the resize for the loop's `take_screen_resize`
+    /// drain, which is exactly where an X11 RandR change lands.
+    ///
+    /// Only the first output is touched, and that is not a shortcut:
+    /// this is the nested backend's path, where the host window *is*
+    /// the one output. The session backend never calls it — its outputs
+    /// keep the mode they were set to at startup, and a real mode change
+    /// (or a connector appearing) would have to re-lay-out every output
+    /// and re-advertise all of them, which is the connector-hot-plug
+    /// work `session.rs`'s module docs scope out.
+    pub(crate) fn on_output_resized(&mut self, size: SSize<i32, Physical>) {
+        if matches!(self.graphics, Graphics::Winit(_)) && self.outputs.len() > 1 { return; }
+        let mode = Mode { size, refresh: 60_000 };
+        let logical = Size::new(size.w.max(0) as u32, size.h.max(0) as u32);
+        let Some(entry) = self.outputs.first_mut() else {
+            return;
+        };
+        // A resize to the size the output already has changes nothing
+        // and must cost nothing. This is not a hypothetical: winit
+        // replays the host's configure as a `Resized` event on the
+        // loop's first pass, so a nested session's very first dispatch
+        // used to rebuild the damage tracker and — through
+        // `pending_resize` → `Shell::on_screen_resize` — re-decode and
+        // re-scale the wallpaper and repaint every piece of chrome it
+        // had all just painted at this exact size during `Shell::new`.
+        // At 2560x1600 in a debug build that is ~11 seconds of the
+        // event loop answering nobody: a client's `get_registry` sat
+        // queued behind a repaint of pixels that did not change.
+        if entry.size == logical {
+            return;
+        }
+        entry.output.change_current_state(Some(mode), None, None, None);
+        entry.output.set_preferred(mode);
+        entry.size = logical;
+        // The damage tracker was sized to the old mode and is pinned
+        // rather than output-tracking (see `physical_damage_tracker`),
+        // so a resize rebuilds it. A fresh tracker starts at age 0,
+        // which is what every frame here renders at anyway.
+        entry.damage_tracker = physical_damage_tracker(&entry.output, logical);
+        self.output_mgmt.mark_dirty();
+        self.session_lock.mark_dirty();
+        let backend = self.wm.backend_mut();
+        if let Some(monitor) = backend.monitors.first_mut() {
+            monitor.geometry.size = logical;
+        }
+        // Through the union rather than assigned directly, so the one
+        // place that decides what "the screen" measures stays one place
+        // even while only a single output can resize.
+        backend.output_size = union_size(&backend.monitors);
+        backend.pending_resize = Some(backend.output_size);
+        backend.mark_damaged();
+        self.wm.reconcile_display_spaces();
+        self.layer_shell.needs_arrange = true;
+    }
+
+    /// Copies each output's fractional scale onto the ledger
+    /// (`WaylandBackend::monitor_scales`), which is where the `Backend`
+    /// verbs and the renderer read it from. Called after anything
+    /// changes an `OutputEntry::scale` — the two lists must never
+    /// disagree, and this is the one direction data flows.
+    pub(crate) fn sync_monitor_scales(&mut self) {
+        let scales: Vec<f64> = self.outputs.iter().map(|entry| entry.scale).collect();
+        self.wm.backend_mut().monitor_scales = scales;
+        self.sync_monitor_outputs();
+    }
+
+    /// Where `output` sits in [`Compositor::outputs`] now, or `None`
+    /// once it has left.
+    ///
+    /// The one identity-to-position lookup for every protocol that
+    /// keeps per-output state across requests (gamma, CTM, output
+    /// power). They hold a `WeakOutput` and resolve it here per
+    /// request, so a hotplug that shifts positions cannot hand one
+    /// client's state to a different monitor.
+    pub(crate) fn output_index_of(&self, output: &smithay::output::WeakOutput) -> Option<usize> {
+        output_index_in(self.outputs.iter().map(|entry| &entry.output), output)
+    }
+
+    /// The identity of the output a client's `wl_output` names, or
+    /// `None` for a resource that is not one of ours or whose output
+    /// has already left.
+    pub(crate) fn output_identity(
+        &self,
+        resource: &smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    ) -> Option<smithay::output::WeakOutput> {
+        let output = Output::from_resource(resource)?.downgrade();
+        self.output_index_of(&output).map(|_| output)
+    }
+
+    /// Mirrors each output's EDID identity and mode list onto the
+    /// backend, where the IPC snapshot can reach them.
+    ///
+    /// Read straight off the `Output` the compositor already drives, so
+    /// what IPC reports and what `wl_output` / `zwlr_output_management`
+    /// advertise for the same head come from one source and cannot
+    /// drift. Rides along with the scale sync because the two change
+    /// together: every event that reshapes the output layout moves both.
+    pub(crate) fn sync_monitor_outputs(&mut self) {
+        let outputs: Vec<MonitorOutput> = self
+            .outputs
+            .iter()
+            .map(|entry| {
+                monitor_output_of(
+                    &entry.output,
+                    &entry.serial,
+                    entry.transform,
+                    &entry.modes,
+                    entry.powered,
+                    entry.vrr_supported,
+                    entry.vrr_enabled,
+                )
+            })
+            .collect();
+        let parked: Vec<ParkedMonitor> = self
+            .parked_outputs
+            .iter()
+            .map(|parked| ParkedMonitor {
+                name: parked.setup.output.name(),
+                identity: parked.setup.identity.clone(),
+                hardware: monitor_output_of(
+                    &parked.setup.output,
+                    &parked.setup.serial,
+                    parked.setup.transform,
+                    &parked.setup.modes,
+                    false,
+                    parked.setup.vrr_supported,
+                    false,
+                ),
+            })
+            .collect();
+        let backend = self.wm.backend_mut();
+        backend.monitor_outputs = outputs;
+        backend.parked_monitors = parked;
+    }
+
+    /// Change one live output's advertised scale from IPC. The scale
+    /// ledger, wl_output metadata, fractional-scale preference and the
+    /// primary output's compositor chrome are updated as one action so
+    /// an `ok` response cannot describe only half a change.
+    /// Restyles the session for a new primary-output scale from the
+    /// running session's own configuration, never from the file. Shared by
+    /// `hyprctl keyword monitor`/`hl.monitor` and wlr-output-management,
+    /// so the two routes to one user action cannot disagree about where
+    /// the configuration lives: a `config.toml` that stopped parsing, or an
+    /// edit nobody reloaded, stays out of the live session until a reload.
+    pub(crate) fn apply_primary_ui_scale(&mut self, scale: f32) {
+        let mut state = self.shell.session_state().clone();
+        state.scale = scale;
+        self.shell.apply_session_state(&mut self.wm, state);
+    }
+
+    pub(crate) fn set_output_scale(&mut self, name: &str, scale: f64) -> bool {
+        if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
+            return false;
+        }
+        let Some(index) = self.outputs.iter().position(|entry| entry.output.name() == name) else {
+            return false;
+        };
+        let entry = &mut self.outputs[index];
+        entry.scale = scale;
+        entry.output.change_current_state(None, None, Some(advertised_output_scale(scale as f32)), None);
+        self.output_mgmt.mark_dirty();
+        self.session_lock.mark_dirty();
+        self.sync_monitor_scales();
+        self.layer_shell.needs_arrange = true;
+        if index == 0 {
+            self.apply_primary_ui_scale(scale as f32);
+        }
+        self.wm.backend_mut().mark_damaged();
+        true
+    }
+
+    /// Lands a deferred focus intent on the seat's keyboard — a
+    /// window from `set_input_focus`, or nothing from
+    /// `publish_active_window(None)` (see [`FocusIntent`] for the bug
+    /// the second kind exists to prevent). A window that died in the
+    /// meantime clears focus rather than leaving it on the previous
+    /// window — matching what the X11 server does when a focused
+    /// window disappears. A window that is still alive but has no
+    /// `wl_surface` *yet* is retried instead, see below.
+    fn apply_pending_focus(&mut self) {
+        // While a session lock holds the seat, the intent stays parked
+        // (an `Option` check per pass) rather than being applied or
+        // dropped: applied, it would point the keyboard at a client
+        // behind the lock; dropped, the unlock would restore focus to
+        // a window `wm-core` had already moved on from.
+        if self.wm.backend().locked {
+            return;
+        }
+        let Some(intent) = self.wm.backend_mut().pending_focus.take() else {
+            return;
+        };
+        let target = match intent {
+            FocusIntent::Window(id) => Some(id),
+            FocusIntent::Nothing => None,
+        };
+        // An XWayland window exists as an X11 window before Xwayland
+        // binds a `wl_surface` to it, and that bind can land one or
+        // more passes after the map that focused it. Clearing the seat
+        // in that window (which this used to do) left `wm-core`
+        // believing the window was focused while the seat held nothing
+        // — a divergence `focus_client` cannot repair, because its
+        // "already focused" early return is exactly the path a user
+        // takes to try: clicking the window that already looks focused.
+        // The window stayed keyboard-dead until they focused something
+        // else and came back. So put the request back and retry on the
+        // next pass; the association arrives (and this lands), or the
+        // window dies (and the lookup below clears focus for real).
+        let awaiting_surface = target.is_some_and(|id| {
+            self.wm
+                .backend()
+                .windows
+                .get(&id)
+                .filter(|record| record.surface.alive())
+                .is_some_and(|record| record.surface.wl_surface().is_none())
+        });
+        if awaiting_surface {
+            self.wm.backend_mut().pending_focus = Some(intent);
+            return;
+        }
+        // Focus is two things to a client: the seat's keyboard focus,
+        // which decides where keys go, and an "I am the active window"
+        // flag it reads for its own styling - a title bar, a caret that
+        // blinks, an unfocused-dim treatment. Keyboard focus alone
+        // leaves every client permanently drawing itself as background
+        // furniture, so both kinds of surface get the flag here, and
+        // every window gets it (not just the newly focused one) so the
+        // one losing focus repaints inactive. When the intent is
+        // `Nothing`, every window loses the flag — which is the half of
+        // this that wakes a self-minimized Chromium on restore: the
+        // unset here is a real state change, so the restore's re-set
+        // produces a real configure instead of a dedup.
+        let mut restaged: Vec<WlWindowId> = Vec::new();
+        for (window_id, record) in self.wm.backend().windows.iter() {
+            let active = Some(*window_id) == target;
+            match &record.surface {
+                // xdg-shell carries it as a toplevel state on the next
+                // configure, which goes out with everything else this
+                // pass staged (`xdg::flush_configures`); the dedup there
+                // means an unchanged flag still costs nothing.
+                ManagedSurface::Xdg(toplevel) => {
+                    if toplevel.alive() {
+                        toplevel.with_pending_state(|state| {
+                            if active {
+                                state.states.set(XdgToplevelState::Activated);
+                            } else {
+                                state.states.unset(XdgToplevelState::Activated);
+                            }
+                        });
+                        restaged.push(*window_id);
+                    }
+                }
+                ManagedSurface::X11(surface) => {
+                    if surface.alive() {
+                        let _ = surface.set_activated(active);
+                    }
+                }
+            }
+        }
+        for window in restaged {
+            self.wm.backend_mut().note_configure(window);
+        }
+        // A layer surface holding *exclusive* keyboard interactivity
+        // outranks window focus on the seat (the protocol's demand —
+        // it is what a launcher types into). The activated flags above
+        // still applied, so `wm-core`'s idea of the focused window
+        // stays current and the seat returns to it the moment the
+        // layer surface lets go (`layers::sync_keyboard`).
+        if self.layer_shell.exclusive_focus.is_some() {
+            return;
+        }
+        // A focus grab (`focus_grab.rs`) pins the keyboard to its
+        // whitelist for as long as it holds, so window focus stops here
+        // too — one rung below exclusive interactivity in that module's
+        // ordering table. The activated flags above still applied, for
+        // the same reason they do under an exclusive layer surface:
+        // `wm-core`'s idea of the focused window stays current, and the
+        // seat returns to it when the grab ends — re-derived from
+        // `wm-core` at that moment rather than replayed, which is why
+        // this intent is dropped here and not parked the way the lock
+        // branch above parks it. Without this line the
+        // click-to-focus a dismissing press queues would drag the
+        // keyboard off an Omarchy menu the instant it opened over a
+        // window.
+        if self.focus_grab.is_active() {
+            return;
+        }
+        // A `Nothing` intent falls through here with no surface, which
+        // is the point: the seat drops the hidden window, so the keys
+        // typed while it is miniaturized stop landing on it, and the
+        // eventual restore is a real `wl_keyboard.enter` rather than a
+        // smithay-deduplicated no-op.
+        let surface = target
+            .filter(|_| !self.wm.backend().modal_keyboard_grabbed())
+            .and_then(|id| self.wm.backend().windows.get(&id))
+            .filter(|record| record.surface.alive())
+            .and_then(|record| crate::input::keyboard::KeyboardFocus::from_managed(&record.surface));
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+        }
+        // Mapping/raising a focused window can replace the surface beneath
+        // a stationary pointer. Enter that surface before waiting for
+        // physical motion so clients can set their cursor and activate
+        // pointer locks. The window already under the pointer is left
+        // alone: resending its position becomes the first motion of a drag.
+        crate::input::enter_replaced_pointer_target(self);
+    }
+}
+
+/// Builds and runs the entire compositor session; returns when the
+/// session ends (root-menu Exit, host window closed) or re-execs in
+/// place on a requested restart. The Wayland analogue of everything
+/// `crates/chonkstep/src/main.rs` does after config load — read that
+/// file for the loop-order rationale this mirrors.
+/// Whether some other desktop is already running here to nest inside.
+/// A bare TTY login has neither variable set; a terminal inside
+/// Hyprland, GNOME, or an X session has at least one.
+fn nesting_desktop_present() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
+}
+
+/// Omarchy's entry point talks to the Quickshell process the session
+/// has just relaunched. Run that one fallback through a login shell —
+/// the same environment contract as `host_omarchy_shell` — and wait
+/// asynchronously for its IPC target to become ready. The compositor
+/// is already blank and input-isolated while this child retries, so no
+/// sleep or process wait ever lands on the event thread and no desktop
+/// frame can leak through the startup race.
+const OMARCHY_LOCK_COMMAND: &str = "omarchy-system-lock";
+const OMARCHY_RECOVERY_LOCK_SCRIPT: &str = r#"
+for attempt in {1..100}; do
+    if omarchy-shell lock lock >/dev/null 2>&1; then
+        exec omarchy-system-lock
+    fi
+    sleep 0.1
+done
+exit 1
+"#;
+
+fn recovery_locker_argv<'a>(
+    command: &'a str,
+    omarchy_shell: &'a str,
+) -> Option<(&'a str, Vec<&'a str>)> {
+    if command == OMARCHY_LOCK_COMMAND {
+        return Some((omarchy_shell, vec!["-lc", OMARCHY_RECOVERY_LOCK_SCRIPT]));
+    }
+    let mut parts = command.split_whitespace();
+    let program = parts.next()?;
+    Some((program, parts.collect()))
+}
+
+
+pub fn run(config: wm_config::Config) -> Result<(), Box<dyn std::error::Error>> {
+    let host_display = crate::restart::HostDisplay::capture();
+    // Consume the supervisor's one-shot marker before bringing up any
+    // display machinery. A recovery with no resolved locker must fail
+    // at the login boundary, not finish booting an unlocked desktop.
+    let recovery_locker = if recovering_from_crash() {
+        tracing::error!(
+            "RECOVERED FROM A CRASH: the previous compositor process exited abnormally and the session supervisor restarted it"
+        );
+        Some(config.lock_command.clone().ok_or_else(|| {
+            std::io::Error::other(
+                "crash recovery has no lock command; refusing to expose an unlocked desktop (set lock_command or desktop = \"omarchy\")",
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let mut event_loop: EventLoop<Compositor> = EventLoop::try_new()?;
+    let loop_handle = event_loop.handle();
+
+    // Keep registration alive through teardown. Children inherit ordinary
+    // signal delivery, while session stops still run the event-loop cleanup.
+    let _termination = crate::termination::install(&loop_handle)?;
+
+    let display: Display<Compositor> = Display::new()?;
+    let display_handle = display.handle();
+
+    // Wayland globals. Each `new::<Compositor>` registers the global
+    // against the delegate impls in `xdg.rs`/`input.rs`/`xwayland.rs`.
+    // v6, not smithay's default v5: version 6 is what carries
+    // `wl_surface.preferred_buffer_scale`, the direct statement of the
+    // session's scale that `xdg.rs`'s commit handler (and the
+    // live-rescale drain in `dispatch_pending`) sends per surface. The
+    // `wl_output.scale` advertisement alone also works for a client's
+    // first mapping, but a toolkit holding an already-mapped surface
+    // follows a *change* of scale far more reliably when told about
+    // its own surface than when left to re-derive it from the outputs
+    // it has entered.
+    let compositor_state = CompositorState::new_v6::<Compositor>(&display_handle);
+    let xdg_shell_state = XdgShellState::new::<Compositor>(&display_handle);
+    // xdg-decoration is what lets us tell clients "the server draws
+    // your chrome" — without it every GTK/Qt app draws its own
+    // titlebar and our chiseled frames would double up.
+    let xdg_decoration_state = XdgDecorationState::new::<Compositor>(&display_handle);
+    // `Server` is the whole point: `gdk_wayland_display_prefers_ssd()`
+    // is a plain equality test against this value, and it decides
+    // whether every GTK window on the desk draws its own titlebar.
+    let kde_decoration = KdeDecorationState::new::<Compositor>(&display_handle, crate::decoration::KDE_DEFAULT_MODE);
+    let shm_state = ShmState::new::<Compositor>(&display_handle, vec![]);
+    let output_manager_state = OutputManagerState::new_with_xdg_output::<Compositor>(&display_handle);
+    let data_device_state = DataDeviceState::new::<Compositor>(&display_handle);
+    let primary_selection_state = PrimarySelectionState::new::<Compositor>(&display_handle);
+    // Data control rides on both selections above, so it is built from
+    // the primary state rather than beside it — passing that state is
+    // what makes middle-click selections visible to a clipboard
+    // manager (see `data_control`'s module docs for the silent
+    // half-working session the alternative produces).
+    let data_control = crate::data_control::init(&display_handle, &primary_selection_state);
+    let xwayland_shell_state = XWaylandShellState::new::<Compositor>(&display_handle);
+    // The fractional-scale pair. Both are plain globals with no failure
+    // mode; registered here so they exist before any client can bind —
+    // the same timing rule as every global below.
+    let fractional_scale_state =
+        smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<Compositor>(&display_handle);
+    let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Compositor>(&display_handle);
+    let core_protocols = crate::core_protocols::init(&display_handle);
+    // Same timing rule as every global above: bound before the
+    // listening socket exists, because a global that is missing when a
+    // client binds might as well never have existed.
+    let workspaces = crate::workspace::init(&display_handle);
+
+    let mut seat_state: SeatState<Compositor> = SeatState::new();
+    let mut seat: Seat<Compositor> = seat_state.new_wl_seat(&display_handle, "chonkstep");
+    // Keyboard and pointer are assumed present — this is a desktop
+    // compositor; hot-plug tracking can come with the session backend.
+    // Keyboard layout from the environment, using libxkbcommon's own
+    // XKB_DEFAULT_* convention: a session started from a TTY has no
+    // desktop settings daemon to ask, and a compositor that hardcodes
+    // a US layout is unusable for everyone else. `scripts/wayland-
+    // session.sh` is where a login session sets these; the nested
+    // backend inherits whatever the host desktop already exported.
+    let resolved = resolve_keyboard_config(&wm_core::KeyboardConfig {
+        rules: config.input.rules.clone(),
+        model: config.input.model.clone(),
+        layout: config.input.layout.clone(),
+        variant: config.input.variant.clone(),
+        options: config.input.options.clone(),
+        repeat_rate: config.input.repeat_rate,
+        repeat_delay: config.input.repeat_delay,
+        numlock_by_default: config.input.numlock_by_default,
+    });
+    let numlock_by_default = resolved.numlock_by_default;
+    let repeat_delay = resolved.repeat_delay;
+    let repeat_rate = resolved.repeat_rate;
+    let keyboard_config = if let Err(error) = seat.add_keyboard(resolved.xkb_config(), repeat_delay, repeat_rate) {
+        // A typo—or a Lua value whose runtime source the static config
+        // reader cannot resolve—must cost the requested layout, never
+        // the login. libxkbcommon has already produced the precise
+        // diagnostic; fall back to its default keymap and keep a usable
+        // keyboard so the user can fix the file from this session.
+        tracing::warn!(
+            %error,
+            rules = %resolved.rules,
+            model = %resolved.model,
+            layout = %resolved.layout,
+            variant = %resolved.variant,
+            "configured xkb keymap was rejected; using the libxkbcommon default"
+        );
+        seat.add_keyboard(XkbConfig::default(), repeat_delay, repeat_rate)
+            .map_err(|fallback| format!("failed to initialize even the default seat keyboard: {fallback}"))?;
+        None
+    } else {
+        Some(resolved)
+    };
+    // The first keymap install, and so the one start-of-session moment
+    // `numlock_by_default` names. Nothing has keyboard focus yet: the
+    // first client to receive it reads the lock in its `enter`.
+    if numlock_by_default {
+        if let Some(keyboard) = seat.get_keyboard() {
+            crate::input::keyboard::lock_num_lock(&keyboard);
+        }
+    }
+    seat.add_pointer();
+    // wl_touch is a seat capability, not a per-device global. Keeping
+    // it present lets hot-plugged touchscreens work without changing
+    // the wl_seat capability set underneath already-bound clients.
+    seat.add_touch();
+
+    // Which kind of session this process is. Owning the hardware and
+    // living in a window on somebody else's desktop are the same
+    // desktop with different plumbing, so the choice is made here, at
+    // startup, rather than at build time - one binary has to serve
+    // both "I am logging in from a TTY" and "I am previewing this
+    // inside my existing desktop". `CHONKSTEP_BACKEND` forces the
+    // decision ("drm"/"session" or "winit"/"nested"); otherwise an
+    // existing `WAYLAND_DISPLAY` or `DISPLAY` means there is already a
+    // desktop here to nest inside, and their absence means a bare TTY.
+    let nested = match std::env::var("CHONKSTEP_BACKEND").ok().as_deref() {
+        Some("winit") | Some("nested") => true,
+        Some("drm") | Some("session") => false,
+        Some(other) => {
+            tracing::warn!(backend = other, "unknown CHONKSTEP_BACKEND value; deciding automatically");
+            nesting_desktop_present()
+        }
+        None => nesting_desktop_present(),
+    };
+
+    let (mut graphics, mut output_setups) = if nested {
+        tracing::info!("nested backend: rendering into a window on the host desktop");
+        // Match the native EGLContext's GLES 2 minimum. Smithay's winit
+        // convenience initializer requests GLES 3 unconditionally and
+        // rejects otherwise usable older/software contexts before its
+        // GLES 2-capable renderer can inspect their extensions. Drivers
+        // may provide a newer compatible context; renderer capabilities
+        // continue to come from that actual context, not this minimum.
+        let (winit_backend, winit_source) = winit::init_from_attributes_with_gl_attr::<GlesRenderer>(
+            smithay::reexports::winit::window::Window::default_attributes()
+                .with_inner_size(smithay::reexports::winit::dpi::LogicalSize::new(1280.0, 800.0))
+                .with_title("Smithay")
+                .with_visible(true),
+            smithay::backend::egl::context::GlAttributes {
+                version: (2, 0), profile: None, debug: cfg!(debug_assertions), vsync: false,
+            },
+        ).map_err(|error| format!("winit backend init failed: {error}"))?;
+        let window_size = winit_backend.window_size();
+
+        // Flipped180 is deliberately copied from Smithay's own winit
+        // references (anvil, smallvil): the winit EGL surface's
+        // coordinate origin differs from the output's, and this
+        // transform is how upstream squares the two. The session
+        // backend's outputs need no such correction, which is why the
+        // transform lives in this arm and not in the shared scene.
+        let mode = Mode { size: window_size, refresh: 60_000 };
+        let output = Output::new(
+            "chonkstep".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "chonkstep".into(),
+                model: "winit".into(),
+            },
+        );
+        output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
+        output.set_preferred(mode);
+
+        // Host-window events: input feeds the translation layer in
+        // `input.rs` (the seam where raw winit input becomes seat
+        // events plus `BackendEvent`s per the wm-x11 contract);
+        // everything else is resize/redraw/close plumbing.
+        loop_handle
+            .insert_source(winit_source, |event, _, comp| match event {
+                WinitEvent::Resized { size, .. } => comp.on_output_resized(size),
+                WinitEvent::Input(event) => crate::input::process_input_event(comp, event),
+                // The host asked us to repaint (the window was exposed
+                // or resized): full-frame damage, same as any scene
+                // change.
+                WinitEvent::Redraw => comp.wm.backend_mut().mark_damaged(),
+                WinitEvent::CloseRequested => comp.running = false,
+                WinitEvent::Focus(_) => {}
+            })
+            .map_err(|error| format!("failed to register the winit event source: {error}"))?;
+
+        let size = Size::new(window_size.w.max(0) as u32, window_size.h.max(0) as u32);
+        // One output at the origin: a host window is one screen by
+        // construction, and everything downstream — the ledger's
+        // monitor list, the renderer's viewport offset, the pointer
+        // clamp — then takes the degenerate single-monitor case of the
+        // multi-monitor path rather than a path of its own.
+        (
+            Graphics::Winit(Box::new(winit_backend)),
+            vec![OutputSetup {
+                output,
+                identity: None,
+                serial: String::new(),
+                position: Point::new(0, 0),
+                size,
+                transform: Transform::Normal,
+                requested_mode: None,
+                modes: vec![mode],
+                powered: true,
+                vrr_supported: false,
+                vrr_requested: false,
+                vrr_enabled: false,
+            }],
+        )
+    } else {
+        tracing::info!("session backend: taking over the DRM device and input");
+        let init = crate::session::init(&loop_handle, &display_handle)?;
+        (init.graphics, init.outputs)
+    };
+    let scale_override = chonk_shell::startup::read_scale_override(config.scale);
+    // Outputs a monitor rule disables are parked before any global is
+    // published, and before the layout is built without them. Walked
+    // downwards so each removal leaves the lower indices — the session
+    // backend's and this list's alike — where they were.
+    let mut parked_outputs = Vec::new();
+    for index in disabled_by_rules(&output_setups, &config.monitor_rules, 0).into_iter().rev() {
+        match crate::session::park_output(&mut graphics, index) {
+            Ok(()) => {
+                let setup = output_setups.remove(index);
+                tracing::info!(output = %setup.output.name(), "hyprland-config: monitor line disables this output; parked at startup");
+                parked_outputs.push(ParkedOutput { setup });
+            }
+            Err(error) => tracing::warn!(
+                output = %output_setups[index].output.name(),
+                %error,
+                "could not disable this output at startup; it stays in the layout"
+            ),
+        }
+    }
+    let monitor_scales = apply_monitor_rules(
+        &mut output_setups,
+        &config.monitor_rules,
+        scale_override.map(f64::from),
+    );
+    crate::session::apply_output_setups(&mut graphics, &mut output_setups);
+    let initial_layout: Vec<(Point, Size)> = output_setups.iter().map(|setup| (setup.position, setup.size)).collect();
+    crate::session::sync_positions(&mut graphics, &initial_layout);
+    let mut outputs: Vec<OutputEntry> =
+        output_setups.into_iter().map(|setup| OutputEntry::new(setup, &display_handle)).collect();
+    // The ledger's copy of the layout, which is what `wm-core` and the
+    // shell see through `Backend::monitors`. Built here, from the same
+    // list the renderer draws through, so the two can never disagree
+    // about where a monitor is. The first output is primary: on the
+    // session backend that is the first connected connector in kernel
+    // enumeration order, and there is no protocol or config that could
+    // currently say otherwise (see `session.rs`'s module docs).
+    let monitors: Vec<MonitorInfo> = outputs
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| MonitorInfo {
+            geometry: Rect { pos: entry.position, size: entry.size },
+            name: entry.output.name(),
+            identity: entry.identity.clone(),
+            primary: index == 0,
+        })
+        .collect();
+    for monitor in &monitors {
+        tracing::info!(
+            output = %monitor.name,
+            primary = monitor.primary,
+            x = monitor.geometry.pos.x,
+            y = monitor.geometry.pos.y,
+            width = monitor.geometry.size.w,
+            height = monitor.geometry.size.h,
+            "monitor in the desktop layout"
+        );
+    }
+
+    // linux-dmabuf, before the listening socket exists: a global that
+    // is missing when a client binds might as well never exist, and
+    // GPU clients read its absence as "this compositor has no GPU".
+    // Both backends own a `GlesRenderer`, so one call serves both.
+    let dmabuf = crate::dmabuf::init_for_graphics(&display_handle, &mut graphics);
+    // Explicit sync rides the same timing rule, and additionally only
+    // exists where a DRM device backs the session — its global is what
+    // lets a client (Chromium on NVIDIA, most famously) tell us when a
+    // dmabuf is actually finished instead of us sampling mid-render.
+    let syncobj = crate::dmabuf::init_syncobj(&display_handle, &graphics);
+    // Same timing rule as dmabuf: bound before any client can connect.
+    let protocols = crate::protocols::init(&display_handle);
+    let image_capture = crate::image_capture::init(&display_handle);
+    let toplevel_mapping = crate::toplevel_mapping::init(&display_handle);
+    let output_mgmt = crate::output_mgmt::init(&display_handle);
+    let output_power = crate::output_power::init(&display_handle, &graphics);
+    // Gamma control rides the same timing rule and additionally asks
+    // the graphics stack what its hardware can do: an output with no
+    // gamma LUT — every nested one, and some real crtcs — is refused
+    // honestly, and a session where no output can be tinted advertises
+    // no global at all rather than one that lies.
+    let gamma = crate::gamma::init(&display_handle, &graphics, &outputs);
+    let ctm = crate::ctm::init(&display_handle, crate::gamma::available(&gamma));
+    // And again for the one protocol with no crate behind it: this is
+    // the global Omarchy's Quickshell looks for the moment it connects,
+    // and finding it absent is what makes every popout in that shell
+    // impossible to dismiss by clicking away. See `focus_grab.rs`.
+    let focus_grab = crate::focus_grab::init(&display_handle);
+    let global_shortcuts = crate::global_shortcuts::init(&display_handle);
+    // The ecosystem protocols, under the same timing rule. Layer-shell
+    // is what fuzzel/mako/waybar look for the moment they connect;
+    // layer-shell and session-lock both consult the shared
+    // security-context policy excluding confined clients; the idle
+    // notifier's timers live on this very event loop.
+    let layer_shell = crate::layers::LayerShell::new(
+        smithay::wayland::shell::wlr_layer::WlrLayerShellState::new_with_filter::<Compositor, _>(
+            &display_handle,
+            crate::state::privileged_global_visible,
+        ),
+    );
+    let session_lock = crate::lock::SessionLock::new(smithay::wayland::session_lock::SessionLockManagerState::new::<
+        Compositor,
+        _,
+    >(&display_handle, crate::state::privileged_global_visible));
+    let mut idle = crate::idle::Idle::new(
+        smithay::wayland::idle_notify::IdleNotifierState::<Compositor>::new(&display_handle, loop_handle.clone()),
+        smithay::wayland::idle_inhibit::IdleInhibitManagerState::new::<Compositor>(&display_handle),
+    );
+    if let Some(status) = crate::inhibit_bus::init(&loop_handle) {
+        idle.attach_screen_saver_status(status);
+    }
+    tracing::info!("layer-shell, session-lock and idle-notify advertised");
+    // Same timing rule again, plus one of its own: the seat this is
+    // handed must already carry a keyboard, because smithay's handler
+    // unwraps it on the first synthetic key. `add_keyboard` above is
+    // what guarantees that, and `virtual_keyboard::init` says so out
+    // loud if it ever stops being true.
+    let virtual_keyboard = crate::virtual_keyboard::init(&display_handle, &seat);
+    let virtual_pointer = crate::virtual_pointer::init(&display_handle);
+
+    // The listening socket clients connect to, plus the display's own
+    // fd so wayland-server processes client requests — both plain
+    // calloop sources.
+    let listening_socket = ListeningSocketSource::new_auto()?;
+    let socket_name = listening_socket.socket_name().to_os_string();
+    loop_handle
+        .insert_source(listening_socket, |client_stream, _, comp| {
+            match comp.display_handle.insert_client(client_stream, Arc::new(ClientState::default())) {
+                Ok(client) => crate::client_mesa::record_peer(&client, &comp.display_handle),
+                Err(error) => tracing::warn!(?error, "failed to admit a wayland client"),
+            }
+        })
+        .map_err(|error| format!("failed to register the wayland socket source: {error}"))?;
+    // A separate connection lets unmodified recording clients opt into the
+    // displayed UI without changing any concurrent screenshot/recording client.
+    // The name stays outside wayland-* so generic discovery cannot silently
+    // opt an ordinary client in. Both sockets disappear together. A
+    // sandbox-context connection never inherits this connection-local policy.
+    let demo_name = format!("chonkstep-capture-{}", socket_name.to_string_lossy());
+    match ListeningSocketSource::with_name(&demo_name) {
+        Ok(socket) => {
+            loop_handle.insert_source(socket, |stream, _, comp| {
+                let data = ClientState { capture_overlays: true, ..ClientState::default() };
+                match comp.display_handle.insert_client(stream, Arc::new(data)) {
+                    Ok(client) => crate::client_mesa::record_peer(&client, &comp.display_handle),
+                    Err(error) => tracing::warn!(?error, "failed to admit a demo capture client"),
+                }
+            }).map_err(|error| format!("failed to register the demo capture socket: {error}"))?;
+        }
+        Err(error) => tracing::warn!(?error, socket = %demo_name, "demo capture connection unavailable"),
+    }
+    let display_source = Dispatcher::new(Generic::new(display, Interest::READ, TriggerMode::Level), |_, display, comp: &mut Compositor| {
+            // SAFETY: the display is owned by this source and never
+            // moved out of it; `get_mut` is the documented access
+            // pattern for dispatching from inside calloop.
+            if let Err(error) = unsafe { display.get_mut().dispatch_clients(comp) } {
+                tracing::error!(?error, "wayland display dispatch failed, shutting down");
+                comp.running = false;
+            }
+            Ok(PostAction::Continue)
+        });
+    loop_handle
+        .register_dispatcher(display_source.clone())
+        .map_err(|error| format!("failed to register the wayland display source: {error}"))?;
+
+    // This binary IS the Wayland session, and says so rather than
+    // leaving the shell to deduce it from `/proc/self/exe` — which
+    // answers " (deleted)" for any session whose binary has been
+    // rebuilt under it, and silently launched every browser on
+    // XWayland at double scale when it did.
+    chonk_shell::spawn::declare_display_stack(chonk_shell::spawn::DisplayStack::Wayland);
+
+    // Take the hot-restart marker out of the environment beside the
+    // stack declaration, for the same two reasons: both are one-shot
+    // facts about this process, and both have to be settled before any
+    // thread exists — this one because `remove_var` is only sound while
+    // single-threaded, and because everything this session spawns
+    // inherits whatever is left behind here.
+    chonk_shell::startup::consume_session_continuation();
+    // Children the shell spawns find the session through the
+    // environment, so it must be set before `Shell::new` (which may
+    // autostart things). Replace the host's X11 display too: even if
+    // our XWayland cannot start, children must not escape to the host.
+    std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    std::env::remove_var("DISPLAY");
+    tracing::info!(socket = ?socket_name, "wayland socket listening");
+
+    // Bind and publish the X11 display before shell construction can
+    // autostart X11 applications. Server initialization overlaps theme
+    // and shell setup; its Ready callback is serviced once comp exists.
+    // Failure to spawn still degrades only X11 compatibility.
+    crate::xwayland::register_source(&display_handle, &loop_handle)?;
+
+    // Hyprland IPC, for Omarchy's unmodified shell and the real
+    // `hyprctl`. Bound here, beside `WAYLAND_DISPLAY`, for the same two
+    // reasons that variable is set here: it exports
+    // `HYPRLAND_INSTANCE_SIGNATURE`, which must be in the environment
+    // before `Shell::new` autostarts anything that would look for it,
+    // and setting an environment variable is only sound while this
+    // process is still single-threaded. Off unless the session asked
+    // for it; see `hyprland_ipc::init`.
+    let hyprland_ipc = crate::hyprland_ipc::init();
+
+    // Session policy comes from `chonk_shell::startup`, shared with the
+    // X11 binary: same env-over-config precedence, same theme
+    // resolution, same cursor sizing. A compositor that resolved these
+    // its own way is exactly how the two sessions would drift.
+    //
+    // Resolved as one `SessionState` rather than value by value, and by
+    // the same call the reload below makes, so a session that has been
+    // reloaded a dozen times is indistinguishable from one that started
+    // where it now stands.
+    let explicit_scale = scale_override.is_some();
+    let primary_scale = monitor_scales.first().copied().unwrap_or(1.0) as f32;
+    let state = SessionState::resolve_with_scale_default(&config, primary_scale);
+    // Kept separately because `state` is handed off to the applier
+    // below, and the compositor's own pointer is sized from the scale
+    // here (and only here — every later change to it arrives through
+    // `pending_cursor_scale`).
+    let scale = state.scale;
+    tracing::info!(scale, "UI scale (config `scale`; CHONKSTEP_SCALE overrides)");
+    // XWayland clients draw their own Xcursor pointers and have no way
+    // to learn this session's scale otherwise.
+    ensure_xcursor_size(scale);
+    // The `env` lines from the desktop's own Hyprland configuration
+    // (`wm_config::hyprland`), for the same reason and in the same
+    // window as the cursor size above: they exist to be *inherited* —
+    // `GDK_BACKEND`, `MOZ_ENABLE_WAYLAND` and the rest are how an
+    // Omarchy machine's toolkits get onto Wayland at all — so they have
+    // to be set before this process starts anything, and this is still
+    // the single-threaded part of startup where setting them is sound.
+    // Empty on a session that reads no such configuration, which is
+    // most of them.
+    chonk_shell::startup::apply_session_env(&state.session_env);
+    chonk_shell::startup::clear_inherited_gtk_scale_env();
+    let theme = state.theme();
+    tracing::info!(theme = %theme.id, decoration_style = state.decoration_style.name(), "theme loaded");
+    // The font database is built out here rather than inside the engine
+    // so the shell can hold on to it and build this engine's
+    // replacements around the same one on every later restyle. A
+    // restyle must restyle and not re-scan fontconfig — doubly so on
+    // this stack, where the process that would block on that scan is
+    // the display server every client is waiting on. See
+    // `wm_theme::FontState`.
+    let fonts = FontState::new();
+    let engine = state.decoration_engine(fonts.clone());
+
+    // The outputs advertise the session's scale from here on — the only
+    // way a native Wayland client ever learns this desktop is scaled
+    // (the per-child `GDK_SCALE`/`QT_SCALE_FACTOR` environment the
+    // launcher sets is ignored by toolkits for buffer scale). The first
+    // attempt at this set `change_current_state(scale = 2)` alone and
+    // was reverted: with the damage trackers reading their scale from
+    // the outputs, every chrome element — a memory buffer at a
+    // device-pixel position with a device-pixel size — was multiplied
+    // to double size while the wallpaper stayed anchored at the origin
+    // and the dock at the right edge, so the wallpaper showed a
+    // quarter of itself and the dock grew off the screen. The full
+    // account of which coordinate space each half of smithay's
+    // pipeline works in lives on `physical_damage_tracker`, and the
+    // fix is split exactly along it: the advertisement is protocol
+    // metadata (here and in `advertise_scale`), the compositor's own
+    // composition stays pinned to physical pixels
+    // (`physical_damage_tracker`, `session::attach_output`), and
+    // client buffers are put back at 1 buffer pixel : 1 screen pixel
+    // per surface (`renderer::push_surface_tree`). `wm-core`, the
+    // theme and the shell remain physical end to end and never hear
+    // about any of it. Fractional-scale clients additionally hear the
+    // exact fraction per surface (see `xdg.rs`'s commit handler).
+    let effective_monitor_scales = if explicit_scale { vec![scale as f64; outputs.len()] } else { monitor_scales };
+    advertise_scales(&mut outputs, &effective_monitor_scales);
+
+    // The desktop shell is built against the mutable backend before
+    // `WindowManager::new` takes ownership — the exact construction
+    // order the X11 binary uses, for the exact same borrow reason.
+    let gpu_timer = crate::gpu_timer::GpuTimer::default();
+    let mut backend = WaylandBackend::new(display_handle.clone(), monitors, scale);
+    backend.graphics_diagnostics = crate::session::graphics_diagnostics(&graphics);
+    backend.gpu_timings = gpu_timer.measurements.clone();
+    backend.native_frame_stats = crate::session::native_frame_stats(&graphics);
+    backend.monitor_scales = effective_monitor_scales;
+    backend.repeat_delay = std::time::Duration::from_millis(repeat_delay as u64);
+    backend.repeat_rate = repeat_rate as u32;
+    // The layout actually installed, so IPC reports the keymap in force
+    // rather than the config's request (they differ under XKB_DEFAULT_*).
+    backend.keyboard_layout = keyboard_config.as_ref().map(|config| config.layout.clone()).unwrap_or_default();
+    // The whole screen, as the shell sizes the desktop against it: the
+    // union of every monitor. Where the dock and the workareas land
+    // inside that union is the shell's decision, not this loop's.
+    let output_size = backend.output_size;
+    let capture_tool = crate::capture_tool::Service::new(fonts.clone());
+    let mut shell = Shell::new(&mut backend, &state, fonts);
+    // No `scan_existing_windows` here: a compositor's clients cannot
+    // predate the compositor. (Hot-restart adoption is impossible for
+    // the same reason — see `Compositor::restart`.)
+    let mut wm = WindowManager::new(backend, Box::new(engine));
+    // Session policy — focus, placement, edge resistance, the keymap
+    // and the grabs that go with it — is applied through the very call
+    // a live reload makes, in place of the setter block that used to
+    // stand here. Two places that set a setting is how a setting ends
+    // up reloadable but not startable, or the reverse. The look half
+    // costs nothing: the shell was just built from this same state, so
+    // the applier finds nothing changed there and repaints nothing.
+    //
+    // The config's combos still reach `grab_key`, one layer down, and
+    // that still matters here for the reason it always did: a "grab" on
+    // this stack is only a filter entry — the compositor sees every key
+    // regardless — but going through the same path keeps `wm-core`'s
+    // bookkeeping, and any future per-combo policy, identical on both
+    // stacks. `wm-core`'s own modal Alt+Tab grabs belong to
+    // `bind_default_keys` below; the applier only ever reconciles the
+    // grabs the *config* asked for.
+    shell.initialize_window_manager(&mut wm);
+    wm.set_workarea(shell.workarea(output_size));
+    wm.bind_default_keys();
+
+    let mut comp = Compositor {
+        hyprland_ipc,
+        workspaces,
+        hyprland_ipc_ready: false,
+        control_ready: false,
+        // A subscriber present on the first pass must receive a
+        // baseline even before the desktop produces its first event.
+        hyprland_state_dirty: true,
+        foreign_toplevel_dirty: true,
+        observed_wm_protocol_revision: wm.protocol_state_revision(),
+        protocol_publish_metrics: ProtocolPublishMetrics::default(),
+        gpu_timer,
+        frame_stats: FrameStats::default(),
+        wm,
+        shell,
+        display_handle,
+        loop_handle,
+        compositor_state,
+        xdg_shell_state,
+        xdg_decoration_state,
+        kde_decoration,
+        shm_state,
+        seat_state,
+        keyboard_config,
+        clipboard_persistence: crate::selection::persistence::Persistence::default(),
+        mac_keyboard: crate::input::keyboard::mac::MacKeyboard::default(),
+        mac_copy_order: Default::default(),
+        output_manager_state,
+        data_device_state,
+        primary_selection_state,
+        data_control,
+        xwayland_shell_state,
+        fractional_scale_state,
+        viewporter_state,
+        core_protocols,
+        popups: PopupManager::default(),
+        ipc_sources: Vec::new(),
+        source_scratch: Vec::new(),
+        source_membership_scratch: HashSet::new(),
+        hyprland_source_scratch: HashSet::new(),
+        seat,
+        outputs,
+        parked_outputs,
+        applied_monitor_rules: HashMap::new(),
+        surface_outputs: crate::surface_outputs::SurfaceOutputs::default(),
+        pacing_surfaces: HashMap::new(),
+        pacing_scratch: crate::xdg::PacingScratch::default(),
+        pacing_fifo_deadlines: HashMap::new(),
+        xwayland: crate::xwayland::State::default(),
+        ui_scale: scale,
+        graphics,
+        snapshot_downloads: crate::capture::SnapshotDownloads::default(),
+        screenshot_poller: crate::capture::ScreenshotRequestPoller::new(Instant::now()),
+        capture_tool,
+        dmabuf,
+        syncobj,
+        protocols,
+        image_capture,
+        _toplevel_mapping: toplevel_mapping,
+        output_mgmt,
+        output_power,
+        gamma,
+        _ctm: ctm,
+        layer_shell,
+        session_lock,
+        focus_grab,
+        global_shortcuts,
+        idle,
+        _virtual_keyboard: virtual_keyboard,
+        _virtual_pointer: virtual_pointer,
+        pointer_location: (0.0, 0.0).into(),
+        touchpad_pointer_captured: false,
+        cursor_status: CursorImageStatus::default_named(),
+        cursor_theme: None,
+        tablet_cursors: Vec::new(),
+        cursors: CursorSet::build(scale),
+        start_time: Instant::now(),
+        running: true,
+        restart: false,
+    };
+    // Named cursor shapes load on their own thread from here on. The
+    // environment the theme resolves through (`XCURSOR_THEME`,
+    // `XCURSOR_PATH`, the pinned `XCURSOR_SIZE`) is final by now.
+    crate::cursor_theme::set_base_size(&mut comp, chonk_shell::startup::xcursor_base_size());
+    comp.cursor_theme = crate::cursor_theme::init(&comp.loop_handle.clone());
+    crate::hyprland_ipc::refresh_keyboard_layout(&mut comp);
+
+    // Cross into the lock domain before the first dispatch. Clients
+    // may already have been spawned during shell construction, but no
+    // Wayland request can be serviced and no frame can be rendered
+    // until the loop below; from here onward both paths see `locked`.
+    // Starting blank ourselves also closes the launcher-failure race:
+    // if it exits before acquiring ext-session-lock, the desktop stays
+    // black and input-isolated rather than falling open.
+    if let Some(command) = recovery_locker.as_deref() {
+        crate::lock::begin_crash_recovery_lock(&mut comp);
+        // The override is an E2E seam, accepted only in the same
+        // process that has enabled the private test door. It is also
+        // scrubbed from the child environment in `chonk-shell::spawn`.
+        let omarchy_shell = if std::env::var_os("CHONKSTEP_TEST_SOCKET").is_some() {
+            std::env::var("CHONKSTEP_TEST_RECOVERY_SHELL")
+                .ok()
+                .filter(|program| !program.trim().is_empty())
+                .unwrap_or_else(|| "bash".to_string())
+        } else {
+            "bash".to_string()
+        };
+        let (program, args) = recovery_locker_argv(command, &omarchy_shell).ok_or_else(|| {
+            std::io::Error::other(
+                "crash recovery resolved an empty lock command; refusing to expose an unlocked desktop",
+            )
+        })?;
+        tracing::warn!(
+            locker = command,
+            "launching the replacement locker from an already-locked session"
+        );
+        if chonk_shell::spawn::spawn_detached(program, &args).is_none() {
+            return Err(std::io::Error::other(format!(
+                "failed to launch recovery lock command {command:?}; refusing to expose an unlocked desktop"
+            ))
+            .into());
+        }
+    }
+
+    // Seed the hardware mirror from the outputs just created. Every
+    // later reshape re-syncs it, but the first IPC query can arrive
+    // before any reshape does, and a monitor list that reports no modes
+    // until something happens to move a scale is the same fabricated
+    // answer this replaced.
+    //
+    // Deliberately not `sync_monitor_scales`, which would also be
+    // correct-looking here and is not: `OutputEntry::new` starts every
+    // entry at 1.0 and only `advertise_scale` — which no startup path
+    // reaches — writes the session's real factor into it. Syncing
+    // scales from the entries at this point would overwrite the ledger
+    // the backend was *constructed* with and flatten a 2x session to 1x
+    // until something happened to change a scale.
+    comp.sync_monitor_outputs();
+    let (rules, _) = session_rules(&comp);
+    record_applied_monitor_rules(&mut comp, &rules);
+
+    // The end-to-end test door: a control socket for injected input,
+    // opened only when CHONKSTEP_TEST_SOCKET is set (a user session
+    // pays one env lookup here and nothing else). See `test_door.rs`.
+    crate::test_door::init(&comp.loop_handle);
+
+    tracing::info!("entering compositor loop");
+    let mut request_poller = SessionRequestPoller::new(Instant::now());
+    while comp.running {
+        // Read both process markers together, on the same bounded
+        // cadence as the X11 loop. Apply reload first if both exist:
+        // it preserves the shared ordering and leaves no requested
+        // state unapplied before the replacement image starts.
+        let requests = request_poller.poll(Instant::now());
+        // Reload is almost always the one a user wants: it re-reads the
+        // config and moves the running session onto it, where a restart
+        // here costs every client on the screen (there is no SaveSet to
+        // hand them forward — see `restart_in_place`). A file that no
+        // longer parses keeps the configuration already running and
+        // reports why through `configerrors`, so a mistyped edit costs the
+        // session nothing.
+        if requests.reload {
+            tracing::info!("reload requested — re-reading the config and applying it in place");
+            // Everything this reload touches — decoration rules and
+            // the drag modifier included — travels through
+            // `SessionState`, so the marker file and the bound `reload`
+            // key apply exactly the same set. They did not: the
+            // decoration policy was assigned here and nowhere else, so
+            // the key silently skipped it.
+            // The marker has nobody to answer; the shell logs and
+            // records a rejection itself.
+            let _ = comp.shell.reload_config(&mut comp.wm);
+            comp.hyprland_state_dirty = true;
+            comp.foreign_toplevel_dirty = true;
+        }
+        if requests.restart {
+            tracing::info!("restart requested — re-executing in place");
+            comp.restart = true;
+            break;
+        }
+        // Blocks on every source at once (Wayland clients, input,
+        // XWayland and dockapps). Time-only work contributes its exact
+        // deadline; otherwise the shell's bounded idle poll covers
+        // worker results and marker files without waking at display
+        // refresh rate. A held compositor binding contributes the
+        // key-repeat deadline separately because that state belongs to
+        // the seat, not to the backend-generic shell.
+        let now = std::time::Instant::now();
+        let mut wait = comp.shell.next_housekeeping_in(now);
+        if let Some(deadline) = comp.mac_copy_order.deadline() { wait = wait.min(deadline.saturating_duration_since(now)); }
+        if comp.clipboard_persistence.active() || !comp.wm.backend().pending_quit.is_empty() { wait = wait.min(Duration::from_millis(5)); }
+        wait = wait.min(request_poller.next_deadline().saturating_duration_since(now));
+        wait = wait.min(comp.screenshot_poller.next_deadline().saturating_duration_since(now));
+        if let Some(deadline) = crate::input::repeating_binding_deadline(&comp) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::session::next_render_deadline(&comp.graphics) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::layout_scene::deadline(&comp) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::gesture_scene::deadline(&comp) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = comp.snapshot_downloads.deadline() {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::capture_tool::deadline(&comp) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::image_capture::deadline(&comp) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::protocols::screencopy_deadline(&comp.protocols) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = crate::session::next_hotplug_deadline(&comp.graphics) {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(deadline) = comp.wm.backend().cursor_visibility.deadline() {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(pacing) = comp.next_surface_pacing_in() {
+            wait = wait.min(pacing);
+        }
+        event_loop.dispatch(Some(wait), &mut comp)?;
+        comp.dispatch_pending();
+        let killed = std::mem::take(&mut comp.wm.backend_mut().killed_clients);
+        if !killed.is_empty() {
+            // Server-initiated kills can happen outside display dispatch. The
+            // Rust Wayland backend otherwise defers resource destruction until
+            // another client becomes readable, leaving a hung app's frame up.
+            let mut source = display_source.as_source_mut();
+            // SAFETY: the registered display stays in its Generic source; no
+            // descriptor is moved or replaced, and event dispatch has returned.
+            let display = unsafe { source.get_mut() };
+            for client in killed {
+                // The client may already be gone; dispatch still drains its
+                // queued destructors and never blocks on a silent connection.
+                let _ = display.backend().dispatch_single_client(&mut comp, client);
+            }
+            drop(source);
+            comp.dispatch_pending();
+        }
+    }
+
+    crate::gamma::restore_all(&mut comp);
+
+    // The Hyprland sockets go before the shell's, and explicitly,
+    // because a hot restart re-execs this process and `exec` runs no
+    // destructors: the incoming process would then find a live-looking
+    // socket at the path it wants and refuse to bind. Unlinking here is
+    // the same discipline `ControlSocket::shut_down` follows.
+    if let Some(server) = &mut comp.hyprland_ipc {
+        server.shut_down();
+    }
+    comp.shell.shut_down();
+
+    if comp.restart {
+        // `nested` is the decision this process made at startup, so the
+        // replacement makes the same one rather than re-deriving it
+        // from an environment this compositor itself wrote.
+        restart_in_place(nested, &host_display);
+    }
+    tracing::info!("compositor session over");
+    Ok(())
+}
+
+/// Re-execs the on-disk binary in place — resolved from `argv[0]`, not
+/// `current_exe()`, for the same pick-up-the-fresh-build reason the
+/// X11 binary documents at length. The one behavioral difference is
+/// unavoidable: Wayland clients die with our socket (no SaveSet), so
+/// the fresh process starts with an empty session.
+fn restart_in_place(nested: bool, host_display: &crate::restart::HostDisplay) -> ! {
+    use std::os::unix::process::CommandExt;
+    let bin = std::env::args_os().next().unwrap_or_else(|| "chonkstep-wayland".into());
+    let mut command = std::process::Command::new(&bin);
+    // Pin the backend and restore its upstream display. The current
+    // environment instead names our own sockets, which die on exec.
+    host_display.configure_restart(&mut command, nested);
+    // A deliberate hot restart is a continuation of the same session,
+    // not a fresh login — session-layout restore must not fire from
+    // it. On this stack the distinction is subtle (the clients die
+    // with the socket either way), but relaunching here would also
+    // relaunch on every `scripts/update.sh`, turning "pick up a new
+    // build" into "and also spawn last week's window list". The crash
+    // path never runs through here — a crashed compositor is re-execed
+    // by the session supervisor with a fresh environment, which is
+    // exactly when restore *should* fire.
+    command.env("CHONKSTEP_SESSION_CONTINUES", "1");
+    let err = command.exec();
+    tracing::error!(?err, bin = ?bin, "re-exec failed; exiting instead of restarting");
+    std::process::exit(1);
+}
+
+/// The built-in pointer: the classic black arrow with a white halo,
+/// matching the scaled cursor the X11 backend draws for the root
+/// window. Hand-authored rather than loaded from an Xcursor theme —
+/// the compositor must have a cursor before any theme machinery could
+/// run. Only a client's named shapes come from the theme, once the
+/// worker in `cursor_theme` has loaded them; this arrow is what they
+/// draw until then, and what `default` always draws.
+///
+/// `scale` is the session's UI scale, and it has to be baked into the
+/// pixels here because nothing downstream will apply it: the buffer is
+/// drawn by `renderer::push_cursor_elements` with no explicit size, so
+/// smithay sizes the element at the buffer's own dimensions divided by
+/// its buffer scale (`element::memory`'s `from_buffer`), and every
+/// damage tracker in this session renders at scale 1 whatever the
+/// outputs advertise (see `physical_damage_tracker`), so that size
+/// reaches the screen as-is. A fixed 1x arrow therefore reached the
+/// screen at 1x pixels next to `scaled(scale)` chrome and clients'
+/// `XCURSOR_SIZE`-sized pointers — the "tiny cursor over the desktop,
+/// right-sized cursor over a window" report.
+///
+/// Raising the *buffer scale* argument instead would move the bug, not
+/// fix it: a buffer scale of 2 tells smithay these pixels are 2 per
+/// logical unit, which halves the element on a scale-1 output.
+/// One pointer image plus the pixel of it that sits on the pointer's
+/// position. The arrow's hotspot is its (0, 0) tip; a resize
+/// double-arrow's is its center, because the shape *points across* the
+/// position it marks — drawn from its corner, the visible crosshair of
+/// the arrows would float below and right of the edge the user is
+/// actually about to grab.
+pub(crate) struct CursorSprite {
+    pub(crate) buffer: MemoryRenderBuffer,
+    pub(crate) hotspot: (i32, i32),
+    /// Physical pixels, retained alongside Smithay's opaque memory
+    /// buffer so the renderer can reject a cursor outside an output
+    /// before asking GLES to import it.
+    pub(crate) size: Size,
+}
+
+/// Every cursor this compositor draws itself, pre-rendered once per UI
+/// scale (not lazily per-hover) — the same set, from the same
+/// hand-authored shapes, as `wm-x11`'s `Cursors`. Diagonals are shared
+/// between opposite corners because the cursor shows the resize *axis*:
+/// SouthEast and NorthWest stretch along the same ↘ line.
+pub(crate) struct CursorSet {
+    arrow: CursorSprite,
+    resize_vertical: CursorSprite,
+    resize_horizontal: CursorSprite,
+    resize_southeast: CursorSprite,
+    resize_southwest: CursorSprite,
+    /// Client-named shapes from the Xcursor theme, filled in by the
+    /// theme worker's deliveries. Carried across a UI-scale rebuild.
+    pub(crate) themed: crate::cursor_theme::ThemedCursors,
+}
+
+impl CursorSet {
+    pub(crate) fn build(scale: f32) -> Self {
+        let right_angle = 90.0_f32.to_radians();
+        Self {
+            arrow: build_default_cursor(scale),
+            resize_vertical: build_resize_cursor(scale, 0.0),
+            // East/West: the same double-arrow turned to horizontal;
+            // the diagonals are the 45° rotations between them — the
+            // construction `wm-x11`'s `Cursors::create` uses. The
+            // angles are assigned by the picture they produce, not
+            // copied from there: with this rotation's sign convention
+            // (screen coordinates, y down), -45° is the ⤡ arrow along
+            // the NW–SE axis and +45° the ⤢ along NE–SW — verified by
+            // rasterizing both, because the first draft copied the X11
+            // literals and put each diagonal on the corner the OTHER
+            // one resizes.
+            resize_horizontal: build_resize_cursor(scale, right_angle),
+            resize_southeast: build_resize_cursor(scale, -right_angle / 2.0),
+            resize_southwest: build_resize_cursor(scale, right_angle / 2.0),
+            themed: Default::default(),
+        }
+    }
+
+    pub(crate) fn arrow(&self) -> &CursorSprite {
+        &self.arrow
+    }
+
+    /// The sprite for a resize edge — the mapping `wm-x11`'s
+    /// `Cursors::for_edge` uses, minus the `None` arm the caller
+    /// spells as [`CursorSet::arrow`].
+    pub(crate) fn for_edge(&self, edge: ResizeEdge) -> &CursorSprite {
+        match edge {
+            ResizeEdge::North | ResizeEdge::South => &self.resize_vertical,
+            ResizeEdge::East | ResizeEdge::West => &self.resize_horizontal,
+            ResizeEdge::SouthEast | ResizeEdge::NorthWest => &self.resize_southeast,
+            ResizeEdge::SouthWest | ResizeEdge::NorthEast => &self.resize_southwest,
+        }
+    }
+}
+
+/// Converts the rasterizer's premultiplied RGBA bytes to the BGRA byte order
+/// of little-endian Argb8888. Smithay's hardware cursor copy path requires
+/// this format. Keeping Abgr8888 forced the compositor's own pointer through
+/// GLES and retried an unusable cursor-plane copy on every animated frame.
+/// Convert once when building the cached sprite, preserving alpha and colors
+/// for both hardware scanout and the ordinary composition fallback.
+fn cursor_memory(pixels: &[u8], width: i32, height: i32) -> MemoryBuffer {
+    let mut memory = MemoryBuffer::from_slice(pixels, Fourcc::Argb8888, (width, height));
+    for pixel in memory.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    memory
+}
+
+/// Imports one cursor's converted pixels.
+///
+/// Buffer scale 1 for the reason `backend_impl::import_buffer`
+/// documents for decoration buffers: this session's ledger is in
+/// physical pixels, so a buffer already rasterized at the UI scale is
+/// 1 buffer pixel per unit of that space.
+fn import_cursor(pixels: &[u8], width: i32, height: i32) -> MemoryRenderBuffer {
+    MemoryRenderBuffer::from_memory(cursor_memory(pixels, width, height), 1, Transform::Normal, None)
+}
+
+fn build_default_cursor(scale: f32) -> CursorSprite {
+    let (pixels, width, height) = default_cursor_pixels(scale);
+    CursorSprite {
+        buffer: import_cursor(&pixels, width, height),
+        hotspot: (0, 0),
+        size: Size::new(width.max(0) as u32, height.max(0) as u32),
+    }
+}
+
+fn build_resize_cursor(scale: f32, angle_rad: f32) -> CursorSprite {
+    let (pixels, width, height, hotspot) = resize_cursor_pixels(scale, angle_rad);
+    CursorSprite {
+        buffer: import_cursor(&pixels, width, height),
+        hotspot,
+        size: Size::new(width.max(0) as u32, height.max(0) as u32),
+    }
+}
+
+/// The arrow's premultiplied RGBA8 pixels at `scale`, with its width
+/// and height. Split out from [`build_default_cursor`] because the
+/// scaling is the part worth testing and `MemoryRenderBuffer` exposes
+/// no dimensions to assert on.
+///
+/// Nearest-neighbour pixel replication rather than a filtered resample:
+/// the source is a hand-placed 1-bit shape with a one-pixel halo, and
+/// interpolating it would blur that halo into grey fringing at exactly
+/// the theme's hard-edged aesthetic. Sampling from the source origin
+/// also keeps the hotspot correct for free — the tip sits at pixel
+/// (0, 0) and `push_cursor_elements` draws this buffer at the pointer
+/// position with no hotspot offset, and (0, 0) maps to (0, 0) under any
+/// scale factor.
+fn default_cursor_pixels(scale: f32) -> (Vec<u8>, i32, i32) {
+    // '#' = black shape, 'o' = white halo, anything else transparent.
+    // Rows may be ragged; missing trailing cells are transparent.
+    const ARROW: [&str; 19] = [
+        "o",
+        "oo",
+        "o#o",
+        "o##o",
+        "o###o",
+        "o####o",
+        "o#####o",
+        "o######o",
+        "o#######o",
+        "o########o",
+        "o#####oooo",
+        "o##o##o",
+        "o#o o##o",
+        "oo  o##o",
+        "o    o##o",
+        "     o##o",
+        "      o##o",
+        "      o##o",
+        "       oo",
+    ];
+    let source_height = ARROW.len();
+    let source_width = ARROW.iter().map(|row| row.len()).max().unwrap_or(1);
+    // Never below 1x, matching `wm-x11`'s `create_scaled_cursor`: a
+    // sub-1 scale is a config typo, and shrinking the pointer below the
+    // hand-placed shape loses the halo entirely. (`f32::max` also
+    // returns 1.0 for a NaN scale, so the cast below is always sane.)
+    let scale = scale.max(1.0) as f64;
+    let width = ((source_width as f64 * scale).round() as usize).max(1);
+    let height = ((source_height as f64 * scale).round() as usize).max(1);
+    let mut pixels = vec![0u8; width * height * 4];
+    for y in 0..height {
+        // `min` guards the row a rounded-up edge pixel would sample
+        // past the source for.
+        let row = ARROW[((y as f64 / scale) as usize).min(source_height - 1)].as_bytes();
+        for x in 0..width {
+            let value: Option<[u8; 4]> = match row.get((x as f64 / scale) as usize) {
+                Some(b'#') => Some([0, 0, 0, 0xFF]),
+                Some(b'o') => Some([0xFF, 0xFF, 0xFF, 0xFF]),
+                _ => None,
+            };
+            if let Some(rgba) = value {
+                let at = (y * width + x) * 4;
+                pixels[at..at + 4].copy_from_slice(&rgba);
+            }
+        }
+    }
+    (pixels, width as i32, height as i32)
+}
+
+/// The double-headed resize arrow (⇕), the same polygon `wm-x11`'s
+/// `CURSOR_RESIZE_ARROW` hands the X server, traced as one outline:
+/// apex of the top triangle, down its right side, along the shaft, out
+/// to the bottom triangle, back up the other side. All four resize
+/// cursors are rotations of this one shape about its center.
+const CURSOR_RESIZE_ARROW: &[(f32, f32)] = &[
+    (5.0, 0.0),
+    (10.0, 6.0),
+    (7.0, 6.0),
+    (7.0, 14.0),
+    (10.0, 14.0),
+    (5.0, 20.0),
+    (0.0, 14.0),
+    (3.0, 14.0),
+    (3.0, 6.0),
+    (0.0, 6.0),
+];
+const CURSOR_RESIZE_ARROW_CENTER: (f32, f32) = (5.0, 10.0);
+
+/// Even-odd point-in-polygon (ray casting toward +x). Sampled at pixel
+/// centers below, so a pixel is part of the shape when its center is
+/// inside the outline — the software spelling of the X server's
+/// `FillPoly` this replaces.
+fn polygon_contains(polygon: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut inside = false;
+    let mut j = polygon.len() - 1;
+    for i in 0..polygon.len() {
+        let (xi, yi) = polygon[i];
+        let (xj, yj) = polygon[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// The resize arrow's premultiplied RGBA8 pixels at `scale`, rotated by
+/// `angle_rad` about its center, with the buffer size and the hotspot —
+/// the rotated center — in buffer coordinates. The rendering follows
+/// `wm-x11`'s `create_scaled_cursor` step for step (scale, rotate,
+/// shift into a non-negative box, black shape over a white halo) so the
+/// two backends' resize pointers are one drawing; the halo is the
+/// shape dilated by the same clamped radius, and it exists for the same
+/// reason as the arrow's — a flat black glyph disappears against a
+/// dark window at exactly the edge the user is squinting at.
+fn resize_cursor_pixels(scale: f32, angle_rad: f32) -> (Vec<u8>, i32, i32, (i32, i32)) {
+    let s = scale.max(1.0);
+    let (cx, cy) = CURSOR_RESIZE_ARROW_CENTER;
+    let (sin, cos) = angle_rad.sin_cos();
+    let outline: Vec<(f32, f32)> = CURSOR_RESIZE_ARROW
+        .iter()
+        .map(|&(x, y)| {
+            let (dx, dy) = (x - cx, y - cy);
+            ((dx * cos - dy * sin + cx) * s, (dx * sin + dy * cos + cy) * s)
+        })
+        .collect();
+    let hotspot_f = (cx * s, cy * s);
+
+    let min_x = outline.iter().map(|p| p.0).fold(hotspot_f.0, f32::min);
+    let min_y = outline.iter().map(|p| p.1).fold(hotspot_f.1, f32::min);
+    let max_x = outline.iter().map(|p| p.0).fold(hotspot_f.0, f32::max);
+    let max_y = outline.iter().map(|p| p.1).fold(hotspot_f.1, f32::max);
+
+    // Same halo radius and margin as the X11 rasterizer, so the two
+    // stay the same picture at every scale.
+    let halo = (s.round() as i32).clamp(1, 3);
+    let margin = halo + 1;
+    let shift_x = margin as f32 - min_x;
+    let shift_y = margin as f32 - min_y;
+    let width = (((max_x - min_x).round() as i32) + margin * 2).max(1) as usize;
+    let height = (((max_y - min_y).round() as i32) + margin * 2).max(1) as usize;
+    let hotspot = ((hotspot_f.0 + shift_x).round() as i32, (hotspot_f.1 + shift_y).round() as i32);
+
+    let shifted: Vec<(f32, f32)> = outline.iter().map(|&(x, y)| (x + shift_x, y + shift_y)).collect();
+    let shape: Vec<bool> = (0..width * height)
+        .map(|i| {
+            let (x, y) = ((i % width) as f32 + 0.5, (i / width) as f32 + 0.5);
+            polygon_contains(&shifted, x, y)
+        })
+        .collect();
+
+    let mut pixels = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let rgba: [u8; 4] = if shape[y * width + x] {
+                [0, 0, 0, 0xFF]
+            } else {
+                // The halo: any pixel within `halo` of the shape in
+                // Chebyshev distance — the same dilation the X11 side
+                // draws as offset copies of the polygon.
+                let mut near = false;
+                'scan: for dy in -halo..=halo {
+                    for dx in -halo..=halo {
+                        let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                        if nx >= 0
+                            && ny >= 0
+                            && (nx as usize) < width
+                            && (ny as usize) < height
+                            && shape[ny as usize * width + nx as usize]
+                        {
+                            near = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                if near {
+                    [0xFF, 0xFF, 0xFF, 0xFF]
+                } else {
+                    continue;
+                }
+            };
+            let at = (y * width + x) * 4;
+            pixels[at..at + 4].copy_from_slice(&rgba);
+        }
+    }
+    (pixels, width as i32, height as i32, hotspot)
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn drag_icon_offsets_accumulate_per_commit_and_saturate() {
+        // Each attach dx/dy is relative to the previous buffer, so two
+        // commits of (6, 10) leave the icon 12, 20 from the hotspot ...
+        let offset = DndIcon::shifted((0, 0).into(), (6, 10).into());
+        assert_eq!(DndIcon::shifted(offset, (6, 10).into()), SPoint::<i32, Logical>::from((12, 20)));
+        // ... a commit back by the same amount returns it, ...
+        assert_eq!(DndIcon::shifted(offset, (-6, -10).into()), SPoint::<i32, Logical>::from((0, 0)));
+        // ... and a client feeding extremes cannot overflow the sum.
+        assert_eq!(
+            DndIcon::shifted((i32::MAX, i32::MIN).into(), (1, -1).into()),
+            SPoint::<i32, Logical>::from((i32::MAX, i32::MIN))
+        );
+    }
+
+    #[test]
+    fn removing_an_output_unassigns_its_lock_surfaces_and_shifts_later_ones() {
+        assert_eq!(reindex_after_removal(Some(1), 1), None);
+        assert_eq!(reindex_after_removal(Some(2), 1), Some(1));
+        assert_eq!(reindex_after_removal(Some(0), 1), Some(0));
+        assert_eq!(reindex_after_removal(None, 0), None, "an unassigned surface stays unassigned");
+    }
+
+    #[test]
+    fn frame_stats_use_bounded_power_of_two_buckets_and_saturating_counts() {
+        let mut stats = FrameStats::default();
+        stats.record_dispatch(Duration::from_micros(1));
+        stats.record_dispatch(Duration::from_micros(8));
+        stats.record_render(Duration::from_millis(40));
+
+        assert_eq!(stats.dispatch.calls, 2);
+        assert_eq!(stats.dispatch_histogram[0], 1);
+        assert_eq!(stats.dispatch_histogram[3], 1);
+        assert_eq!(stats.render.calls, 1);
+        assert_eq!(stats.render_histogram[15], 1, "large frames stay in the final bucket");
+        assert_eq!(stats.dispatch.max, Duration::from_micros(8));
+    }
+
+    #[test]
+    fn omarchys_recovery_locker_waits_for_its_relaunched_shell() {
+        let (program, args) = recovery_locker_argv(OMARCHY_LOCK_COMMAND, "bash").unwrap();
+        assert_eq!(program, "bash", "Omarchy needs its login-shell environment");
+        assert_eq!(args, ["-lc", OMARCHY_RECOVERY_LOCK_SCRIPT]);
+        assert!(args[1].contains("omarchy-shell lock lock"));
+        assert!(args[1].contains("exec omarchy-system-lock"));
+
+        let (program, args) = recovery_locker_argv("swaylock --daemonize", "bash").unwrap();
+        assert_eq!(program, "swaylock", "an explicit ordinary locker stays direct");
+        assert_eq!(args, ["--daemonize"]);
+        assert!(recovery_locker_argv("   ", "bash").is_none());
+    }
+
+    // The rest of this module needs a wayland display, a GPU or a host
+    // window; the layout arithmetic needs none of them, and it is the
+    // part a single-connector test machine cannot demonstrate.
+
+    fn monitor(x: i32, y: i32, w: u32, h: u32) -> MonitorInfo {
+        MonitorInfo {
+            geometry: Rect { pos: Point::new(x, y), size: Size::new(w, h) },
+            name: format!("test-{x}x{y}"),
+            identity: None,
+            primary: x == 0 && y == 0,
+        }
+    }
+
+    #[test]
+    fn one_monitor_is_its_own_screen() {
+        assert_eq!(union_size(&[monitor(0, 0, 1920, 1080)]), Size::new(1920, 1080));
+    }
+
+    #[test]
+    fn side_by_side_monitors_span_their_widths() {
+        // The layout `session::init` builds: left to right, from the
+        // origin, at each output's mode size.
+        assert_eq!(union_size(&[monitor(0, 0, 1920, 1080), monitor(1920, 0, 1280, 1024)]), Size::new(3200, 1080));
+    }
+
+    #[test]
+    fn the_union_is_the_farthest_corner_not_the_last_monitor() {
+        // The tallest screen sets the height even when it is not the
+        // last one, and the box covers dead space rather than tracking
+        // the outline of the monitors — which is what makes it a
+        // bounding box and why the pointer needs its own confinement
+        // (see `input::confine_to_outputs`).
+        assert_eq!(union_size(&[monitor(0, 0, 1280, 1024), monitor(1280, 0, 1920, 1080)]), Size::new(3200, 1080));
+    }
+
+    // The cursor pixels are pure arithmetic over a const string
+    // table — no display, no GPU — which is the half of
+    // `build_default_cursor` that got the size wrong.
+
+    /// Alpha of the pixel at (x, y) in a `default_cursor_pixels` buffer.
+    fn alpha_at(pixels: &[u8], width: i32, x: i32, y: i32) -> u8 {
+        pixels[((y * width + x) * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn cursor_storage_matches_the_hardware_format_without_swapping_visible_colors() {
+        let rgba = [0x20, 0x40, 0x60, 0x80, 0x90, 0x30, 0x10, 0xff];
+        let memory = cursor_memory(&rgba, 2, 1);
+        assert_eq!(memory.format(), Fourcc::Argb8888);
+        assert_eq!(&*memory, &[0x60, 0x40, 0x20, 0x80, 0x10, 0x30, 0x90, 0xff]);
+        assert_eq!(memory.stride(), 8);
+    }
+
+    #[test]
+    fn the_default_cursor_grows_with_the_ui_scale() {
+        // The bug this pins: at scale 2.0 the arrow reached the screen
+        // at its 1x size (10x19) because nothing multiplied it, leaving
+        // a half-size pointer next to `scaled(2.0)` chrome.
+        let (_, base_width, base_height) = default_cursor_pixels(1.0);
+        assert_eq!((base_width, base_height), (10, 19));
+        let (_, width, height) = default_cursor_pixels(2.0);
+        assert_eq!((width, height), (base_width * 2, base_height * 2));
+    }
+
+    #[test]
+    fn a_fractional_scale_rounds_to_whole_pixels() {
+        let (pixels, width, height) = default_cursor_pixels(1.5);
+        assert_eq!((width, height), (15, 29));
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+    }
+
+    #[test]
+    fn the_hotspot_pixel_stays_at_the_origin() {
+        // `push_cursor_elements` draws this buffer at the pointer
+        // position with no hotspot offset, so the tip must remain at
+        // (0, 0) at every scale or the pointer would click low and to
+        // the right of where it points.
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            let (pixels, width, _) = default_cursor_pixels(scale);
+            assert_eq!(alpha_at(&pixels, width, 0, 0), 0xFF, "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn scaling_replicates_pixels_rather_than_blending_them() {
+        // Every destination pixel is one source pixel verbatim: a
+        // filtered resample would put partially transparent grey
+        // between the black shape and its white halo.
+        let (pixels, width, height) = default_cursor_pixels(2.0);
+        for y in 0..height {
+            for x in 0..width {
+                let at = ((y * width + x) * 4) as usize;
+                let rgba = &pixels[at..at + 4];
+                assert!(rgba == [0, 0, 0, 0] || rgba == [0, 0, 0, 0xFF] || rgba == [0xFF; 4], "({x}, {y}) is {rgba:?}");
+            }
+        }
+        // The source's transparent gap at (3, 12) ("o#o o##o") becomes
+        // a 2x2 transparent block, which is the replication itself.
+        assert_eq!(alpha_at(&pixels, width, 6, 24), 0);
+        assert_eq!(alpha_at(&pixels, width, 7, 25), 0);
+        assert_eq!(alpha_at(&pixels, width, 5, 24), 0xFF);
+    }
+
+    #[test]
+    fn a_scale_below_one_is_clamped() {
+        // A config typo must not shrink the pointer past the shape the
+        // halo was hand-placed on — same floor `wm-x11`'s
+        // `create_scaled_cursor` applies.
+        let (_, width, height) = default_cursor_pixels(1.0);
+        assert_eq!(default_cursor_pixels(0.25).1, width);
+        assert_eq!(default_cursor_pixels(0.0).2, height);
+    }
+
+    fn output_setup(name: &str, physical_mm: (i32, i32), size: Size, position: Point) -> OutputSetup {
+        use smithay::output::{Mode, PhysicalProperties, Subpixel};
+
+        let output = Output::new(
+            name.to_string(),
+            PhysicalProperties {
+                size: smithay::utils::Size::from(physical_mm),
+                subpixel: Subpixel::Unknown,
+                make: "test".into(),
+                model: "test".into(),
+            },
+        );
+        let mode = Mode { size: smithay::utils::Size::from((size.w as i32, size.h as i32)), refresh: 60_000 };
+        output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
+        output.set_preferred(mode);
+        OutputSetup {
+            output,
+            identity: None,
+            serial: String::new(),
+            position,
+            size,
+            transform: Transform::Normal,
+            requested_mode: None,
+            modes: vec![mode],
+            powered: true,
+            vrr_supported: false,
+            vrr_requested: false,
+            vrr_enabled: false,
+        }
+    }
+
+    fn monitor_rule(
+        output: &str,
+        mode: &str,
+        position: &str,
+        scale: &str,
+        extra: &[&str],
+    ) -> wm_config::hyprland::directive::Monitor {
+        wm_config::hyprland::directive::Monitor {
+            output: output.into(),
+            mode: mode.into(),
+            position: position.into(),
+            scale: scale.into(),
+            extra: extra.iter().map(|value| (*value).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn changed_monitor_rules_preserve_a_neighbors_runtime_setup() {
+        let mut left = output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(0, 50));
+        left.transform = Transform::_90;
+        left.size = Size::new(1080, 1920);
+        let right = output_setup("DP-2", (600, 340), Size::new(1920, 1080), Point::new(1920, 0));
+        let mut setups = vec![left, right];
+        let rules = vec![
+            monitor_rule("DP-1", "preferred", "auto", "1", &[]),
+            monitor_rule("DP-2", "preferred", "auto", "2", &[]),
+        ];
+        let preserved = HashMap::from([("DP-1".to_string(), 1.5)]);
+        let scales = apply_monitor_rules_preserving(&mut setups, &rules, Some(1.0), &preserved);
+        assert_eq!(scales, vec![1.5, 2.0]);
+        assert_eq!(setups[0].position, Point::new(0, 50));
+        assert_eq!(setups[0].size, Size::new(1080, 1920));
+        assert_eq!(setups[0].transform, Transform::_90);
+        assert_eq!(setups[0].requested_mode, None);
+        assert_eq!(setups[1].position, Point::new(1080, 0), "auto placement uses the neighbor's live width");
+    }
+
+    #[test]
+    fn monitor_rules_apply_exact_over_catchall_and_normalize_negative_positions() {
+        let mut setups = vec![
+            output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(0, 0)),
+            output_setup("HDMI-A-1", (300, 170), Size::new(1920, 1080), Point::new(1920, 0)),
+        ];
+        let rules = vec![
+            monitor_rule("", "preferred", "auto", "1", &[]),
+            monitor_rule("DP-1", "preferred", "-1920x100", "1.5", &[]),
+        ];
+        let scales = apply_monitor_rules(&mut setups, &rules, Some(2.0));
+        assert_eq!(scales, vec![1.5, 1.0]);
+        assert_eq!(setups[0].position, Point::new(0, 100));
+        assert_eq!(setups[1].position, Point::new(1920, 0));
+    }
+
+    #[test]
+    fn monitor_description_rule_follows_the_panel_instead_of_the_port() {
+        let description = "Dell Inc. DELL U2720Q ABC123";
+        let mut panel = output_setup("DP-7", (600, 340), Size::new(3840, 2160), Point::new(1920, 0));
+        panel.identity = Some(description.to_string());
+        panel.serial = "ABC123".to_string();
+        let mut setups = vec![
+            output_setup("eDP-1", (280, 160), Size::new(1920, 1080), Point::new(0, 0)),
+            panel,
+        ];
+        let rules = vec![
+            monitor_rule("", "preferred", "auto", "1", &[]),
+            monitor_rule(&format!("desc:{description}"), "preferred", "0x0", "2", &[]),
+        ];
+
+        let scales = apply_monitor_rules(&mut setups, &rules, Some(1.0));
+        assert_eq!(scales, vec![1.0, 2.0]);
+        assert_eq!(setups[1].position, Point::new(0, 0));
+    }
+
+    #[test]
+    fn monitor_rotation_is_applied_as_part_of_the_whole_line() {
+        let mut setups = vec![output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(77, 88))];
+        let rules = vec![monitor_rule("DP-1", "preferred", "0x0", "2", &["transform", "1"])];
+        let scales = apply_monitor_rules(&mut setups, &rules, Some(1.25));
+        assert_eq!(scales, vec![2.0]);
+        assert_eq!(setups[0].position, Point::new(0, 0));
+        assert_eq!(setups[0].size, Size::new(1080, 1920));
+        assert_eq!(setups[0].transform, Transform::_90);
+        assert_eq!(setups[0].requested_mode, Some(0));
+    }
+
+    #[test]
+    fn unsupported_monitor_fields_still_refuse_the_whole_line() {
+        let original = Point::new(77, 88);
+        for extra in [&["cm", "srgb"][..], &["bitdepth", "10"][..], &["transform", "1", "cm", "srgb"][..]] {
+            let mut setups = vec![output_setup("DP-1", (600, 340), Size::new(1920, 1080), original)];
+            let rules = vec![monitor_rule("DP-1", "preferred", "0x0", "2", extra)];
+            let scales = apply_monitor_rules(&mut setups, &rules, Some(1.25));
+            assert_eq!(scales, vec![1.25], "{extra:?}");
+            assert_eq!(setups[0].position, original, "position was not partially applied: {extra:?}");
+            assert_eq!(setups[0].size, Size::new(1920, 1080));
+            assert_eq!(setups[0].transform, Transform::Normal);
+            assert_eq!(setups[0].requested_mode, None);
+            assert!(disabled_by_rules(&setups, &rules, 1).is_empty(), "a refused line disables nothing: {extra:?}");
+        }
+        // `disabled` is a field this compositor honours: the line parks
+        // its output rather than being refused, and the geometry beside
+        // it is not applied to an output that is leaving the layout.
+        let mut setups = vec![output_setup("DP-1", (600, 340), Size::new(1920, 1080), original)];
+        let rules = vec![monitor_rule("DP-1", "preferred", "0x0", "2", &["disabled", "on"])];
+        assert_eq!(disabled_by_rules(&setups, &rules, 1), vec![0]);
+        let scales = apply_monitor_rules(&mut setups, &rules, Some(1.25));
+        assert_eq!(scales, vec![1.25]);
+        assert_eq!(setups[0].position, original);
+        assert_eq!(setups[0].requested_mode, None);
+    }
+
+    /// Every spelling of a monitor line's intent, and the whole-line
+    /// refusal of anything else, in one place.
+    #[test]
+    fn monitor_intent_reads_disable_transform_and_mirror_and_refuses_the_rest() {
+        let intent = |mode: &str, position: &str, extra: &[&str]| {
+            monitor_intent(&monitor_rule("eDP-1", mode, position, "1", extra)).map_err(str::to_string)
+        };
+        assert_eq!(intent("preferred", "auto", &[]), Ok(MonitorIntent::Enabled { transform: Transform::Normal }));
+        assert_eq!(intent("preferred", "auto", &["transform", "3"]), Ok(MonitorIntent::Enabled { transform: Transform::_270 }));
+        // conf: `monitor = eDP-1, disable`; Lua: `disabled = true` as the reader spells it.
+        assert_eq!(intent("disable", "", &[]), Ok(MonitorIntent::Disabled));
+        assert_eq!(intent("", "", &["disabled", "on"]), Ok(MonitorIntent::Disabled));
+        assert_eq!(intent("", "", &["disabled", "true"]), Ok(MonitorIntent::Disabled));
+        assert_eq!(intent("", "", &["disabled", "off"]), Ok(MonitorIntent::Enabled { transform: Transform::Normal }));
+        assert_eq!(intent("", "", &["disabled", "false", "transform", "1"]), Ok(MonitorIntent::Enabled { transform: Transform::_90 }));
+        assert_eq!(intent("", "", &["disabled", "maybe"]), Err("maybe".to_string()));
+        assert_eq!(intent("preferred", "auto", &["mirror", "DP-1"]), Ok(MonitorIntent::Mirror { source: "DP-1".into() }));
+        assert_eq!(intent("mirror", "DP-1", &[]), Ok(MonitorIntent::Mirror { source: "DP-1".into() }));
+        assert_eq!(intent("preferred", "auto", &["cm", "srgb"]), Err("cm".to_string()));
+        assert_eq!(intent("preferred", "auto", &["bitdepth", "10"]), Err("bitdepth".to_string()));
+        assert_eq!(intent("preferred", "auto", &["transform"]), Err("transform".to_string()));
+        assert_eq!(intent("preferred", "auto", &["transform", "9"]), Err("9".to_string()));
+    }
+
+    /// A rule that disables every connected output keeps the first one:
+    /// the desktop is never without an output, from config any more
+    /// than from IPC or output management (`park_output` refuses the
+    /// last output on those routes).
+    #[test]
+    fn rules_that_disable_every_output_keep_the_first_and_the_last_output_is_never_disabled() {
+        let setups = vec![
+            output_setup("eDP-1", (300, 190), Size::new(2560, 1600), Point::new(0, 0)),
+            output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(2560, 0)),
+        ];
+        let both = vec![monitor_rule("eDP-1", "disable", "", "", &[]), monitor_rule("DP-1", "", "", "", &["disabled", "on"])];
+        assert_eq!(disabled_by_rules(&setups, &both, 0), vec![1], "startup keeps the first when every rule disables");
+        assert_eq!(disabled_by_rules(&setups, &both, 1), vec![0, 1], "with another output staying, both may leave");
+        let catch_all = vec![monitor_rule("", "disable", "", "", &[])];
+        assert_eq!(disabled_by_rules(&setups, &catch_all, 0), vec![1]);
+        let one = vec![monitor_rule("eDP-1", "disable", "", "", &[])];
+        assert_eq!(disabled_by_rules(&setups, &one, 0), vec![0]);
+        assert_eq!(disabled_by_rules(&setups[..1], &one, 0), Vec::<usize>::new(), "the only output is kept");
+        assert_eq!(disabled_by_rules(&setups[..1], &one, 1), vec![0], "the only *new* output may leave beside a survivor");
+        let exact_over_catch_all = vec![monitor_rule("", "disable", "", "", &[]), monitor_rule("eDP-1", "preferred", "auto", "1", &[])];
+        assert_eq!(disabled_by_rules(&setups, &exact_over_catch_all, 0), vec![1], "an exact line wins over the catch-all");
+    }
+
+    /// A reload acts on the connectors whose resolved rule changed and
+    /// on no other: a save of an unrelated key touches nothing, and a
+    /// runtime disable of an output whose rule did not change survives.
+    #[test]
+    fn a_reload_reconciles_only_the_connectors_whose_rule_changed() {
+        let connectors = || {
+            [("eDP-1".to_string(), None), ("DP-1".to_string(), Some("Dell U2720Q ABC123"))].into_iter()
+        };
+        let before = vec![monitor_rule("", "preferred", "auto", "auto", &[]), monitor_rule("eDP-1", "preferred", "auto", "2", &[])];
+        let applied: HashMap<String, Option<wm_config::hyprland::directive::Monitor>> = connectors()
+            .map(|(name, identity)| {
+                let rule = resolve_monitor_rule(&name, identity, &before).cloned();
+                (name, rule)
+            })
+            .collect();
+        assert!(changed_monitor_rules(connectors(), &before, &applied).is_empty(), "the same rules change nothing");
+
+        let scale = vec![monitor_rule("", "preferred", "auto", "auto", &[]), monitor_rule("eDP-1", "preferred", "auto", "1.5", &[])];
+        assert_eq!(changed_monitor_rules(connectors(), &scale, &applied), vec!["eDP-1"]);
+
+        let disable = vec![monitor_rule("", "preferred", "auto", "auto", &[]), monitor_rule("eDP-1", "preferred", "auto", "2", &[]), monitor_rule("eDP-1", "", "", "", &["disabled", "on"])];
+        assert_eq!(changed_monitor_rules(connectors(), &disable, &applied), vec!["eDP-1"]);
+        assert!(rule_disables("eDP-1", None, &disable));
+        assert!(!rule_disables("DP-1", Some("Dell U2720Q ABC123"), &disable));
+
+        let by_description = vec![monitor_rule("", "preferred", "auto", "auto", &[]), monitor_rule("eDP-1", "preferred", "auto", "2", &[]), monitor_rule("desc:Dell U2720Q ABC123", "disable", "", "", &[])];
+        assert_eq!(changed_monitor_rules(connectors(), &by_description, &applied), vec!["DP-1"]);
+
+        let catch_all_gone = vec![monitor_rule("eDP-1", "preferred", "auto", "2", &[])];
+        assert_eq!(changed_monitor_rules(connectors(), &catch_all_gone, &applied), vec!["DP-1"]);
+
+        let unknown: HashMap<String, Option<wm_config::hyprland::directive::Monitor>> = HashMap::new();
+        assert_eq!(changed_monitor_rules(connectors(), &before, &unknown).len(), 2, "a connector never recorded counts as changed");
+    }
+
+    /// When the output at the origin leaves, the survivors are shifted
+    /// back to the origin rather than left at x = 1920 with a hole the
+    /// pointer and every rect would still count.
+    #[test]
+    fn a_layout_whose_first_output_left_is_shifted_back_to_the_origin() {
+        let mut setups = vec![
+            output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(2560, 120)),
+            output_setup("DP-2", (600, 340), Size::new(1920, 1080), Point::new(4480, 0)),
+        ];
+        normalize_setups(&mut setups);
+        assert_eq!((setups[0].position, setups[1].position), (Point::new(0, 120), Point::new(1920, 0)));
+        normalize_setups(&mut []);
+    }
+
+    #[test]
+    fn an_invalid_scale_still_reserves_its_layout_slot_for_auto_positioning() {
+        for scale in ["999", "0.25", "NaN", "inf", "invalid"] {
+            let mut setups = vec![
+                output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(0, 0)),
+                output_setup("HDMI-A-1", (300, 170), Size::new(1920, 1080), Point::new(500, 500)),
+            ];
+            let rules = vec![
+                monitor_rule("DP-1", "preferred", "100x100", scale, &["transform", "1"]),
+                monitor_rule("HDMI-A-1", "preferred", "auto", "1", &[]),
+            ];
+            let scales = apply_monitor_rules(&mut setups, &rules, Some(1.25));
+            assert_eq!(scales, vec![1.25, 1.0], "rejected scale {scale}");
+            assert_eq!(setups[0].position, Point::new(0, 0));
+            assert_eq!(setups[0].size, Size::new(1920, 1080));
+            assert_eq!(setups[0].transform, Transform::Normal);
+            assert_eq!(setups[0].requested_mode, None, "the whole rule must be refused");
+            assert_eq!(
+                setups[1].position,
+                Point::new(1920, 0),
+                "auto-positioning must reserve the rejected output's original width"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_monitor_modes_select_the_nearest_advertised_timing() {
+        use smithay::output::Mode;
+
+        let mut setup = output_setup("DP-1", (600, 340), Size::new(1920, 1080), Point::new(0, 0));
+        setup.modes.extend([
+            Mode { size: (2560, 1440).into(), refresh: 60_000 },
+            Mode { size: (2560, 1440).into(), refresh: 143_999 },
+            Mode { size: (3840, 2160).into(), refresh: 59_940 },
+        ]);
+        let mut setups = vec![setup];
+        let rules = vec![monitor_rule("DP-1", "2560x1440@144", "auto", "1", &[])];
+        assert_eq!(apply_monitor_rules(&mut setups, &rules, Some(1.0)), vec![1.0]);
+        assert_eq!(setups[0].size, Size::new(2560, 1440));
+        assert_eq!(setups[0].requested_mode, Some(2));
+
+        let rules = vec![monitor_rule("DP-1", "highres", "auto", "1", &[])];
+        apply_monitor_rules(&mut setups, &rules, Some(1.0));
+        assert_eq!(setups[0].size, Size::new(3840, 2160));
+        assert_eq!(setups[0].requested_mode, Some(3));
+    }
+
+    #[test]
+    fn automatic_monitor_scale_uses_physical_dpi_and_has_a_safe_fallback() {
+        let hidpi = output_setup("eDP-1", (280, 160), Size::new(2560, 1600), Point::new(0, 0));
+        assert_eq!(automatic_output_scale(&hidpi.output, hidpi.size), Some(2.0));
+        let unknown = output_setup("virtual", (0, 0), Size::new(1920, 1080), Point::new(0, 0));
+        assert_eq!(automatic_output_scale(&unknown.output, unknown.size), None);
+    }
+
+    #[test]
+    fn m1_air_panel_is_hidpi_even_when_drm_omits_physical_size() {
+        let panel = output_setup("eDP-1", (0, 0), Size::new(2560, 1600), Point::new(0, 0));
+        assert_eq!(automatic_output_scale(&panel.output, panel.size), Some(2.0));
+
+        let ordinary = output_setup("eDP-1", (0, 0), Size::new(1920, 1080), Point::new(0, 0));
+        assert_eq!(automatic_output_scale(&ordinary.output, ordinary.size), Some(1.0));
+
+        let external = output_setup("HDMI-A-1", (0, 0), Size::new(3840, 2160), Point::new(0, 0));
+        assert_eq!(automatic_output_scale(&external.output, external.size), None);
+    }
+
+    #[test]
+    fn missing_monitor_rule_uses_automatic_scale_without_a_global_override() {
+        let mut setups = vec![output_setup("eDP-1", (0, 0), Size::new(2560, 1600), Point::new(0, 0))];
+        assert_eq!(apply_monitor_rules(&mut setups, &[], None), vec![2.0]);
+        assert_eq!(apply_monitor_rules(&mut setups, &[], Some(1.0)), vec![1.0]);
+    }
+
+    // -- the resize cursors ------------------------------------------
+    // Rasterized from the same polygon `wm-x11` hands the X server, so
+    // what is pinned here is the software half: the rotations land the
+    // shape the right way round, the hotspot stays its center, and the
+    // buffer grows with the scale.
+
+    /// Alpha of the pixel at (x, y) in a `resize_cursor_pixels` buffer.
+    fn resize_alpha_at(pixels: &[u8], width: i32, x: i32, y: i32) -> u8 {
+        pixels[((y * width + x) * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn the_vertical_arrow_is_taller_than_wide_and_the_horizontal_is_its_transpose() {
+        let (_, vw, vh, _) = resize_cursor_pixels(1.0, 0.0);
+        assert!(vh > vw, "a ⇕ cursor is taller than it is wide ({vw}x{vh})");
+        let (_, hw, hh, _) = resize_cursor_pixels(1.0, 90.0_f32.to_radians());
+        // The 90° turn swaps the extents (give or take a rounding
+        // pixel, since the outline is rotated in floats and re-boxed).
+        assert!((hw - vh).abs() <= 1 && (hh - vw).abs() <= 1, "{vw}x{vh} vs {hw}x{hh}");
+    }
+
+    /// The hotspot is the shaft's center — the pixel the user is told
+    /// they are pointing at must be part of the drawing, or the cursor
+    /// visibly floats beside the edge it marks.
+    #[test]
+    fn the_hotspot_is_inside_the_shape_at_every_rotation() {
+        for angle in [0.0_f32, 45.0, 90.0, -45.0] {
+            let (pixels, width, height, (hx, hy)) = resize_cursor_pixels(2.0, angle.to_radians());
+            assert!(hx > 0 && hx < width && hy > 0 && hy < height);
+            assert_eq!(
+                resize_alpha_at(&pixels, width, hx, hy),
+                0xFF,
+                "hotspot ({hx}, {hy}) must land on the shaft at {angle}°"
+            );
+        }
+    }
+
+    #[test]
+    fn the_resize_cursor_grows_with_the_ui_scale() {
+        let (_, base_width, base_height, _) = resize_cursor_pixels(1.0, 0.0);
+        let (_, width, height, _) = resize_cursor_pixels(2.0, 0.0);
+        assert!(width > base_width && height > base_height);
+    }
+
+    /// The two diagonals run along opposite axes: -45° is the ⤡
+    /// arrow, its shaft passing through the quadrants northwest and
+    /// southeast of the hotspot, and +45° is the ⤢ through the other
+    /// two. A sign slip in either rotation shows a corner the axis it
+    /// does not resize along — the mistake `CursorSet::build`'s
+    /// comment records nearly shipping — and this is the assertion
+    /// that catches it. (Exact pixel-mirror equality between the two
+    /// is deliberately not asserted: the outline is rotated in floats,
+    /// so the buffers' boundary pixels round independently.)
+    #[test]
+    fn each_diagonal_runs_through_its_own_corners() {
+        let (se_pixels, se_width, _, (sx, sy)) = resize_cursor_pixels(2.0, -45.0_f32.to_radians());
+        let (sw_pixels, sw_width, _, (wx, wy)) = resize_cursor_pixels(2.0, 45.0_f32.to_radians());
+        let d = se_width / 4;
+        // ↘: shape on the NW–SE diagonal, nothing on the NE–SW one.
+        assert_eq!(resize_alpha_at(&se_pixels, se_width, sx - d, sy - d), 0xFF);
+        assert_eq!(resize_alpha_at(&se_pixels, se_width, sx + d, sy + d), 0xFF);
+        assert_eq!(resize_alpha_at(&se_pixels, se_width, sx + d, sy - d), 0);
+        assert_eq!(resize_alpha_at(&se_pixels, se_width, sx - d, sy + d), 0);
+        // ↙: the mirror.
+        assert_eq!(resize_alpha_at(&sw_pixels, sw_width, wx + d, wy - d), 0xFF);
+        assert_eq!(resize_alpha_at(&sw_pixels, sw_width, wx - d, wy + d), 0xFF);
+        assert_eq!(resize_alpha_at(&sw_pixels, sw_width, wx - d, wy - d), 0);
+        assert_eq!(resize_alpha_at(&sw_pixels, sw_width, wx + d, wy + d), 0);
+    }
+
+    // The stacking transforms behind a client-decorated window's place
+    // in the scene. They are pure `Vec<StackEntry>` arithmetic, which is
+    // the only part of that path a unit test can reach: `WindowRecord`
+    // holds a live `ToplevelSurface` or `X11Surface`, so the renderer's
+    // and the hit-test's walks over real records need a client on a
+    // socket, not a test.
+
+    fn frame(id: u64) -> StackEntry {
+        StackEntry::Frame(WlFrameId(id))
+    }
+
+    fn window(id: u64) -> StackEntry {
+        StackEntry::Window(WlWindowId(id))
+    }
+
+    #[test]
+    fn releasing_chrome_keeps_the_window_at_its_own_depth() {
+        // Edge rewrites `_MOTIF_WM_HINTS` while sitting in the middle of
+        // the stack. Losing its frame must not promote it over the two
+        // windows above it.
+        let mut stacking = vec![frame(1), frame(2), frame(3)];
+        replace_stack_entry(&mut stacking, frame(2), window(20));
+        assert_eq!(stacking, vec![frame(1), window(20), frame(3)]);
+    }
+
+    #[test]
+    fn growing_chrome_keeps_the_window_at_its_own_depth() {
+        // And the way back, which is the same requirement: a window that
+        // asks to be decorated again has not asked to be raised.
+        let mut stacking = vec![window(10), frame(2), window(30)];
+        replace_stack_entry(&mut stacking, window(30), frame(3));
+        assert_eq!(stacking, vec![window(10), frame(2), frame(3)]);
+    }
+
+    #[test]
+    fn a_window_is_never_left_in_the_stack_twice() {
+        // The double-draw this guards: both spellings present means the
+        // renderer paints the client at two depths and the hit-test
+        // resolves clicks at whichever it reaches first.
+        let mut stacking = vec![frame(1), window(20)];
+        replace_stack_entry(&mut stacking, window(20), frame(2));
+        assert_eq!(stacking.iter().filter(|entry| **entry == window(20)).count(), 0);
+        assert_eq!(stacking, vec![frame(1), frame(2)]);
+    }
+
+    #[test]
+    fn a_first_map_lands_on_top() {
+        // No slot to inherit: a window mapping for the first time goes
+        // where `create_decoration` puts a fresh frame.
+        let mut stacking = vec![frame(1)];
+        replace_stack_entry(&mut stacking, window(20), frame(2));
+        assert_eq!(stacking, vec![frame(1), frame(2)]);
+
+        let mut stacking = vec![frame(1)];
+        ensure_stack_entry(&mut stacking, window(20));
+        assert_eq!(stacking, vec![frame(1), window(20)]);
+    }
+
+    #[test]
+    fn remapping_a_frameless_window_is_not_a_raise() {
+        // Coming back from another workspace, or from the icon well,
+        // calls `map_frameless` again on a window that never lost its
+        // slot — which must stay exactly where it was.
+        let mut stacking = vec![window(10), frame(2), frame(3)];
+        ensure_stack_entry(&mut stacking, window(10));
+        assert_eq!(stacking, vec![window(10), frame(2), frame(3)]);
+    }
+
+    #[test]
+    fn raising_a_frameless_window_puts_it_above_a_framed_one() {
+        // The bug the `raise_frameless` verb was added for: every raise
+        // site in `wm-core` named a `FrameId`, so a client-decorated
+        // window stayed at the depth it mapped at forever — clicking it
+        // focused it and left it behind whatever was in front. Invisible
+        // to every application that lets us draw its titlebar, which is
+        // why it needs pinning here.
+        let mut stacking = vec![window(10), frame(2), frame(3)];
+        assert!(raise_stack_entry(&mut stacking, window(10)));
+        assert_eq!(stacking, vec![frame(2), frame(3), window(10)]);
+    }
+
+    #[test]
+    fn a_framed_window_still_raises_over_a_frameless_one() {
+        // And the converse, which is the actual requirement: the two
+        // kinds restack against each other by one order, not two. A
+        // frameless window that could only ever be raised *among* its
+        // own kind would be a separate stacking path pretending to be
+        // the same one.
+        let mut stacking = vec![frame(1), window(20)];
+        assert!(raise_stack_entry(&mut stacking, frame(1)));
+        assert_eq!(stacking, vec![window(20), frame(1)]);
+    }
+
+    #[test]
+    fn raising_something_with_no_slot_reports_nothing_to_redraw() {
+        // The answer is the caller's damage test (see
+        // `Backend::raise_frameless`), so a raise of a window that was
+        // never mapped — or was destroyed a pass ago — must not mark the
+        // scene dirty and wake a redraw for a frame that is identical.
+        let mut stacking = vec![frame(1)];
+        assert!(!raise_stack_entry(&mut stacking, window(20)));
+        assert_eq!(stacking, vec![frame(1)]);
+    }
+
+    #[test]
+    fn raising_the_top_entry_leaves_the_order_alone() {
+        // Click-to-focus re-raises the already-front window constantly
+        // (`focus_client`'s re-assert path does it on every click), and
+        // the removal-then-push must be a no-op there rather than a
+        // rotation.
+        let mut stacking = vec![frame(1), frame(2), window(30)];
+        assert!(raise_stack_entry(&mut stacking, window(30)));
+        assert_eq!(stacking, vec![frame(1), frame(2), window(30)]);
+    }
+
+    #[test]
+    fn managed_stack_changes_cannot_disturb_shell_order() {
+        // The two orders have different semantics and different hot
+        // paths. A chrome change rewrites only the managed order, while
+        // the renderer and input both read this one shell order.
+        let shell_stacking = vec![WlShellId(9), WlShellId(8)];
+        let mut stacking = vec![frame(2)];
+        replace_stack_entry(&mut stacking, frame(2), window(20));
+        assert_eq!(stacking, vec![window(20)]);
+        assert_eq!(shell_stacking, vec![WlShellId(9), WlShellId(8)]);
+    }
+
+    #[test]
+    fn scene_index_transitions_are_exclusive_and_collect_every_edge() {
+        let window = WlWindowId(7);
+        let mut index = SceneIndex::default();
+
+        index.mark_presented(window);
+        assert!(index.is_presented(window));
+        assert_eq!(index.unmanaged().count(), 0);
+
+        index.mark_unmanaged(window);
+        assert!(!index.is_presented(window));
+        assert_eq!(index.unmanaged().collect::<Vec<_>>(), vec![window]);
+
+        index.mark_hidden(window);
+        assert_eq!(index.unmanaged().collect::<Vec<_>>(), vec![window]);
+        index.forget(window);
+        assert_eq!(index.unmanaged().count(), 0);
+        assert!(!index.is_presented(window));
+    }
+
+    /// Deterministic operation-count regression for the indexed part of
+    /// `hit_at`: adding ordinary managed windows must not add candidates
+    /// to either exceptional band. The necessary z-ordered frame walk is
+    /// intentionally outside this assertion.
+    #[test]
+    fn auxiliary_hit_candidates_are_flat_in_managed_window_count() {
+        let mut index = SceneIndex::default();
+        let shell_stacking = [WlShellId(1), WlShellId(2)];
+        let baseline = index.unmanaged().count() + shell_stacking.len();
+
+        for id in 1..=10_000 {
+            index.mark_presented(WlWindowId(id));
+        }
+
+        assert_eq!(index.unmanaged().count() + shell_stacking.len(), baseline);
+        assert!(index.is_presented(WlWindowId(10_000)));
+    }
+
+    /// Manual release-mode microbenchmark for issue #40. It compares
+    /// the former worst-case visibility scan (a hidden committing
+    /// window absent from a 201-frame stack) with the lifecycle index.
+    /// Kept ignored because timing is evidence, not a correctness gate;
+    /// `auxiliary_hit_candidates_are_flat_in_managed_window_count`
+    /// carries the deterministic complexity assertion above.
+    #[test]
+    #[ignore = "benchmark: cargo test -p wm-wayland --release benchmark_scene_membership_index -- --ignored --nocapture"]
+    fn benchmark_scene_membership_index() {
+        use std::hint::black_box;
+
+        const WINDOWS: u64 = 201;
+        const LOOKUPS: usize = 500_000;
+        let mut frames = HashMap::new();
+        let mut stacking = Vec::new();
+        let mut index = SceneIndex::default();
+        for id in 1..=WINDOWS {
+            let window = WlWindowId(id);
+            let frame_id = WlFrameId(id + WINDOWS);
+            frames.insert(
+                frame_id,
+                FrameRecord {
+                    input_margin: 0,
+                    input_exclusion: None,
+                    window,
+                    geometry: Rect::default(),
+                    parts: Vec::new(),
+                solids: Vec::new(),
+                effects: None,
+                    fill_id: smithay::backend::renderer::element::Id::new(),
+                    mapped: true,
+                },
+            );
+            stacking.push(StackEntry::Frame(frame_id));
+            index.mark_presented(window);
+        }
+        let hidden = WlWindowId(WINDOWS + 1);
+
+        let old_started = Instant::now();
+        for _ in 0..LOOKUPS {
+            let found = stacking.iter().any(|entry| match entry {
+                StackEntry::Window(candidate) => *candidate == hidden,
+                StackEntry::Frame(frame) => frames
+                    .get(frame)
+                    .is_some_and(|record| record.window == hidden && record.mapped),
+            });
+            black_box(found);
+        }
+        let old = old_started.elapsed();
+
+        let indexed_started = Instant::now();
+        for _ in 0..LOOKUPS {
+            black_box(index.is_presented(black_box(hidden)));
+        }
+        let indexed = indexed_started.elapsed();
+
+        eprintln!(
+            "{LOOKUPS} hidden-scene lookups across {WINDOWS} windows: scan={old:?}, index={indexed:?}, speedup={:.1}x",
+            old.as_secs_f64() / indexed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn source_reconciliation_removes_in_place_and_preserves_capacity() {
+        let mut registered = Vec::with_capacity(8);
+        registered.extend([(3, 'a'), (4, 'b'), (5, 'c')]);
+        let allocation = registered.as_ptr();
+        let mut removed = Vec::new();
+
+        let wanted = HashSet::from([5, 3, 7]);
+        retain_wanted_sources(&mut registered, &wanted, |token| removed.push(token));
+
+        registered.sort_by_key(|(fd, _)| *fd);
+        assert_eq!(registered, [(3, 'a'), (5, 'c')]);
+        assert_eq!(removed, ['b']);
+        assert_eq!(registered.as_ptr(), allocation, "pruning must keep the established source allocation");
+    }
+
+    // Per-output scale resolution: the mixed-DPI question ("which
+    // factor does this window get?") answered without a display, which
+    // is the only way a single-monitor test box can pin the two-monitor
+    // arithmetic.
+
+    #[test]
+    fn a_window_takes_the_scale_of_the_monitor_holding_its_center() {
+        let monitors = [monitor(0, 0, 1920, 1080), monitor(1920, 0, 2560, 1440)];
+        let scales = [1.0, 1.5];
+        // Entirely on the second monitor.
+        let rect = Rect { pos: Point::new(2000, 100), size: Size::new(400, 300) };
+        assert_eq!(scale_for_rect(&monitors, &scales, rect), 1.5);
+        // Entirely on the first.
+        let rect = Rect { pos: Point::new(100, 100), size: Size::new(400, 300) };
+        assert_eq!(scale_for_rect(&monitors, &scales, rect), 1.0);
+        // Straddling, with most of it (its center) on the right: one
+        // factor, the right screen's.
+        let rect = Rect { pos: Point::new(1800, 100), size: Size::new(400, 300) };
+        assert_eq!(scale_for_rect(&monitors, &scales, rect), 1.5);
+        // Straddling with the center on the left keeps the left's.
+        let rect = Rect { pos: Point::new(1600, 100), size: Size::new(400, 300) };
+        assert_eq!(scale_for_rect(&monitors, &scales, rect), 1.0);
+    }
+
+    #[test]
+    fn dead_space_and_unplaced_windows_take_the_primary_scale() {
+        let monitors = [monitor(0, 0, 1920, 1080), monitor(1920, 0, 1280, 720)];
+        let scales = [2.0, 1.0];
+        // Below the shorter second monitor: covered by no screen.
+        let rect = Rect { pos: Point::new(2000, 900), size: Size::new(100, 100) };
+        assert_eq!(scale_for_rect(&monitors, &scales, rect), 2.0);
+        // A fresh window's empty rect at the origin resolves to the
+        // primary too — the honest guess at first-commit time.
+        assert_eq!(scale_for_rect(&monitors, &scales, Rect::default()), 2.0);
+        // No monitors at all (never true in a running session) is 1.0,
+        // not a panic.
+        assert_eq!(scale_for_rect(&[], &[], Rect::default()), 1.0);
+    }
+
+    #[test]
+    fn fractional_output_geometry_keeps_the_actual_scale() {
+        // Omarchy uses xdg-output's logical size to clamp its panels.
+        // Advertising Integer(2) at 150% made a 4K screen look only
+        // 1920px wide while layer surfaces were configured at 2560px.
+        for (scale, logical_width) in [(0.75, 5120), (1.0, 3840), (1.25, 3072), (1.5, 2560), (2.0, 1920)] {
+            let advertised = advertised_output_scale(scale);
+            let mode = SSize::<i32, Physical>::from((3840, 2160));
+            let logical = mode.to_f64().to_logical(advertised.fractional_scale()).to_i32_round::<i32>();
+            assert_eq!(logical.w, logical_width, "output scale {scale}");
+        }
+    }
+
+    #[test]
+    fn the_integral_fallback_advertises_the_ceiling() {
+        // Round UP: the fallback client renders more pixels than the
+        // output needs and is downscaled — the crisp direction. 1.25
+        // used to round to 1 (blurry upscale); now both fractional
+        // steps advertise 2.
+        assert_eq!(advertised_output_scale(1.0).integer_scale(), 1);
+        assert_eq!(advertised_output_scale(1.25).integer_scale(), 2);
+        assert_eq!(advertised_output_scale(1.5).integer_scale(), 2);
+        assert_eq!(advertised_output_scale(2.0).integer_scale(), 2);
+        assert_eq!(advertised_output_scale(2.25).integer_scale(), 3);
+        // Degenerate inputs stay sane.
+        assert_eq!(advertised_output_scale(0.0).integer_scale(), 1);
+        assert_eq!(advertised_output_scale(f32::NAN).integer_scale(), 1);
+    }
+
+    #[test]
+    fn no_monitors_is_an_empty_screen() {
+        // Not reachable in a running session (`run` always builds at
+        // least one output); the arithmetic must not panic on it.
+        assert_eq!(union_size(&[]), Size::new(0, 0));
+    }
+}

@@ -1,0 +1,1658 @@
+//! Hyprland's IPC, end to end against a live nested session.
+//!
+//! The unit tests in `chonk-hyprland-ipc` prove every JSON shape and
+//! every parser against a hand-built `Snapshot`. What only a live
+//! session can prove is the plumbing between that crate and the real
+//! window manager: that the sockets appear where the protocol says, at
+//! the modes the security posture claims; that a real window's arrival
+//! reaches the event stream with the address `j/clients` gives it; that
+//! a dispatch reaches `wm-core` and *actually changes the desktop*
+//! rather than merely answering `ok`; and that a verb chonkstep cannot
+//! honour is refused instead of accepted.
+//!
+//! That last pair is why this file exists at all. The unit tests cannot
+//! catch the failure mode this whole feature is built around — a verb
+//! that answers `ok` and does nothing — because the answer and the
+//! effect live on opposite sides of the crate boundary. An end-to-end
+//! run against the real `hyprctl` found exactly that bug in
+//! `dispatch workspace N`, which the unit tests were green through.
+//! `switches_the_workspace_for_real` is its regression test.
+//!
+//! The client here is deliberately the dumbest thing that works — a
+//! blocking `UnixStream`, one connection per request — because that is
+//! precisely what `hyprctl` is, and the socket has to be right for it.
+//!
+//! Same run rules as `e2e.rs`: needs a Wayland session to nest inside,
+//! so `#[ignore]`d; run with
+//! `cargo test -p chonk-testkit --test hyprland_ipc -- --ignored`.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use chonk_hyprland_ipc::{MAX_EVENT_CLIENTS, MAX_REQUEST_CLIENTS};
+use chonk_testkit::{keys, HyprlandSources, poll_until, profile_binary, Session, SessionOptions};
+
+const EVENT: Duration = Duration::from_secs(10);
+
+/// The directory the compositor says it bound, read out of its log the
+/// same way `scripts/wayland-session.sh` reads it — so this test also
+/// covers the log line that session script depends on.
+fn socket_dir(session: &Session) -> PathBuf {
+    let signature = poll_until(EVENT, "the hyprland ipc log line", || {
+        let log = session.log();
+        let at = log.find("hyprland ipc listening")?;
+        // `tracing` colours the field *keys* with ANSI escapes even into
+        // a file, so match the quoted value rather than the key — the
+        // same reason the session script matches on shape.
+        let rest = &log[at..];
+        let start = rest.find('"')? + 1;
+        let end = rest[start..].find('"')? + start;
+        Some(rest[start..end].to_string())
+    })
+    .expect("the compositor logs the signature it bound");
+
+    let runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+    PathBuf::from(runtime).join("hypr").join(signature)
+}
+
+fn control_socket(session: &Session) -> PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+    PathBuf::from(runtime).join("chonkstep").join(format!("control-{}.sock", session.wayland_display))
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn experimental_scanout_controls_reach_the_live_renderer_policy() {
+    let mut session = Session::boot("gpu-policy-controls", SessionOptions {
+        env: vec![("CHONKSTEP_GPU_TIMINGS".into(), "1".into())],
+        ..Default::default()
+    }).unwrap();
+    let probe = profile_binary("chonk-fullscreen-probe").unwrap();
+    session.launch(&probe.display().to_string(), &["GPU timing", "gpu-timing", "animate-frame"]).unwrap();
+    session.wait_for_window("GPU timing").unwrap();
+    let dir = socket_dir(&session);
+    let snapshot = || {
+        let stream = UnixStream::connect(control_socket(&session)).unwrap();
+        stream.set_read_timeout(Some(EVENT)).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        writer.write_all(b"{\"request\":\"debug\",\"topic\":\"scene\"}\n").unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "debug" { break event.to_string(); }
+        }
+    };
+    let initial = snapshot();
+    assert!(initial.contains("overlay-scanout=false"), "{initial}");
+    assert!(initial.contains("primary-scanout-any=false"), "{initial}");
+    if !initial.contains("gpu_timer status=unavailable") {
+        let measured = poll_until(EVENT, "asynchronous GPU query results", || {
+            let report = snapshot();
+            let samples = report.split("stage=composition_gpu samples=").nth(1)?
+                .split_whitespace().next()?.parse::<u64>().ok()?;
+            (samples >= 3).then_some(report)
+        }).unwrap();
+        eprintln!("GPU timing observed: {measured}");
+    }
+    for name in ["overlay-scanout", "primary-scanout-any", "no-direct-scanout", "no-cursor-plane"] {
+        for enabled in [true, false] {
+            assert_eq!(request(&dir, &format!("debug-set {name} {enabled}")), "ok");
+            poll_until(EVENT, "the diagnostic to change in the running compositor", || {
+                snapshot().contains(&format!("{name}={enabled}")).then_some(())
+            }).unwrap();
+        }
+    }
+    assert!(session.compositor_alive());
+}
+
+/// One request: connect, write, read to EOF. Exactly `hyprctl`'s shape.
+fn request(dir: &Path, payload: &str) -> String {
+    let mut stream = UnixStream::connect(dir.join(".socket.sock"))
+        .unwrap_or_else(|e| panic!("connecting to the request socket: {e}"));
+    stream.set_read_timeout(Some(EVENT)).expect("read timeout");
+    stream.write_all(payload.as_bytes()).expect("write the request");
+    stream.flush().expect("flush");
+    // `hyprctl` does not shut down its write side; the server must
+    // answer on the bytes alone and close, or a real client hangs.
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read the response");
+    response
+}
+
+fn json(dir: &Path, payload: &str) -> serde_json::Value {
+    let raw = request(dir, payload);
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{payload} was not JSON: {raw:?}: {e}"))
+}
+
+/// A bar, tailing the event socket.
+struct Events(BufReader<UnixStream>);
+
+impl Events {
+    fn connect(dir: &Path) -> Events {
+        let stream = UnixStream::connect(dir.join(".socket2.sock")).expect("event socket");
+        stream.set_read_timeout(Some(EVENT)).expect("read timeout");
+        Events(BufReader::new(stream))
+    }
+
+    /// Read until a line starts with `name>>`, or panic.
+    fn wait_for(&mut self, name: &str) -> String {
+        let deadline = Instant::now() + EVENT;
+        let prefix = format!("{name}>>");
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            let mut line = String::new();
+            if self.0.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            assert!(line.ends_with('\n'), "every event line ends in a newline: {line:?}");
+            let line = line.trim_end().to_string();
+            if let Some(data) = line.strip_prefix(&prefix) {
+                return data.to_string();
+            }
+            seen.push(line);
+        }
+        panic!("never saw {name}; events seen: {seen:#?}");
+    }
+}
+
+fn boot(name: &str) -> Session {
+    let mut options = SessionOptions::default();
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    Session::boot(name, options).expect("nested session")
+}
+
+/// The sockets exist where the protocol says, and are private.
+///
+/// The modes are asserted rather than assumed because this socket
+/// accepts commands: `docs/hyprland-ipc.md` §4 argues it needs no
+/// authentication *on the grounds that* only its own user can reach it,
+/// and that argument is only as good as these two numbers.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn binds_two_private_sockets_where_the_protocol_says() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let session = boot("hypr-ipc-bind");
+    let dir = socket_dir(&session);
+
+    let mode = |p: PathBuf| {
+        std::fs::metadata(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).permissions().mode() & 0o777
+    };
+
+    assert_eq!(mode(dir.clone()), 0o700, "the instance directory must be private");
+    assert_eq!(mode(dir.join(".socket.sock")), 0o600, "the request socket must be private");
+    assert_eq!(mode(dir.join(".socket2.sock")), 0o600, "the event socket must be private");
+}
+
+/// A socket-existence probe connects and closes without writing. The
+/// server's own stale-instance sweep does exactly that, so this is a
+/// normal lifecycle event rather than a hostile-client curiosity.
+/// Retaining the accepted EOF fd leaves HUP permanently readable: one
+/// live session accumulated 23 of them, spun 1,560 passes/second, and
+/// consumed 99% of one CPU core.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn disconnected_socket_probes_leave_no_fds_and_no_busy_loop_behind() {
+    let mut session = boot("hypr-ipc-probe-eof");
+    let dir = socket_dir(&session);
+    // A frame barrier does not settle asynchronous XWayland, D-Bus,
+    // or renderer startup. A process-wide fd baseline can therefore
+    // grow for reasons unrelated to these probes. Inspect the owned IPC
+    // descriptors and their event sources, with no leaked-peer tolerance.
+    session.door().barrier().unwrap();
+    let listeners = HyprlandSources { desired: 2, registered: 2 };
+    assert_eq!(session.door().hyprland_sources().unwrap(), listeners);
+    for _ in 0..8 {
+        for socket in [".socket.sock", ".socket2.sock"] {
+            for _ in 0..4 {
+                drop(UnixStream::connect(dir.join(socket)).expect("probe connects"));
+            }
+        }
+        session.door().barrier().unwrap();
+    }
+
+    poll_until(EVENT, "disconnected probe fds to be pruned", || {
+        let current = session.door().hyprland_sources().unwrap();
+        (current == listeners).then_some(current)
+    })
+    .unwrap_or_else(|error| panic!("{error}; remaining IPC sources={:?}", session.door().hyprland_sources()));
+
+    assert!(json(&dir, "j/version").is_object(), "the request socket still answers after the probe storm");
+}
+
+/// Excess connections are accepted and closed, never retained as
+/// compositor descriptors/calloop sources. The two populations are
+/// capped independently so a real query can recover as soon as the
+/// silent request peers leave even while a full event audience stays.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_connection_storm_is_capped_before_it_can_grow_the_source_set() {
+    let mut session = boot("hypr-ipc-connection-cap");
+    let dir = socket_dir(&session);
+    fn connect(session: &mut Session, dir: &Path, socket: &str, count: usize) -> Vec<UnixStream> {
+        let mut peers = Vec::new();
+        for index in 0..count {
+            peers.push(UnixStream::connect(dir.join(socket)).expect("storm connection"));
+            // Stay below the transport's pending backlog. The property
+            // under test is the accepted population and its one-source-
+            // per-fd compositor cost, not connect(2) scheduling.
+            if index % 8 == 7 {
+                session.door().barrier().unwrap();
+            }
+        }
+        session.door().barrier().unwrap();
+        peers
+    }
+
+    session.door().barrier().unwrap();
+    assert_eq!(
+        session.door().hyprland_sources().unwrap(),
+        HyprlandSources { desired: 2, registered: 2 },
+        "an idle server retains only its two listeners"
+    );
+    let mut requests = connect(&mut session, &dir, ".socket.sock", MAX_REQUEST_CLIENTS + 32);
+    let mut events = connect(&mut session, &dir, ".socket2.sock", MAX_EVENT_CLIENTS + 32);
+
+    let capped = 2 + MAX_REQUEST_CLIENTS + MAX_EVENT_CLIENTS;
+    assert_eq!(
+        session.door().hyprland_sources().unwrap(),
+        HyprlandSources { desired: capped, registered: capped },
+        "excess clients must grow neither the retained server population nor the calloop source set"
+    );
+    for excess in [requests.last_mut().unwrap(), events.last_mut().unwrap()] {
+        excess.set_read_timeout(Some(EVENT)).unwrap();
+        let mut byte = [0_u8; 1];
+        match excess.read(&mut byte) {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("an accepted excess client must be closed immediately, got {result:?}"),
+        }
+    }
+    assert_eq!(
+        session.log().matches("hyprland IPC client limit reached").count(),
+        2,
+        "one warning per continuously-full request/event population"
+    );
+
+    drop(requests);
+    session.door().barrier().unwrap();
+    assert_eq!(
+        session.door().hyprland_sources().unwrap(),
+        HyprlandSources {
+            desired: 2 + MAX_EVENT_CLIENTS,
+            registered: 2 + MAX_EVENT_CLIENTS,
+        },
+        "request clients and sources prune while event subscribers remain"
+    );
+    assert!(json(&dir, "j/version").is_object(), "a slot reopens without disturbing full event subscribers");
+    drop(events);
+    session.door().barrier().unwrap();
+    assert_eq!(
+        session.door().hyprland_sources().unwrap(),
+        HyprlandSources { desired: 2, registered: 2 },
+        "every storm client and calloop source is pruned"
+    );
+}
+
+/// The monitor object a display panel reads, against a live session.
+///
+/// Three of its fields used to be fabricated while the same session
+/// published the truth on `wl_output` and `zwlr_output_management` at
+/// the same moment: `availableModes` was empty, and `make`/`model` were
+/// empty strings. The nested backend drives one mode, so this cannot
+/// prove the *rate* is measured (its host window is 60 Hz either way —
+/// that is what the unit tests in `chonk-hyprland-ipc` are for), but it
+/// can prove the list and the identity are no longer blank.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_live_monitor_reports_its_real_modes_and_identity() {
+    let session = boot("hypr-ipc-monitor-facts");
+    let dir = socket_dir(&session);
+
+    let monitors = json(&dir, "j/monitors");
+    let monitor = &monitors.as_array().expect("monitors is an array")[0];
+
+    let modes = monitor["availableModes"].as_array().expect("availableModes is a list");
+    assert!(
+        !modes.is_empty(),
+        "the session enumerates this connector's modes for wlr-output-management; \
+         IPC must not report none: {monitor}"
+    );
+    let current = modes[0].as_str().expect("a mode is a string");
+    assert!(
+        current.contains('x') && current.ends_with("Hz"),
+        "Hyprland's spelling is WIDTHxHEIGHT@RATEHz, got {current:?}"
+    );
+    assert!(
+        !monitor["model"].as_str().unwrap_or_default().is_empty(),
+        "model comes from the same properties wl_output advertises: {monitor}"
+    );
+    assert!(
+        monitor["refreshRate"].as_f64().unwrap_or(0.0) > 0.0,
+        "no caller may be handed a rate it will divide by: {monitor}"
+    );
+}
+
+/// `keyword` outside the served forms is refused, and the refusal is
+/// the only diagnostic there is: `hyprctl` exits zero for it. The old
+/// sentence denied the compositor's headline feature. `keyword monitor
+/// NAME,disable` is served now, so on a desk with no `eDP-1` its refusal
+/// names the output it could not find rather than a missing feature.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn the_live_keyword_refusal_does_not_deny_reading_a_hyprland_config() {
+    let session = boot("hypr-ipc-keyword");
+    let dir = socket_dir(&session);
+
+    let answer = request(&dir, "keyword general:gaps_in 5");
+    assert!(answer.starts_with("Invalid dispatcher:"), "still a refusal: {answer}");
+    assert!(
+        !answer.contains("does not read a Hyprland config"),
+        "chonkstep reads one; the refusal must not say otherwise: {answer}"
+    );
+    assert!(answer.contains("~/.config/hypr"), "point at the route that works: {answer}");
+
+    let answer = request(&dir, "keyword monitor eDP-1,disable");
+    assert!(answer.starts_with("Invalid dispatcher:"), "no such output on a nested desk: {answer}");
+    assert!(answer.contains("unknown output"), "the refusal names the missing output, not a missing feature: {answer}");
+}
+
+fn changed_cursor_pixels(left: &chonk_testkit::Screenshot, right: &chonk_testkit::Screenshot, x: u32, y: u32) -> usize {
+    (y..y + 40)
+        .flat_map(|py| (x..x + 40).map(move |px| (px, py)))
+        .filter(|&(px, py)| {
+            left.pixel(px, py)
+                .iter()
+                .zip(right.pixel(px, py))
+                .take(3)
+                .any(|(a, b)| a.abs_diff(b) > 12)
+        })
+        .count()
+}
+
+/// Omarchy's screensaver uses the eval spelling first and the keyword
+/// spelling as its fallback. Both must alter pixels, and a screensaver
+/// killed before its cleanup command must give the cursor back.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn screensaver_cursor_visibility_is_live_and_owned() {
+    let mut session = boot("hypr-ipc-cursor-visibility");
+    let dir = socket_dir(&session);
+
+    session
+        .launch("zenity", &["--question", "--title", "cursor-owner", "--text", "hold still"])
+        .expect("launch a focused owner window");
+    session.wait_for_window("cursor-owner").expect("the owner maps");
+
+    let (x, y) = (48_u32, 48_u32);
+    session.door().motion(f64::from(x), f64::from(y)).unwrap();
+    session.door().barrier().unwrap();
+    let visible = session.screenshot_with_cursor("cursor-visible").unwrap();
+
+    assert_eq!(
+        request(&dir, "/eval hl.config({ cursor = { invisible = true } })").trim(),
+        "ok"
+    );
+    session.door().barrier().unwrap();
+    let hidden = session.screenshot_with_cursor("cursor-hidden-by-eval").unwrap();
+    assert!(
+        changed_cursor_pixels(&visible, &hidden, x, y) > 16,
+        "the eval request must remove cursor pixels ({} vs {})",
+        visible.path.display(),
+        hidden.path.display()
+    );
+
+    assert_eq!(request(&dir, "/keyword cursor:invisible false").trim(), "ok");
+    session.door().barrier().unwrap();
+    let restored = session.screenshot_with_cursor("cursor-restored-by-keyword").unwrap();
+    assert!(
+        changed_cursor_pixels(&visible, &restored, x, y) <= 4,
+        "the keyword fallback must restore the same cursor pixels ({} vs {})",
+        visible.path.display(),
+        restored.path.display()
+    );
+
+    assert_eq!(request(&dir, "/keyword cursor:invisible true").trim(), "ok");
+    session.door().barrier().unwrap();
+    session.kill_client("zenity");
+    session.wait_for_window_gone("cursor-owner").expect("the owner exits");
+    session.door().barrier().unwrap();
+    let after_owner_death = session.screenshot_with_cursor("cursor-restored-after-owner-death").unwrap();
+    assert!(
+        changed_cursor_pixels(&hidden, &after_owner_death, x, y) > 16,
+        "a dead owner must not strand the session cursorless ({} vs {})",
+        hidden.path.display(),
+        after_owner_death.path.display()
+    );
+}
+
+/// Omarchy's screenshot picker moves slurp's highlight between windows by
+/// warping the pointer with `hl.dsp.cursor.move`, in the logical units
+/// `cursorpos` reports, and reads the result back the same way. A script
+/// must never move the pointer behind the lock.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_scripted_pointer_warp_lands_where_cursorpos_reports_and_never_behind_the_lock() {
+    for (scale, name) in [(1.0, "hypr-ipc-warp-1x"), (1.5, "hypr-ipc-warp-1.5x")] {
+        let mut options = SessionOptions { scale: Some(scale), ..SessionOptions::default() };
+        options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+        let mut session = Session::boot(name, options).expect("nested session");
+        let dir = socket_dir(&session);
+        for (warp, x, y) in [
+            ("/eval hl.dispatch(hl.dsp.cursor.move({ x = 300, y = 200 }))", 300, 200),
+            ("/dispatch movecursor 120 90", 120, 90),
+        ] {
+            assert_eq!(request(&dir, warp).trim(), "ok", "{warp} at scale {scale}");
+            session.door().barrier().unwrap();
+            assert_eq!(json(&dir, "j/cursorpos"), serde_json::json!({ "x": x, "y": y }), "{warp} at scale {scale}");
+        }
+        if scale != 1.0 {
+            continue;
+        }
+        let probe = profile_binary("chonk-lock-probe").expect("cargo build -p chonk-testkit builds the probe");
+        session.launch(probe.to_str().unwrap(), &["--hold"]).expect("the locker launches");
+        poll_until(EVENT, "the locker to hold the lock", || {
+            session.client_log("chonk-lock-probe").contains("holding the lock").then_some(())
+        })
+        .unwrap();
+        let before = json(&dir, "j/cursorpos");
+        assert_ne!(
+            request(&dir, "/eval hl.dispatch(hl.dsp.cursor.move({ x = 40, y = 40 }))").trim(),
+            "ok",
+            "a script cannot move the pointer behind the lock"
+        );
+        session.door().barrier().unwrap();
+        assert_eq!(json(&dir, "j/cursorpos"), before);
+    }
+}
+
+/// Omarchy's look turns on `cursor:hide_on_key_press`: typing into a window
+/// gets the pointer out of the way until it next moves, and a touch does the
+/// same with `hide_on_touch`. The compositor's own hide must not disturb the
+/// screensaver's owned `invisible` flag in either direction.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn typing_and_touch_hide_the_pointer_until_it_moves() {
+    let mut options = SessionOptions {
+        config_extra: concat!(
+            "[cursor]\nhide_on_key_press = true\nhide_on_touch = true\n\n",
+            "[commands]\nnoop = [\"true\"]\n\n",
+            "[keybindings]\n\"super+x\" = \"run noop\"\n",
+        )
+        .into(),
+        ..SessionOptions::default()
+    };
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    let mut session = Session::boot("hypr-ipc-cursor-auto-hide", options).expect("nested session");
+    let dir = socket_dir(&session);
+    session
+        .launch("zenity", &["--question", "--title", "typing-target", "--text", "type here"])
+        .expect("launch a focused window to type into");
+    session.wait_for_window("typing-target").expect("the typing target maps");
+
+    let (x, y) = (48_u32, 48_u32);
+    // Motion away and back, so the comparison is at the same position.
+    let wiggle = |session: &mut Session| {
+        session.door().motion(f64::from(x + 6), f64::from(y)).unwrap();
+        session.door().motion(f64::from(x), f64::from(y)).unwrap();
+        session.door().barrier().unwrap();
+    };
+    wiggle(&mut session);
+    let visible = session.screenshot_with_cursor("auto-hide-visible").unwrap();
+    let shown = |session: &mut Session, name: &str| {
+        session.door().barrier().unwrap();
+        let shot = session.screenshot_with_cursor(name).unwrap();
+        changed_cursor_pixels(&visible, &shot, x, y) <= 4
+    };
+    let hidden = |session: &mut Session, name: &str| {
+        session.door().barrier().unwrap();
+        let shot = session.screenshot_with_cursor(name).unwrap();
+        changed_cursor_pixels(&visible, &shot, x, y) > 16
+    };
+
+    session.door().tap_key(keys::LEFTSHIFT).unwrap();
+    assert!(shown(&mut session, "auto-hide-after-modifier"), "a bare modifier must not hide the pointer");
+
+    session.door().key(keys::LEFTMETA, true).unwrap();
+    session.door().tap_key(keys::X).unwrap();
+    session.door().key(keys::LEFTMETA, false).unwrap();
+    assert!(shown(&mut session, "auto-hide-after-binding"), "a key consumed by a binding is not typing");
+
+    session.door().tap_key(keys::X).unwrap();
+    assert!(hidden(&mut session, "auto-hide-after-typing"), "a key delivered to the window hides the pointer");
+    assert_eq!(request(&dir, "/keyword cursor:invisible false").trim(), "ok");
+    assert!(hidden(&mut session, "auto-hide-survives-visible-keyword"), "the screensaver flag cannot reveal a typing hide");
+    wiggle(&mut session);
+    assert!(shown(&mut session, "auto-hide-after-motion"), "the next motion shows the pointer again");
+
+    assert_eq!(request(&dir, "/keyword cursor:invisible true").trim(), "ok");
+    session.door().tap_key(keys::X).unwrap();
+    wiggle(&mut session);
+    assert!(hidden(&mut session, "invisible-survives-typing-and-motion"), "motion cannot reveal a screensaver hide");
+    assert_eq!(request(&dir, "/keyword cursor:invisible false").trim(), "ok");
+    assert!(shown(&mut session, "invisible-released"));
+
+    // On the dialog's label, which a tap leaves alone; its buttons would close it.
+    let (u, v) = session.world().unwrap().touch_fraction(220.0, 110.0);
+    session.door().touch_down(0, u, v).unwrap();
+    session.door().touch_frame().unwrap();
+    session.door().touch_up(0).unwrap();
+    session.door().touch_frame().unwrap();
+    assert!(hidden(&mut session, "auto-hide-after-touch"), "a touch hides the pointer");
+    wiggle(&mut session);
+    assert!(shown(&mut session, "auto-hide-after-touch-then-motion"));
+}
+
+/// Omarchy's touchpad and touchscreen toggles send `hl.device` with the name
+/// `devices` reports. Switched off, that device no longer moves the pointer
+/// or counts as activity, a button it was holding comes back up at the
+/// client, and every other device keeps working. Switched back on, it moves
+/// the pointer again. The nested session's own logical devices are refused
+/// by name.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_device_switched_off_by_name_stops_moving_the_pointer_and_releases_its_button() {
+    const TRACKPAD: &str = "chonkstep-test-trackpad";
+    let mut options = SessionOptions { scale: Some(1.0), ..SessionOptions::default() };
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    let mut session = Session::boot("hypr-ipc-device-switch", options).expect("nested session");
+    let dir = socket_dir(&session);
+    let switch = |enabled: bool, name: &str| format!(r#"/eval hl.device({{ name = "{name}", enabled = {enabled} }})"#);
+    for name in ["chonkstep-pointer", "chonkstep-keyboard"] {
+        let reply = request(&dir, &switch(false, name));
+        assert!(reply.starts_with("Invalid dispatcher") && reply.contains("nested session"), "{name}: {reply}");
+    }
+
+    session.door().pointer_device(TRACKPAD, true).unwrap();
+    session.door().barrier().unwrap();
+    let devices = json(&dir, "j/devices");
+    assert!(
+        devices["mice"].as_array().unwrap().iter().any(|mouse| mouse["name"] == TRACKPAD),
+        "the hotplugged pointer is listed by name: {devices}"
+    );
+
+    let probe = profile_binary("chonk-input-probe").expect("cargo build -p chonk-testkit builds the probe");
+    session.launch(probe.to_str().unwrap(), &["1"]).expect("the input probe launches");
+    let window = session.wait_for_window("input-probe").expect("the input probe maps");
+    let (x, y) = (window.x + 80, window.y + 70);
+    let probe_lines = |session: &Session, kind: &str| {
+        session.client_log("chonk-input-probe").lines().filter(|line| line.split_whitespace().nth(2) == Some(kind)).count()
+    };
+    session.door().motion_from(TRACKPAD, f64::from(x), f64::from(y)).unwrap();
+    session.door().button_from(TRACKPAD, "left", true).unwrap();
+    session.door().barrier().unwrap();
+    poll_until(EVENT, "the trackpad's press to reach the probe", || (probe_lines(&session, "press") == 1).then_some(()))
+        .unwrap();
+
+    assert_eq!(request(&dir, &switch(false, TRACKPAD)).trim(), "ok");
+    poll_until(EVENT, "the held button to come back up", || (probe_lines(&session, "release") == 1).then_some(()))
+        .expect("switching a device off releases the button it held");
+    let at = json(&dir, "j/cursorpos");
+    assert_eq!(at, serde_json::json!({ "x": x, "y": y }));
+    session.door().motion_from(TRACKPAD, f64::from(x + 120), f64::from(y + 40)).unwrap();
+    session.door().barrier().unwrap();
+    assert_eq!(json(&dir, "j/cursorpos"), at, "a switched-off device must not move the pointer");
+    session.door().motion(f64::from(x + 10), f64::from(y + 10)).unwrap();
+    session.door().barrier().unwrap();
+    assert_eq!(json(&dir, "j/cursorpos"), serde_json::json!({ "x": x + 10, "y": y + 10 }), "other devices keep working");
+
+    // Idleness, through the protocol a locker binds: the switched-off
+    // device's motion is not activity, and the door's still is.
+    let watcher = profile_binary("chonk-fullscreen-probe").expect("probe is built").display().to_string();
+    session.launch(&watcher, &["IdleWatch", "idle-watch", "animate-watch-idle"]).expect("the idle watcher launches");
+    session.wait_for_window("IdleWatch").expect("the idle watcher maps");
+    let watched = |session: &Session, line: &str| session.client_log(&watcher).lines().filter(|seen| *seen == line).count();
+    let frames = |session: &Session| session.client_log(&watcher).matches("animation frame=").count();
+    poll_until(EVENT, "the watcher to see the session go idle", || (watched(&session, "idle state=idled") >= 1).then_some(()))
+        .unwrap();
+    let resumed = watched(&session, "idle state=resumed");
+    for step in 0..4 {
+        session.door().motion_from(TRACKPAD, f64::from(x + 20 * step), f64::from(y)).unwrap();
+        session.door().barrier().unwrap();
+    }
+    // Two more reported frames are two more trips around the watcher's event
+    // loop, so a `resumed` sent for that motion would already be logged.
+    let seen = frames(&session);
+    poll_until(EVENT, "the watcher to keep dispatching", || (frames(&session) >= seen + 2).then_some(())).unwrap();
+    assert_eq!(watched(&session, "idle state=resumed"), resumed, "a switched-off device must not count as activity");
+    session.door().motion(f64::from(x), f64::from(y)).unwrap();
+    poll_until(EVENT, "the door's motion to end the idle period", || {
+        (watched(&session, "idle state=resumed") > resumed).then_some(())
+    })
+    .unwrap();
+
+    assert_eq!(request(&dir, &switch(true, TRACKPAD)).trim(), "ok");
+    session.door().motion_from(TRACKPAD, f64::from(x + 30), f64::from(y + 30)).unwrap();
+    session.door().barrier().unwrap();
+    assert_eq!(json(&dir, "j/cursorpos"), serde_json::json!({ "x": x + 30, "y": y + 30 }), "switched back on, it moves the pointer");
+}
+
+/// The mapping protocol has two requests, and both are a join: whether
+/// a caller holds the wlr manager's handle or the frozen
+/// `ext_foreign_toplevel_list_v1` handle, the address that comes back
+/// must be the one `hyprctl clients -j` prints for that window.
+///
+/// The ext arm answered `failed` unconditionally while the list went
+/// unadvertised, so half of a protocol this compositor chose to serve
+/// was inert. Deliberately driven with the harness's own probe rather
+/// than `zenity`, so it runs wherever the harness builds.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn both_mapping_arms_resolve_one_window_to_one_address() {
+    let mut session = boot("hypr-toplevel-mapping-ext");
+    let dir = socket_dir(&session);
+    let mapper = profile_binary("chonk-toplevel-mapping-probe").expect("mapping probe built");
+    session.launch(mapper.to_str().unwrap(), &[]).expect("mapping probe launches");
+    poll_until(EVENT, "the mapping probe to bind every global", || {
+        session.client_log("chonk-toplevel-mapping-probe").contains("**mapping ready**").then_some(())
+    })
+    .expect("the mapping probe binds the wlr manager, the ext list and the mapping manager");
+
+    let window = profile_binary("chonk-fullscreen-probe").expect("fullscreen probe built");
+    session
+        .launch(window.to_str().unwrap(), &["ext-mapping", "ext-mapping"])
+        .expect("the window under test launches");
+    session.wait_for_window("ext-mapping").expect("the window maps");
+
+    fn address_from(session: &Session, arm: &str) -> Option<String> {
+        let report = session.client_log("chonk-toplevel-mapping-probe");
+        let marker = format!("**{arm} address ");
+        Some(report.split(&marker).nth(1)?.split("**").next()?.to_string())
+    }
+
+    let wlr = poll_until(EVENT, "the wlr arm to answer", || address_from(&session, "wlr"))
+        .expect("the wlr arm answers with an address");
+    let ext = poll_until(EVENT, "the ext arm to answer", || address_from(&session, "ext"))
+        .expect("the ext arm must answer with an address, not `failed`");
+    assert_eq!(wlr, ext, "one window has one address whichever handle names it");
+
+    let clients = json(&dir, "j/clients");
+    let ipc = clients
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|client| client["title"].as_str().is_some_and(|title| title.contains("ext-mapping")))
+        .and_then(|client| client["address"].as_str())
+        .expect("the same window appears in IPC");
+    assert_eq!(ext, ipc, "the ext arm must join to the address hyprctl prints");
+    assert!(
+        !session.client_log("chonk-toplevel-mapping-probe").contains("**ext mapping failed**"),
+        "the ext arm answered `failed`, which is the defect this covers"
+    );
+}
+
+/// The four requests Quickshell makes on connect, in the shapes it
+/// parses. `j/status` is first because Quickshell will not even connect
+/// to the event socket until it is answered.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn answers_the_queries_quickshell_makes_on_connect() {
+    let session = boot("hypr-ipc-queries");
+    let dir = socket_dir(&session);
+
+    let status = json(&dir, "j/status");
+    assert!(status.get("configProvider").is_some(), "Quickshell reads configProvider");
+
+    let monitors = json(&dir, "j/monitors");
+    let monitor = &monitors.as_array().expect("monitors is an array")[0];
+    for key in ["id", "name", "description", "x", "y", "width", "height", "scale", "focused"] {
+        assert!(!monitor[key].is_null(), "monitors[0].{key}");
+    }
+    assert!(monitor["activeWorkspace"]["id"].is_number(), "the nested workspace ref");
+
+    let workspaces = json(&dir, "j/workspaces");
+    let workspace = &workspaces.as_array().expect("workspaces is an array")[0];
+    // Hyprland numbers from 1; chonkstep from 0. A workspace served as
+    // 0 is one no bar button can match.
+    assert_eq!(workspace["id"], serde_json::json!(1));
+    assert_eq!(workspace["name"], serde_json::json!("1"));
+
+    assert!(json(&dir, "j/clients").is_array(), "clients is an array");
+
+    // Nothing is focused in a session with no windows, and Hyprland's
+    // shape for that is an empty object — not null, not [].
+    assert_eq!(json(&dir, "j/activewindow"), serde_json::json!({}));
+
+    let devices = json(&dir, "j/devices");
+    let keyboard = &devices["keyboards"][0];
+    for key in ["name", "active_keymap", "layout", "active_layout_index"] {
+        assert!(!keyboard[key].is_null(), "devices.keyboards[0].{key}");
+    }
+    assert!(devices["mice"].as_array().is_some_and(|mice| !mice.is_empty()));
+    assert!(!request(&dir, "binds").trim().is_empty(), "the keybinding menu receives the live keymap");
+}
+
+/// `hyprctl binds` must name keys, because the thing reading it prints
+/// the name to a human.
+///
+/// `omarchy-menu-keybindings` — the script behind `SUPER + K` — parses
+/// the PLAIN bind block (deliberately, not `-j`: its own comment says
+/// Hyprland 0.56.0 emits invalid JSON for binds), awk-splits out the
+/// `key` field and puts it straight into a menu row. So the field is
+/// read by a person, and a `key` of `0x1008ff13` is a cheat sheet that
+/// has failed at the one thing it exists for.
+///
+/// The four chords bound here are the four shapes that were broken:
+/// the whole `XF86` block, the function keys, the editing keys, and
+/// `space` — which is not merely wrong but blank, and which on a real
+/// Omarchy desktop is `SUPER + SPACE`, the chord that opens the menu.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn binds_names_every_key_rather_than_reporting_its_keysym_in_hex() {
+    let mut options = SessionOptions::default();
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    options.config_extra = "\n[keybindings]\n\
+        \"super+space\" = \"overview\"\n\
+        \"volumeup\" = \"toggle-maximize\"\n\
+        \"super+f9\" = \"miniaturize\"\n\
+        \"super+shift+backspace\" = \"close\"\n"
+        .to_string();
+    let session = Session::boot("hypr-ipc-bind-names", options).expect("nested session");
+    let dir = socket_dir(&session);
+
+    let plain = request(&dir, "binds");
+    let keys: Vec<&str> = plain
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("key: "))
+        .map(str::trim_end)
+        .collect();
+    assert!(!keys.is_empty(), "no key fields in the bind block:\n{plain}");
+
+    // Not one row may be a hex number or blank — the two failures.
+    for key in &keys {
+        assert!(!key.starts_with("0x"), "a bind is reported as hex: {key:?}\n{plain}");
+        assert!(!key.is_empty(), "a bind is reported as blank\n{plain}");
+    }
+    // And the specific keys that used to be, by name.
+    for expected in ["space", "F9", "BackSpace", "XF86AudioRaiseVolume"] {
+        assert!(keys.contains(&expected), "no bind reported as {expected:?}, saw {keys:?}");
+    }
+
+    // The JSON encoding carries the same field and had the same bug.
+    let binds = json(&dir, "j/binds");
+    for bind in binds.as_array().expect("binds is an array") {
+        let key = bind["key"].as_str().expect("every bind has a string key");
+        assert!(!key.starts_with("0x") && !key.is_empty(), "j/binds key {key:?}");
+    }
+}
+
+/// A real window reaches both halves of the protocol, with one address.
+///
+/// Quickshell correlates event payloads with `j/clients` entries by
+/// parsing both as base-16 numbers, so the two forms must agree in
+/// value even though they differ in spelling (`0x…` in JSON, bare hex
+/// in events).
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_real_window_appears_in_the_stream_and_the_client_list() {
+    let mut session = boot("hypr-ipc-window");
+    let dir = socket_dir(&session);
+    let mut events = Events::connect(&dir);
+
+    // `zenity --question` is the harness's long-lived window: it sits
+    // on a dialog until dismissed, where a terminal with no command
+    // exits the moment its shell finds no tty.
+    session.launch("zenity", &["--question", "--title", "ipc-probe", "--text", "hold still"]).expect("launch a window");
+    session.wait_for_window("ipc-probe").expect("the window maps");
+
+    let data = events.wait_for("openwindow");
+    let fields: Vec<&str> = data.splitn(4, ',').collect();
+    assert_eq!(fields.len(), 4, "openwindow carries address,workspace,class,title: {data:?}");
+    let from_event = u64::from_str_radix(fields[0], 16).unwrap_or_else(|e| panic!("event address {data:?}: {e}"));
+    assert!(fields[3].contains("ipc-probe"), "the title travels with the event: {data:?}");
+
+    let clients = json(&dir, "j/clients");
+    let entry = clients
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|c| c["title"].as_str().is_some_and(|t| t.contains("ipc-probe")))
+        .unwrap_or_else(|| panic!("the window is missing from j/clients: {clients}"));
+
+    let address = entry["address"].as_str().expect("address is a string");
+    assert!(address.starts_with("0x"), "j/clients spells addresses with 0x: {address}");
+    let from_json = u64::from_str_radix(address.trim_start_matches("0x"), 16).expect("hex");
+    assert_eq!(from_json, from_event, "the two spellings must name the same window");
+
+    // The geometry keys `omarchy-capture-region` indexes as arrays.
+    assert_eq!(entry["at"].as_array().map(Vec::len), Some(2), "at is [x, y]");
+    assert_eq!(entry["size"].as_array().map(Vec::len), Some(2), "size is [w, h]");
+}
+
+/// `xdg_toplevel_tag_v1` reaches `j/clients`. The probe tags its
+/// window and then describes it before the first commit, the way a
+/// real client does, and both come back under Hyprland's names — the
+/// global was advertised for a long time while every value was thrown
+/// away. A retag after the map is protocol-only metadata: nothing
+/// repaints, but the publishers must still notice it on the next pass.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn an_xdg_toplevel_tag_reaches_the_client_list_and_follows_a_retag() {
+    let mut session = boot("hypr-ipc-xdg-tag");
+    let dir = socket_dir(&session);
+    let probe = profile_binary("chonk-fullscreen-probe").expect("cargo build -p chonk-testkit builds the probe");
+    session
+        .launch(probe.to_str().unwrap(), &["xdg-tag-probe", "chonk-fullscreen-probe", "xdg-tag"])
+        .expect("the probe launches");
+    let window = session.wait_for_window("xdg-tag-probe").expect("the probe maps");
+    let probe_entry = |dir: &Path| {
+        let clients = json(dir, "j/clients");
+        clients
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|client| client["title"].as_str() == Some("xdg-tag-probe"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the probe is missing from j/clients: {clients}"))
+    };
+
+    let entry = probe_entry(&dir);
+    assert_eq!(entry["xdgTag"].as_str(), Some("probe-main"), "the tag set before the first commit: {entry}");
+    assert_eq!(
+        entry["xdgDescription"].as_str(),
+        Some("Probe window"),
+        "the description set after the tag, without displacing it: {entry}"
+    );
+
+    // Retag the mapped window through the probe's control. The click
+    // puts the seat's keyboard focus where the injected key goes.
+    let door = session.door();
+    door.click(window.x as f64 + window.w as f64 / 2.0, window.y as f64 + window.h as f64 / 2.0)
+        .expect("a click lands on the probe");
+    door.barrier().expect("the click settles");
+    door.tap_key(keys::T).expect("the retag key reaches the probe");
+    poll_until(EVENT, "the probe to send the retag", || {
+        session.client_log("chonk-fullscreen-probe").contains("xdg tag set to \"probe-retagged\"").then_some(())
+    })
+    .expect("the probe retags on t");
+    poll_until(EVENT, "the retag to reach j/clients", || {
+        (probe_entry(&dir)["xdgTag"].as_str() == Some("probe-retagged")).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}: {}", probe_entry(&dir)));
+    let entry = probe_entry(&dir);
+    assert_eq!(entry["xdgDescription"].as_str(), Some("Probe window"), "a retag leaves the description alone: {entry}");
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn foreign_toplevel_mapping_returns_the_same_live_ipc_address() {
+    let mut session = boot("hypr-toplevel-mapping");
+    let dir = socket_dir(&session);
+    let probe = profile_binary("chonk-toplevel-mapping-probe").expect("mapping probe built");
+    session.launch(probe.to_str().unwrap(), &[]).expect("mapping probe launches");
+    poll_until(EVENT, "the mapping probe to bind both globals", || {
+        session.client_log("chonk-toplevel-mapping-probe").contains("**mapping ready**").then_some(())
+    })
+    .expect("mapping globals are available");
+
+    session.launch("zenity", &["--question", "--title", "mapping-probe", "--text", "hold still"]).unwrap();
+    session.wait_for_window("mapping-probe").expect("window maps");
+    let mapped = poll_until(EVENT, "the protocol to return a window address", || {
+        let report = session.client_log("chonk-toplevel-mapping-probe");
+        let address = report.split("**mapped address ").nth(1)?.split("**").next()?;
+        Some(address.to_string())
+    })
+    .expect("mapping returns an address");
+
+    let clients = json(&dir, "j/clients");
+    let ipc = clients
+        .as_array().unwrap()
+        .iter()
+        .find(|client| client["title"].as_str().is_some_and(|title| title.contains("mapping-probe")))
+        .and_then(|client| client["address"].as_str())
+        .expect("the same window appears in IPC");
+    assert_eq!(mapped, ipc, "the protocol is a join, so both surfaces must return one identity");
+
+    // The subscriber must hear later state changes too. This is the
+    // invalidation edge the demand-driven publisher relies on: an
+    // unchanged client commit sends nothing, while a real WM mutation
+    // closes one new atomic foreign-toplevel batch with `done`.
+    let done_before = session.client_log("chonk-toplevel-mapping-probe").matches("**foreign done**").count();
+    assert_eq!(request(&dir, "dispatch fullscreen 0").trim(), "ok");
+    poll_until(EVENT, "the foreign-toplevel handle to publish fullscreen", || {
+        (session.client_log("chonk-toplevel-mapping-probe").matches("**foreign done**").count() > done_before)
+            .then_some(())
+    })
+    .expect("the foreign-toplevel stream follows WM state changes");
+    let fullscreen = json(&dir, "j/clients")
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|client| client["title"].as_str().is_some_and(|title| title.contains("mapping-probe")))
+        .and_then(|client| client["fullscreen"].as_i64());
+    // 2 is Hyprland's number for real fullscreen; 1 would be maximize.
+    assert_eq!(fullscreen, Some(2), "Hyprland IPC and foreign-toplevel observe the same fullscreen transition");
+
+    session.kill_client("zenity");
+    session.wait_for_window_gone("mapping-probe").expect("window unmaps cleanly");
+    assert!(session.compositor_alive(), "stale foreign handles are cleaned rather than dereferenced");
+}
+
+/// Input-shaped activity is not a protocol invalidation. This observes
+/// work rather than only wire output: a full reconciliation that allocates
+/// and then finds an empty diff would otherwise look just as quiet as the
+/// optimized path from outside the compositor.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn focused_click_is_snapshot_free_and_drag_syncs_only_its_toplevel() {
+    let mut session = boot("hypr-protocol-invalidation");
+    let dir = socket_dir(&session);
+    let _events = Events::connect(&dir);
+
+    let observer = profile_binary("chonk-toplevel-mapping-probe").expect("mapping probe built");
+    session.launch(observer.to_str().unwrap(), &[]).expect("mapping probe launches");
+    poll_until(EVENT, "the foreign-toplevel manager to bind", || {
+        session
+            .client_log("chonk-toplevel-mapping-probe")
+            .contains("**mapping ready**")
+            .then_some(())
+    })
+    .expect("foreign-toplevel manager is available");
+
+    let probe = profile_binary("chonk-fullscreen-probe").expect("window probe built");
+    session
+        .launch(probe.to_str().unwrap(), &["protocol-invalidation"])
+        .expect("window probe launches");
+    let window = session
+        .wait_for_window("protocol-invalidation")
+        .expect("window maps and takes focus");
+    poll_until(EVENT, "the foreign-toplevel handle to settle", || {
+        session
+            .client_log("chonk-toplevel-mapping-probe")
+            .contains("**foreign done**")
+            .then_some(())
+    })
+    .expect("foreign-toplevel published the probe");
+    session.door().barrier().expect("initial protocol publications settle");
+
+    let before_click = session.door().protocol_publishes().expect("read publisher counters");
+    session
+        .door()
+        .click(
+            window.x as f64 + window.w as f64 / 2.0,
+            window.y as f64 + window.h as f64 / 2.0,
+        )
+        .expect("click the already-focused content");
+    let after_click = session.door().protocol_publishes().expect("read counters after click");
+    assert_eq!(
+        after_click, before_click,
+        "a focused content click must build neither protocol snapshot"
+    );
+
+    let world = session.door().windows().expect("read the decorated window");
+    let frame = world.frame_of(window.id).expect("the probe has server decorations");
+    let titlebar = (frame.x as f64 + frame.w as f64 / 2.0, frame.y as f64 + 8.0);
+    session
+        .door()
+        .drag_to(titlebar, (titlebar.0 + 96.0, titlebar.1 + 64.0))
+        .expect("drag the titlebar");
+    session.door().button("left", false).expect("release the drag");
+    session.door().barrier().expect("drag settles");
+
+    let after_drag = session.door().protocol_publishes().expect("read counters after drag");
+    assert_eq!(
+        after_drag.hyprland, after_click.hyprland,
+        "geometry-only drag has no Hyprland event snapshot"
+    );
+    assert_eq!(
+        after_drag.foreign_full, after_click.foreign_full,
+        "dragging one window must not rebuild the full toplevel view"
+    );
+    assert_eq!(
+        after_drag.foreign_drag - after_click.foreign_drag,
+        8,
+        "each of the eight settled drag steps must sync exactly one toplevel"
+    );
+    assert!(session.compositor_alive(), "optimized protocol paths keep the session alive");
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn window_geometry_plain_fields_and_monitor_eval_are_applied_before_ok() {
+    let mut session = boot("hypr-ipc-window-actions");
+    let dir = socket_dir(&session);
+    // Exact geometry needs a client that accepts resize configures. GTK's
+    // question dialog sets equal minimum/maximum sizes and can legitimately
+    // commit its original pixels after acknowledging an arbitrary resize.
+    let binary = profile_binary("chonk-fullscreen-probe").unwrap();
+    session.launch_isolated(binary.to_str().unwrap(), &["geometry-probe", "geometry-probe"]).unwrap();
+    session.wait_for_window("geometry-probe").expect("window maps");
+
+    let client = || {
+        json(&dir, "j/clients")
+            .as_array().unwrap()
+            .iter()
+            .find(|client| client["title"].as_str().is_some_and(|title| title.contains("geometry-probe")))
+            .cloned()
+            .expect("client stays mapped")
+    };
+    let before = client();
+    let address = before["address"].as_str().unwrap().to_string();
+    let original_size = before["size"].clone();
+
+    assert_eq!(
+        request(&dir, &format!("/dispatch resizewindowpixel exact 500 320,address:{address}")).trim(),
+        "ok"
+    );
+    poll_until(EVENT, "the exact resize to reach the live client", || {
+        (client()["size"] == serde_json::json!([500, 320])).then_some(())
+    })
+    .expect("resize changes geometry rather than only replying");
+
+    assert_eq!(
+        request(
+            &dir,
+            &format!(
+                "eval hl.dispatch(hl.dsp.window.resize({{ window = \"address:{address}\", x = 25, y = 10, relative = true }}))"
+            ),
+        )
+        .trim(),
+        "ok"
+    );
+    poll_until(EVENT, "the Lua relative resize to apply", || {
+        (client()["size"] == serde_json::json!([525, 330])).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}; final client: {}", client()));
+
+    let original_w = original_size[0].as_i64().unwrap();
+    let original_h = original_size[1].as_i64().unwrap();
+    assert_eq!(
+        request(
+            &dir,
+            &format!("/dispatch resizewindowpixel exact {original_w} {original_h},address:{address}"),
+        )
+        .trim(),
+        "ok"
+    );
+    poll_until(EVENT, "saved dimensions to round-trip", || (client()["size"] == original_size).then_some(()))
+        .expect("a saved width/height can be restored exactly");
+
+    let plain = request(&dir, "activewindow");
+    for field in [
+        "\tpid:", "\tclass:", "\ttitle:", "\tat:", "\tsize:", "\tworkspace:", "\tfloating:",
+        "\tmonitor:", "\txwayland:", "\tpinned:", "\tfullscreen:",
+    ] {
+        assert!(plain.contains(field), "plain activewindow omitted {field:?}: {plain}");
+    }
+    let pid = client()["pid"].as_u64().expect("live client pid");
+    assert!(pid > 0, "the pid must come from client credentials, not a zero placeholder");
+    assert!(plain.contains(&format!("\tpid: {pid}")), "plain and JSON views must report one pid: {plain}");
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{pid}/cwd")).expect("the focused client's cwd remains inspectable"),
+        std::env::current_dir().unwrap(),
+        "omarchy-cmd-terminal-cwd reads this pid and must reach the real client cwd"
+    );
+
+    assert_eq!(request(&dir, "eval hl.monitor({ output = \"chonkstep\", scale = 1.5 })").trim(), "ok");
+    poll_until(EVENT, "monitor scale eval to update live output state", || {
+        ((json(&dir, "j/monitors")[0]["scale"].as_f64()? - 1.5).abs() < f64::EPSILON).then_some(())
+    })
+    .expect("monitor mutation must happen before success is observable");
+}
+
+/// `hl.monitor` applies everything it was asked for or refuses before
+/// changing anything. A mode the output does not advertise leaves the scale
+/// of the same request alone; an explicit position is where `monitors`
+/// reports the output when `ok` comes back; and Omarchy's own request, the
+/// current mode and `auto` placement with a scale, applies.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn monitor_eval_applies_mode_position_and_scale_together_or_nothing() {
+    let mut options = SessionOptions { scale: Some(1.0), ..SessionOptions::default() };
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    let mut session = Session::boot("hypr-ipc-monitor-configure", options).expect("nested session");
+    let dir = socket_dir(&session);
+    let monitors = || json(&dir, "j/monitors");
+
+    let first = monitors()[0].clone();
+    let name = first["name"].as_str().expect("monitor name").to_string();
+    let scale = first["scale"].as_f64().expect("monitor scale");
+    let refused = request(&dir, &format!("eval hl.monitor({{ output = \"{name}\", mode = \"1x1@1\", scale = 2 }})"));
+    // The nested output publishes no mode list, so the refusal comes from the
+    // compositor's own resolution, after the parse, before anything changes.
+    assert!(refused.starts_with("Invalid dispatcher"), "an unadvertised mode is refused: {refused}");
+    assert!(
+        (monitors()[0]["scale"].as_f64().unwrap() - scale).abs() < f64::EPSILON,
+        "a refused request must not leave its scale applied"
+    );
+
+    session.door().set_virtual_outputs("split").expect("the nested output splits");
+    let second = poll_until(EVENT, "both split outputs to be reported", || {
+        let all = monitors();
+        (all.as_array()?.len() == 2).then(|| all[1].clone())
+    })
+    .expect("two outputs");
+    let second_name = second["name"].as_str().expect("monitor name").to_string();
+    let x = second["x"].as_i64().expect("monitor x") + 100;
+    assert_eq!(
+        request(&dir, &format!("eval hl.monitor({{ output = \"{second_name}\", position = \"{x}x0\" }})")).trim(),
+        "ok"
+    );
+    let reported = monitors();
+    let moved = reported
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|monitor| monitor["name"] == second_name.as_str())
+        .expect("the moved output is still reported");
+    assert_eq!((moved["x"].as_i64(), moved["y"].as_i64()), (Some(x), Some(0)), "{reported}");
+    session.door().set_virtual_outputs("single").expect("the nested output rejoins");
+
+    let current = poll_until(EVENT, "a single output again", || {
+        let all = monitors();
+        (all.as_array()?.len() == 1).then(|| all[0].clone())
+    })
+    .expect("one output");
+    let mode = format!(
+        "{}x{}@{:.2}",
+        current["width"],
+        current["height"],
+        current["refreshRate"].as_f64().expect("refresh rate")
+    );
+    let name = current["name"].as_str().expect("monitor name").to_string();
+    assert_eq!(
+        request(
+            &dir,
+            &format!("eval hl.monitor({{ output = \"{name}\", mode = \"{mode}\", position = \"auto\", scale = 1.25 }})")
+        )
+        .trim(),
+        "ok",
+        "the mode `monitors` reported must be accepted back: {current}"
+    );
+    assert!(
+        (monitors()[0]["scale"].as_f64().unwrap() - 1.25).abs() < f64::EPSILON,
+        "the scale is applied before ok is observable"
+    );
+    assert!(session.compositor_alive());
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_fixed_size_dialog_can_decline_an_ipc_resize_without_an_oversized_frame() {
+    let mut session = boot("hypr-ipc-fixed-dialog");
+    let dir = socket_dir(&session);
+    session.launch("zenity", &["--question", "--title", "fixed-dialog", "--text", "hold still"]).unwrap();
+    let window = session.wait_for_window("fixed-dialog").unwrap();
+    session.door().barrier().unwrap();
+    let before = session.world().unwrap();
+    let original = before.window_matching("fixed-dialog").unwrap();
+    let frame_size = before.frame_of(window.id).map(|frame| (frame.w, frame.h));
+    let requested = (original.w + 200, original.h + 100);
+    assert_eq!(
+        request(&dir, &format!("/dispatch resizeactive exact {} {}", requested.0, requested.1)).trim(),
+        "ok"
+    );
+    poll_until(EVENT, "GTK commits its fixed size and the frame fits it", || {
+        session.door().barrier().ok()?;
+        let world = session.world().ok()?;
+        let current = world.window_matching("fixed-dialog")?;
+        ((current.w, current.h) == (original.w, original.h)
+            && world.frame_of(window.id).map(|frame| (frame.w, frame.h)) == frame_size).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}; {:?}", session.world().unwrap()));
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn exec_and_reload_have_observable_effects_before_success() {
+    let session = boot("hypr-ipc-exec-reload");
+    let dir = socket_dir(&session);
+
+    let direct = session.dir.join("direct-argv-executed");
+    assert_eq!(
+        request(&dir, &format!("/dispatch exec -- /usr/bin/touch {}", direct.display())).trim(),
+        "ok"
+    );
+    poll_until(EVENT, "direct exec argv to create its marker", || direct.exists().then_some(()))
+        .expect("exec -- must preserve argv rather than reinterpret it as shell source");
+
+    let lua = session.dir.join("lua-long-string-executed");
+    assert_eq!(
+        request(
+            &dir,
+            &format!("/dispatch hl.dsp.exec_cmd([=[/usr/bin/touch {}]=])", lua.display()),
+        )
+        .trim(),
+        "ok"
+    );
+    poll_until(EVENT, "Lua long-string exec to create its marker", || lua.exists().then_some(()))
+        .expect("Lua long brackets and quoted strings must reach the same shell-command path");
+
+    let mut events = Events::connect(&dir);
+    assert_eq!(request(&dir, "/reload").trim(), "ok");
+    assert_eq!(events.wait_for("configreloaded"), "", "a live re-read must tell Quickshell to refresh");
+}
+
+/// The reply to a reload is the truth about it. A `config.toml` that
+/// no longer parses keeps the working configuration — correctly — but
+/// `reload` used to answer `ok` and `configerrors` kept listing the
+/// diagnostics from before the edit, which is the pair Omarchy's
+/// documented validation loop (`hyprctl reload`, then `hyprctl
+/// configerrors`) reads. Now the reload is refused, the rejection
+/// heads the list (once, however often the retry fails), and fixing
+/// the file clears it.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_reload_of_an_unparseable_config_is_refused_and_listed_until_the_file_is_fixed() {
+    let mut session = boot("hypr-ipc-reload-rejected");
+    let dir = socket_dir(&session);
+    let working = std::fs::read_to_string(session.dir.join("config/chonkstep/config.toml"))
+        .expect("the harness wrote the session's config");
+    fn config_errors(dir: &Path) -> Vec<String> {
+        json(dir, "j/configerrors")
+            .as_array()
+            .expect("configerrors is an array")
+            .iter()
+            .map(|entry| entry["error"].as_str().expect("an error line").to_string())
+            .collect()
+    }
+    fn rejections(lines: &[String]) -> Vec<&String> {
+        lines.iter().filter(|line| line.starts_with("reload rejected: ")).collect()
+    }
+
+    assert_eq!(request(&dir, "/reload").trim(), "ok");
+    assert!(rejections(&config_errors(&dir)).is_empty(), "a working file has no rejection to report");
+
+    session.rewrite_config("omarchy_shell = false\n[broken\ntheme = \"unterminated\n").unwrap();
+    let reply = request(&dir, "/reload");
+    assert_ne!(reply.trim(), "ok", "a reload that applied nothing must not claim success");
+    let errors = config_errors(&dir);
+    let rejected = rejections(&errors);
+    assert_eq!(rejected.len(), 1, "{errors:?}");
+    assert!(rejected[0].contains("invalid TOML"), "{errors:?}");
+    assert_eq!(errors[0], *rejected[0], "the rejection heads the list: {errors:?}");
+
+    // Retrying the same broken file replaces the line, never stacks it.
+    assert_ne!(request(&dir, "/reload").trim(), "ok");
+    assert_eq!(rejections(&config_errors(&dir)).len(), 1);
+    assert!(session.compositor_alive(), "a broken edit must never cost the session");
+
+    session.rewrite_config(&working).unwrap();
+    assert_eq!(request(&dir, "/reload").trim(), "ok", "the restored file applies again");
+    let errors = config_errors(&dir);
+    assert!(rejections(&errors).is_empty(), "a successful reload clears the rejection: {errors:?}");
+}
+
+/// The regression test for the bug an end-to-end run found and the unit
+/// tests could not: `dispatch workspace N` answered `ok` and left the
+/// desktop where it was, because the answer was written on one side of
+/// the crate boundary and the effect attempted on the other.
+///
+/// Asserting the response alone would still pass against that bug. The
+/// assertion that matters is the one after it.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn switches_the_workspace_for_real() {
+    let session = boot("hypr-ipc-dispatch");
+    let dir = socket_dir(&session);
+    let mut events = Events::connect(&dir);
+
+    assert_eq!(json(&dir, "j/activeworkspace")["id"], serde_json::json!(1));
+
+    assert_eq!(request(&dir, "/dispatch workspace 3").trim(), "ok");
+
+    // The desktop actually moved — this is the assertion the bug failed.
+    poll_until(EVENT, "the compositor to be on workspace 3", || {
+        (json(&dir, "j/activeworkspace")["id"] == serde_json::json!(3)).then_some(())
+    })
+    .expect("dispatch workspace 3 must switch, not merely answer ok");
+
+    // And it was narrated, in Hyprland's spelling and numbering.
+    assert_eq!(events.wait_for("workspacev2"), "3,3");
+
+    // The Lua dialect Omarchy 4 sends first reaches the same place.
+    assert_eq!(request(&dir, r#"dispatch hl.dsp.focus({ workspace = "1" })"#).trim(), "ok");
+    poll_until(EVENT, "the compositor to be back on workspace 1", || {
+        (json(&dir, "j/activeworkspace")["id"] == serde_json::json!(1)).then_some(())
+    })
+    .expect("the Lua dispatch dialect must work too");
+}
+
+/// The direct dispatcher must preserve the semantic difference between
+/// `movetoworkspace` and `movetoworkspacesilent`: move the active
+/// window, leave the output on its current workspace, and focus what
+/// the move exposed.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn silently_moves_a_real_window_without_following_it() {
+    let mut session = boot("hypr-ipc-workspace-send");
+    let dir = socket_dir(&session);
+    let probe = profile_binary("chonk-fullscreen-probe").expect("probe is built");
+    let program = probe.display().to_string();
+    session.launch(&program, &["SilentA"]).expect("first probe launches");
+    session.wait_for_window("SilentA").expect("first probe maps");
+    session.launch(&program, &["SilentB"]).expect("second probe launches");
+    session.wait_for_window("SilentB").expect("second probe maps and takes focus");
+
+    assert_eq!(request(&dir, "/dispatch movetoworkspacesilent 2").trim(), "ok");
+
+    poll_until(EVENT, "the active window to move while the desktop stays", || {
+        let clients = json(&dir, "j/clients");
+        let moved = clients.as_array()?.iter().find(|client| client["title"] == "SilentB")?;
+        (moved["workspace"]["id"] == serde_json::json!(2)
+            && json(&dir, "j/activeworkspace")["id"] == serde_json::json!(1)
+            && json(&dir, "j/activewindow")["title"] == "SilentA")
+            .then_some(())
+    })
+    .expect("silent move must send B, remain on workspace 1, and focus A");
+}
+
+/// Omarchy's launch-or-focus chords and notification clicks activate a
+/// window by address. When that window lives on another workspace the
+/// desktop must go there: focusing it in place would send the user's next
+/// keystrokes into a window nobody can see.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn activating_a_window_on_another_workspace_shows_it() {
+    let mut session = boot("hypr-ipc-activate-hidden");
+    let dir = socket_dir(&session);
+    let probe = profile_binary("chonk-fullscreen-probe").expect("probe is built");
+    let program = probe.display().to_string();
+    session.launch(&program, &["ActivateA"]).expect("first probe launches");
+    session.wait_for_window("ActivateA").expect("first probe maps");
+    session.launch(&program, &["ActivateB"]).expect("second probe launches");
+    session.wait_for_window("ActivateB").expect("second probe maps and takes focus");
+
+    assert_eq!(request(&dir, "/dispatch movetoworkspacesilent 2").trim(), "ok");
+    let address = poll_until(EVENT, "B to be parked on workspace 2", || {
+        let clients = json(&dir, "j/clients");
+        let parked = clients.as_array()?.iter().find(|client| client["title"] == "ActivateB")?;
+        if parked["workspace"]["id"] != serde_json::json!(2)
+            || json(&dir, "j/activeworkspace")["id"] != serde_json::json!(1)
+        {
+            return None;
+        }
+        parked["address"].as_str().map(str::to_string)
+    })
+    .expect("the silent move parks B and stays on workspace 1");
+
+    for (spelling, activation) in [
+        ("classic", format!("/dispatch focuswindow address:{address}")),
+        ("lua", format!(r#"dispatch hl.dsp.focus({{ window = "address:{address}" }})"#)),
+    ] {
+        assert_eq!(request(&dir, "/dispatch workspace 1").trim(), "ok");
+        poll_until(EVENT, "the desktop to be back on workspace 1", || {
+            (json(&dir, "j/activeworkspace")["id"] == serde_json::json!(1)).then_some(())
+        })
+        .unwrap();
+        assert_eq!(request(&dir, &activation).trim(), "ok", "{spelling}");
+        poll_until(EVENT, "activation to bring B's workspace on screen with B focused", || {
+            (json(&dir, "j/activeworkspace")["id"] == serde_json::json!(2)
+                && json(&dir, "j/activewindow")["title"] == "ActivateB")
+                .then_some(())
+        })
+        .unwrap_or_else(|error| panic!("{spelling} activation: {error}"));
+    }
+}
+
+/// Omarchy's scratchpad, live. `movetoworkspacesilent special:scratchpad`
+/// takes the focused window off the desk without changing the
+/// workspace; `togglespecialworkspace scratchpad` brings it back on top
+/// of the workspace's windows and focused, so the seat's keys reach it;
+/// a second toggle hides it again. The bar hears each step as
+/// Hyprland spells it: the special in `workspaces` with a negative id,
+/// `monitors[].specialWorkspace`, and the `activespecial` events.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn the_scratchpad_toggle_shows_a_silently_moved_window_on_top_and_hides_it_again() {
+    let mut session = boot("hypr-ipc-scratchpad");
+    let dir = socket_dir(&session);
+    let mut events = Events::connect(&dir);
+    let probe = profile_binary("chonk-fullscreen-probe").expect("probe is built");
+    let program = probe.display().to_string();
+    session.launch(&program, &["ScratchA"]).expect("first probe launches");
+    session.wait_for_window("ScratchA").expect("first probe maps");
+    session.launch(&program, &["ScratchB"]).expect("second probe launches");
+    session.wait_for_window("ScratchB").expect("second probe maps and takes focus");
+    let monitor = json(&dir, "j/monitors")[0]["name"].as_str().expect("an output").to_string();
+
+    assert_eq!(request(&dir, "/dispatch movetoworkspacesilent special:scratchpad").trim(), "ok");
+    let address = poll_until(EVENT, "B to be parked on the hidden special workspace", || {
+        let clients = json(&dir, "j/clients");
+        let parked = clients.as_array()?.iter().find(|client| client["title"] == "ScratchB")?;
+        (parked["workspace"]["name"] == "special:scratchpad"
+            && parked["workspace"]["id"].as_i64()? < 0
+            && json(&dir, "j/activeworkspace")["id"] == serde_json::json!(1)
+            && json(&dir, "j/activewindow")["title"] == "ScratchA")
+            .then(|| parked["address"].as_str().map(str::to_string))?
+    })
+    .expect("the silent move parks B on the special, stays on workspace 1 and focuses A");
+    let bare = address.trim_start_matches("0x").to_string();
+    assert_eq!(events.wait_for("movewindowv2"), format!("{bare},-99,special:scratchpad"));
+    let world = session.door().windows().expect("read the desk");
+    let frame_shown = |world: &chonk_testkit::World, title: &str| {
+        let window = world.window_matching(title).unwrap_or_else(|| panic!("{title} is listed"));
+        world.frame_of(window.id).unwrap_or_else(|| panic!("{title} is decorated")).mapped
+    };
+    assert!(!frame_shown(&world, "ScratchB"), "a parked member's frame is unmapped: {:?}", world.frames);
+    assert!(frame_shown(&world, "ScratchA"));
+    let listed = json(&dir, "j/workspaces");
+    let special = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workspace| workspace["name"] == "special:scratchpad")
+        .expect("the special is listed among the workspaces");
+    assert_eq!(special["id"], serde_json::json!(-99));
+    assert_eq!(special["windows"], serde_json::json!(1));
+    assert_eq!(json(&dir, "j/monitors")[0]["specialWorkspace"]["id"], serde_json::json!(0), "not shown yet");
+
+    assert_eq!(request(&dir, "/dispatch togglespecialworkspace scratchpad").trim(), "ok");
+    poll_until(EVENT, "the toggle to show B focused with the special on the monitor", || {
+        (json(&dir, "j/activewindow")["title"] == "ScratchB"
+            && json(&dir, "j/monitors")[0]["specialWorkspace"]["name"] == "special:scratchpad"
+            && json(&dir, "j/activeworkspace")["id"] == serde_json::json!(1))
+            .then_some(())
+    })
+    .expect("togglespecialworkspace must show the member, focus it and leave the workspace alone");
+    assert_eq!(events.wait_for("activespecial"), format!("special:scratchpad,{monitor}"));
+    assert_eq!(events.wait_for("activespecialv2"), format!("-99,special:scratchpad,{monitor}"));
+    let world = session.door().windows().expect("read the desk");
+    assert!(frame_shown(&world, "ScratchB"), "B is mapped again: {:?}", world.frames);
+    assert!(frame_shown(&world, "ScratchA"), "A stays on the workspace underneath");
+    let a = world.window_matching("ScratchA").unwrap();
+    let b = world.window_matching("ScratchB").unwrap();
+    assert!(b.stack_index > a.stack_index, "the overlay is on top: A {} B {}", a.stack_index, b.stack_index);
+
+    // The keys go to the shown member: the probe's `f` asks for
+    // fullscreen, and only B ends up fullscreen (mode 2, as Hyprland
+    // reports real fullscreen).
+    session.door().tap_key(33).expect("press f on the focused window");
+    poll_until(EVENT, "B, not A, to answer the key with a fullscreen request", || {
+        let clients = json(&dir, "j/clients");
+        let clients = clients.as_array()?;
+        let fullscreen = |title: &str| clients.iter().find(|client| client["title"] == title).map(|client| client["fullscreen"] == serde_json::json!(2));
+        (fullscreen("ScratchB") == Some(true) && fullscreen("ScratchA") == Some(false)).then_some(())
+    })
+    .expect("input reaches the shown special member");
+    session.door().tap_key(33).expect("press f again to leave fullscreen");
+    poll_until(EVENT, "B to leave fullscreen", || {
+        let clients = json(&dir, "j/clients");
+        let b = clients.as_array()?.iter().find(|client| client["title"] == "ScratchB")?;
+        (b["fullscreen"] == serde_json::json!(0)).then_some(())
+    })
+    .expect("the probe's fullscreen control toggles back");
+
+    assert_eq!(request(&dir, "/dispatch togglespecialworkspace scratchpad").trim(), "ok");
+    poll_until(EVENT, "the second toggle to hide B and hand focus back to A", || {
+        (json(&dir, "j/activewindow")["title"] == "ScratchA"
+            && json(&dir, "j/monitors")[0]["specialWorkspace"]["id"] == serde_json::json!(0))
+            .then_some(())
+    })
+    .expect("a second toggle hides the special");
+    assert_eq!(events.wait_for("activespecial"), format!(",{monitor}"));
+    assert_eq!(events.wait_for("activespecialv2"), format!(",,{monitor}"));
+    let world = session.door().windows().expect("read the desk");
+    assert!(!frame_shown(&world, "ScratchB"), "hidden again: {:?}", world.frames);
+    assert!(frame_shown(&world, "ScratchA"));
+
+    // The Lua dialect Omarchy's `tiling.lua` binds reaches the same place.
+    assert_eq!(request(&dir, r#"dispatch hl.dsp.workspace.toggle_special("scratchpad")"#).trim(), "ok");
+    poll_until(EVENT, "the Lua toggle to show B again", || {
+        (json(&dir, "j/activewindow")["title"] == "ScratchB").then_some(())
+    })
+    .expect("hl.dsp.workspace.toggle_special shows the special");
+    assert!(session.compositor_alive());
+}
+
+/// A mutation arriving through chonkstep's native bar protocol must
+/// invalidate the Hyprland event baseline too. Omarchy can have both
+/// clients connected at once; treating only Hyprland requests as dirty
+/// leaves its workspace indicator stale after the native bar switches.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn native_control_mutations_reach_the_hyprland_event_stream() {
+    let session = boot("hypr-ipc-native-control");
+    let dir = socket_dir(&session);
+    let mut events = Events::connect(&dir);
+
+    assert_eq!(request(&dir, "/dispatch workspace 2").trim(), "ok");
+    assert_eq!(events.wait_for("workspacev2"), "2,2");
+
+    let path = control_socket(&session);
+    let mut native = poll_until(EVENT, "the native control socket", || UnixStream::connect(&path).ok())
+        .expect("the native control socket accepts a bar");
+    native
+        .write_all(b"{\"request\":\"focus-workspace\",\"index\":0}\n")
+        .expect("send the native workspace switch");
+
+    assert_eq!(events.wait_for("workspacev2"), "1,1");
+    assert_eq!(json(&dir, "j/activeworkspace")["id"], serde_json::json!(1));
+}
+
+/// Omarchy's transparency toggle, live: `set_prop` with `prop =
+/// "opaque"` answers `ok` *and* changes the pixels — a window whose
+/// rule makes it translucent is drawn opaque after the toggle and
+/// translucent again after the next — while every other property is
+/// still refused with a message.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn set_prop_opaque_toggles_the_window_and_other_properties_are_refused() {
+    let mut options = SessionOptions::default();
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    options.config_extra = "omarchy_menu = false\nhyprland_config = true\nshow_dock = false\n".into();
+    options.config_root_files =
+        vec![("hypr/hyprland.conf".into(), "windowrule = opacity 0.5 0.5, match:class ^opacity-probe$\n".into())];
+    let mut session = Session::boot("hypr-ipc-opaque", options).expect("nested session");
+    let color = session.dir.join("opacity-rgb");
+    std::fs::write(&color, [255, 0, 0]).unwrap();
+    let probe = profile_binary("chonk-fullscreen-probe").unwrap();
+    session
+        .launch_isolated("env", &[&format!("CHONKSTEP_PROBE_COLOR_FILE={}", color.display()),
+            probe.to_str().unwrap(), "Opaque Probe", "opacity-probe"])
+        .unwrap();
+    let window = session.wait_for_window("Opaque Probe").unwrap();
+    session.door().click(f64::from(window.x) + f64::from(window.w) / 2.0, f64::from(window.y) + f64::from(window.h) / 2.0).unwrap();
+    session.door().barrier().unwrap();
+    let dir = socket_dir(&session);
+    let body = |session: &mut Session, label: &str| {
+        let shot = session.screenshot(label).unwrap();
+        (shot.mean_rgb(window.x as u32 + window.w / 2 - 8, window.y as u32 + window.h / 2 - 8, 16, 16), shot.path)
+    };
+    let pure_red = |[r, g, b]: [f64; 3]| r > 245.0 && g < 10.0 && b < 10.0;
+
+    let (before, path) = body(&mut session, "translucent");
+    assert!(!pure_red(before), "the rule makes the body translucent: {before:?} {}", path.display());
+
+    let address = json(&dir, "j/activewindow")["address"].as_str().expect("the active window's address").to_string();
+    let lua = format!(r#"/dispatch hl.dsp.window.set_prop({{ window = "address:{address}", prop = "opaque", value = "toggle" }})"#);
+    assert_eq!(request(&dir, &lua).trim(), "ok");
+    let (after, path) = body(&mut session, "forced-opaque");
+    assert!(pure_red(after), "the toggle draws the body opaque: {after:?} {}", path.display());
+
+    // The classic spelling the script falls back to, toggling back.
+    assert_eq!(request(&dir, &format!("/dispatch setprop address:{address} opaque toggle")).trim(), "ok");
+    let (again, path) = body(&mut session, "translucent-again");
+    assert!(!pure_red(again), "the second toggle lets the rule apply again: {again:?} {}", path.display());
+
+    for wire in [
+        format!(r#"/dispatch hl.dsp.window.set_prop({{ window = "address:{address}", prop = "rounding", value = "8" }})"#),
+        format!("/dispatch setprop address:{address} alpha 0.5"),
+    ] {
+        let answer = request(&dir, &wire);
+        assert!(answer.starts_with("Invalid dispatcher"), "{wire} is refused with a message: {answer:?}");
+        assert!(answer.contains("not modeled"), "{answer:?}");
+    }
+    let (still, path) = body(&mut session, "after-refusals");
+    assert!(!pure_red(still), "a refused property changes nothing: {still:?} {}", path.display());
+    assert!(session.compositor_alive());
+}
+
+/// The load-bearing rule, live: a verb chonkstep cannot honour fails,
+/// and is seen to change nothing.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn inapplicable_layout_messages_are_quiet_and_unavailable_groups_still_fail() {
+    let session = boot("hypr-ipc-refusal");
+    let dir = socket_dir(&session);
+
+    let before = json(&dir, "j/activeworkspace");
+
+    for verb in ["togglesplit", "layoutmsg orientationtop", "pseudo"] {
+        assert_eq!(request(&dir, &format!("/dispatch {verb}")).trim(), "ok");
+    }
+    let response = request(&dir, "/dispatch togglegroup");
+    assert!(response.starts_with("Invalid dispatcher"), "groups remain unsupported: {response:?}");
+
+    assert_eq!(json(&dir, "j/activeworkspace"), before, "a refused verb changes nothing");
+
+    // An unknown verb is answered, not dropped — a client that gets no
+    // reply blocks in read() forever.
+    assert!(request(&dir, "/nonsense").starts_with("unknown request"));
+}
+
+/// Disabling an output takes it out of `monitors` and into `monitors
+/// all` with `disabled: true`, fires `monitorremoved`, and enabling it
+/// again reverses each. The last output in the layout is refused.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn a_disabled_output_leaves_monitors_and_is_listed_by_monitors_all() {
+    let mut session = boot("hypr-ipc-monitor-disable");
+    let dir = socket_dir(&session);
+    let names = |request: &str| -> Vec<String> {
+        json(&dir, request)
+            .as_array()
+            .expect("monitors is an array")
+            .iter()
+            .map(|monitor| monitor["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    session.door().set_virtual_outputs("split").expect("the nested output splits");
+    poll_until(EVENT, "both split outputs to be reported", || (names("j/monitors").len() == 2).then_some(()))
+        .expect("two outputs");
+    let mut events = Events::connect(&dir);
+
+    assert_eq!(request(&dir, "keyword monitor chonkstep-right,disable").trim(), "ok");
+    assert_eq!(events.wait_for("monitorremoved"), "chonkstep-right");
+    assert_eq!(names("j/monitors"), ["chonkstep"], "plain monitors is the layout");
+    let all = json(&dir, "j/monitors all");
+    assert_eq!(names("j/monitors all"), ["chonkstep", "chonkstep-right"]);
+    assert_eq!(all[0]["disabled"], serde_json::json!(false));
+    assert_eq!(all[1]["disabled"], serde_json::json!(true), "{all}");
+    assert_eq!(all[1]["dpmsStatus"], serde_json::json!(false), "{all}");
+    assert!(request(&dir, "monitors all").contains("Monitor chonkstep-right (ID -1):"));
+
+    // Never zero outputs: the survivor cannot be disabled by any route.
+    let refused = request(&dir, "keyword monitor chonkstep,disable");
+    assert!(refused.starts_with("Invalid dispatcher"), "the last output is refused: {refused}");
+    let refused = request(&dir, "eval hl.monitor({ output = \"chonkstep\", disabled = true })");
+    assert!(refused.starts_with("Invalid dispatcher"), "the last output is refused: {refused}");
+    assert_eq!(names("j/monitors"), ["chonkstep"]);
+
+    // Omarchy's own re-enable, then the Display panel's spelling of both.
+    assert_eq!(request(&dir, "eval hl.monitor({ output = \"chonkstep-right\", disabled = false })").trim(), "ok");
+    assert_eq!(events.wait_for("monitoradded"), "chonkstep-right");
+    assert_eq!(names("j/monitors"), ["chonkstep", "chonkstep-right"]);
+    assert!(json(&dir, "j/monitors all").as_array().unwrap().iter().all(|m| m["disabled"] == serde_json::json!(false)));
+
+    assert_eq!(request(&dir, "keyword monitor chonkstep-right,disable").trim(), "ok");
+    assert_eq!(events.wait_for("monitorremoved"), "chonkstep-right");
+    assert_eq!(request(&dir, "keyword monitor chonkstep-right,preferred,auto,auto").trim(), "ok");
+    assert_eq!(events.wait_for("monitoradded"), "chonkstep-right");
+    assert_eq!(names("j/monitors"), ["chonkstep", "chonkstep-right"]);
+    assert!(session.compositor_alive());
+}

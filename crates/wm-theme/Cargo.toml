@@ -1,0 +1,33 @@
+[package]
+name = "wm-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NeXTSTEP-style theme data model and rendering engine."
+
+[features]
+# The LCOS themes. Off by default: Omarchy is the primary audience and
+# has no use for them, and a theme nobody can pick is still a theme
+# somebody has to read past in a menu.
+lcos = []
+
+[dependencies]
+wm-theme-api = { path = "../wm-theme-api" }
+serde = { version = "1", features = ["derive"] }
+tiny-skia = "0.11"
+cosmic-text = "0.19"
+unicode-segmentation = "1.13"
+tracing = "0.1"
+# Omarchy's `colors.toml` palette (`omarchy` module), and the serde
+# round-trip tests: `theme_toml` (the dockapp wire palette, serialized
+# in chonk-shell) must carry the appearance tag and tolerate its
+# absence, and the pin for that belongs beside the model.
+toml = "0.9"
+
+[dev-dependencies]
+chonk-test-support = { path = "../chonk-test-support" }
+flate2 = "1"
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

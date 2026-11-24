@@ -1,0 +1,1234 @@
+//! Inject physical seat events. DevTools only observes the private page and
+//! selects the starting editing context, never dispatches keyboard/clipboard API.
+#[path = "support/browser.rs"]
+mod browser;
+use browser::Browser;
+use chonk_testkit::{poll_until, Session, SessionOptions};
+use serde_json::Value;
+use std::{path::PathBuf, time::Duration};
+const WAIT: Duration = Duration::from_secs(12);
+const CMD: u32 = 125;
+const CTRL: u32 = 29;
+const SHIFT: u32 = 42;
+const CONTENT: &str = "Mac clipboard: café — 日本語 🍎\nsecond line";
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn spaces_with_desktop_keys_deliver_untranslated_super_and_control() {
+    let mut s = Session::boot("spaces-desktop-input", SessionOptions {
+        config_extra: "interaction_mode='spaces'\nkeyboard_mode='desktop'\ndesktop='omarchy'\nhyprland_config=false\nshow_dock=false\n".into(),
+        ..Default::default()
+    }).unwrap();
+    for platform in ["wayland", "x11"] {
+        let mut b = browser(&mut s, platform, platform);
+        focus(&mut s, &mut b, "source");
+        b.evaluate("events.length=0;true").unwrap();
+        chord(&mut s, &[CMD], 30);
+        poll_until(WAIT, "untranslated Super-A", || {
+            (b.evaluate("events.some(e=>e.key==='a' && e.type==='keydown' && e.meta && !e.ctrl)").ok()? == true).then_some(())
+        }).unwrap();
+        chord(&mut s, &[CTRL], 30);
+        poll_until(WAIT, "ordinary Control-A", || {
+            (b.evaluate("events.some(e=>e.key==='a' && e.type==='keydown' && e.ctrl && !e.meta) && source.selectionStart===0 && source.selectionEnd===source.value.length").ok()? == true).then_some(())
+        }).unwrap();
+    }
+}
+
+fn clipboard_output(s: &Session, args: &[&str]) -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let path = s.dir.join("observed-clipboard");
+    let mut child = Command::new("wl-paste").args(args)
+        .env("WAYLAND_DISPLAY", &s.wayland_display)
+        .stdout(Stdio::from(std::fs::File::create(&path).unwrap()))
+        .stderr(Stdio::null()).spawn().unwrap();
+    let status = poll_until(Duration::from_secs(2), "clipboard observation", || child.try_wait().ok().flatten());
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = poll_until(Duration::from_secs(2), "clipboard reader reaped", || child.try_wait().ok().flatten());
+        return None;
+    }
+    if !status.unwrap().success() || std::fs::metadata(&path).ok()?.len() > 1024 * 1024 { return None; }
+    std::fs::read(path).ok()
+}
+
+fn chord(s: &mut Session, modifiers: &[u32], code: u32) {
+    for &m in modifiers {
+        s.door().key(m, true).unwrap();
+    }
+    s.door().barrier().unwrap();
+    s.door().tap_key(code).unwrap();
+    for &m in modifiers.iter().rev() {
+        s.door().key(m, false).unwrap();
+    }
+    s.door().barrier().unwrap();
+}
+fn browser(s: &mut Session, platform: &str, suffix: &str) -> Browser {
+    assert!(chonk_testkit::require_client("chromium"));
+    let profile = s.dir.join(format!("browser-{suffix}"));
+    std::fs::create_dir(&profile).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mac-mode.html");
+    let url = format!("file://{}?{suffix}", fixture.display());
+    let mut args = vec![
+        format!("--ozone-platform={platform}"),
+        format!("--user-data-dir={}", profile.display()),
+        format!("--app={url}"),
+        "--window-size=520,400".into(),
+        "--remote-debugging-address=127.0.0.1".into(),
+        "--remote-debugging-port=0".into(),
+        "--no-first-run".into(),
+        "--no-default-browser-check".into(),
+        "--disable-background-networking".into(),
+        "--disable-component-update".into(),
+        "--disable-default-apps".into(),
+        "--disable-extensions".into(),
+        "--disable-sync".into(),
+        "--password-store=basic".into(),
+    ];
+    if std::env::var_os("CI").is_some() {
+        // Match the existing browser scale/popup fixtures: hosted runners
+        // deny user namespaces and have no DRM device. Only this disposable
+        // local-page browser gets these settings; local UAT keeps its sandbox.
+        args.extend(["--no-sandbox", "--use-gl=angle", "--use-angle=swiftshader"]
+            .into_iter().map(String::from));
+    }
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    if platform == "x11" {
+        s.launch_x11_isolated("chromium", &args).unwrap();
+    } else {
+        s.launch_isolated("chromium", &args).unwrap();
+    }
+    let mut b = poll_until(Duration::from_secs(60), "private browser page", || {
+        assert!(s.client_status("chromium").unwrap().is_none(),
+            "private browser exited before DevTools startup: {}", s.client_log("chromium"));
+        Browser::connect(&profile, &url).ok()
+    }).unwrap();
+    poll_until(WAIT, "loaded Mac fixture", || {
+        (b.evaluate("!!document.querySelector('#source')").ok()? == true).then_some(())
+    })
+    .unwrap();
+    b.evaluate(&format!("document.title='Mac Probe {suffix}'; true"))
+        .unwrap();
+    let window = s.wait_for_window(&format!("Mac Probe {suffix}")).unwrap();
+    let frame = s.world().unwrap().frame_of(window.id).cloned();
+    if let Some(f) = frame {
+        let x = if platform == "x11" { 650.0 } else { 40.0 };
+        s.door()
+            .drag_to((f.x as f64 + 180.0, f.y as f64 + 10.0), (x + 180.0, 50.0))
+            .unwrap();
+        s.door().button("left", false).unwrap();
+        s.door().barrier().unwrap();
+    }
+    b
+}
+fn focus(s: &mut Session, b: &mut Browser, id: &str) {
+    let title = b.evaluate("document.title").unwrap().as_str().unwrap().to_owned();
+    let window = s.world().unwrap().window_matching(&title).unwrap().clone();
+    let rect=b.evaluate(&format!("(()=>{{const r=document.getElementById('{id}').getBoundingClientRect();return {{x:r.x+10,y:r.y+10,w:innerWidth,h:innerHeight,dpr:devicePixelRatio}}}})()")).unwrap();
+    let n = |key: &str| rect[key].as_f64().unwrap();
+    let x = window.x as f64 + (window.w as f64 - n("w") * n("dpr")).max(0.0) + n("x") * n("dpr");
+    let y = window.y as f64 + (window.h as f64 - n("h") * n("dpr")).max(0.0) + n("y") * n("dpr");
+    s.door().click(x, y).unwrap();
+    poll_until(WAIT, "focused browser field", || {
+        (b.evaluate(&format!("document.hasFocus() && document.activeElement.id === '{id}'"))
+            .ok()?
+            == true)
+            .then_some(())
+    })
+    .unwrap_or_else(|e| {
+        let _ = s.screenshot("focus-failure");
+        panic!(
+            "{e}: point {x},{y}, window {window:?}, rect {rect}, DOM {}, world {:?}",
+            b.evaluate("({focus:document.hasFocus(),active:document.activeElement.id})")
+                .unwrap(),
+            s.world().unwrap()
+        );
+    });
+    s.door().barrier().unwrap();
+}
+fn expect(b: &mut Browser, id: &str, expected: &str) {
+    let mut last = Value::Null;
+    poll_until(WAIT, "actual edited text", || {
+        last = b.evaluate(&format!("document.getElementById('{id}').value")).unwrap();
+        (last == expected).then_some(())
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "{e}: expected {expected:?}, got {last}; events {}",
+            b.evaluate("events").unwrap()
+        )
+    });
+}
+fn boot(name: &str) -> Session {
+    Session::boot(
+        name,
+        SessionOptions {
+            config_extra: "interaction_mode = 'mac'\nshow_dock = false\nhyprland_config = false\n".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode; requires fcitx5 and Python GTK4"]
+fn command_shortcuts_survive_a_real_input_method_keyboard_grab() {
+    if !chonk_testkit::require_client("fcitx5") || !chonk_testkit::require_client("python3") {
+        return;
+    }
+    fn ime_chord(s: &mut Session, modifiers: &[u32], code: u32) {
+        // Mapping/focusing an editor can replace Fcitx's grab asynchronously.
+        // A seat barrier or fixed delay can still send keys to a retired grab.
+        // F12 does not edit text: require a fresh probe to travel through Fcitx
+        // and reach the focused editor before testing the actual shortcut.
+        // Unlike F24, F12 is mapped by older xkeyboard-config releases too.
+        let world = s.world().unwrap();
+        let focused = world.windows.iter().find(|w| Some(w.id) == world.logical_focus).unwrap();
+        let role = focused.title.strip_prefix("IME Probe ").unwrap();
+        let state_path = s.dir.join(format!("{role}.json"));
+        let probes = || {
+            std::fs::read_to_string(&state_path).ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|state| state["events"].as_array()
+                    .map(|events| events.iter().filter(|event| event["key"] == "F12").count()))
+                .unwrap_or(0)
+        };
+        let before = probes();
+        let ime_log = s.dir.join("client-0-env.log");
+        let log_start = std::fs::read_to_string(&ime_log).unwrap_or_default().len();
+        poll_until(WAIT, "focused editor receives a fresh key through Fcitx", || {
+            let log = std::fs::read_to_string(&ime_log).unwrap_or_default();
+            let forwarded = log.get(log_start..).unwrap_or_default().lines().any(|line| {
+                let line = chonk_testkit::strip_ansi(line);
+                line.contains("zwp_virtual_keyboard_v1") && line.contains(".key(")
+                    && line.contains(", 88, 1)")
+            });
+            if probes() > before && forwarded {
+                return Some(());
+            }
+            s.door().tap_key(88).unwrap(); // KEY_F12
+            None
+        }).unwrap_or_else(|error| panic!("{error}: {role}; state {}; world {:?}",
+            std::fs::read_to_string(&state_path).unwrap_or_default(), s.world()));
+        chord(s, modifiers, code);
+    }
+    let mut s = boot("mac-ime-clipboard");
+    s.launch_isolated("env", &["WAYLAND_DEBUG=1", "fcitx5", "--disable", "notificationitem"])
+        .unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mac-ime-editor.py");
+    let dir = s.dir.to_string_lossy().into_owned();
+    let fixture = fixture.to_string_lossy().into_owned();
+    for (role, text) in [("source", CONTENT), ("destination", "")] {
+        s.launch_isolated("env", &["WAYLAND_DEBUG=1", "GTK_IM_MODULE=wayland", "python3", &fixture, role, &dir, text])
+            .unwrap();
+        s.wait_for_window(&format!("IME Probe {role}")).unwrap();
+    }
+    let source = s.world().unwrap().window_matching("IME Probe source").unwrap().clone();
+    s.door().click(source.x as f64 + 60.0, source.y as f64 + 100.0).unwrap();
+    let read = |role: &str| -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(PathBuf::from(&dir).join(format!("{role}.json"))).ok()?).ok()
+    };
+    // A passing direct-keyboard path would miss the bug: require the real
+    // input method to acquire its Wayland keyboard grab before sending keys.
+    poll_until(WAIT, "Fcitx input-method keyboard grab", || {
+        std::fs::read_dir(&dir).ok()?.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_string_lossy().starts_with("client-")
+                && std::fs::read_to_string(entry.path()).unwrap_or_default().contains(".grab_keyboard(")
+        }).then_some(())
+    }).unwrap();
+    ime_chord(&mut s, &[CMD], 30);
+    poll_until(WAIT, "Command-A selection through Fcitx", || {
+        (read("source")?["selected"] == true).then_some(())
+    }).unwrap();
+    let observed = read("source").unwrap();
+    let a = observed["events"].as_array().unwrap().iter().rev().find(|e| e["key"] == "a").unwrap();
+    assert_eq!(a["modifiers"].as_u64().unwrap() & ((1 << 26) | 4), 4,
+        "GTK must see Control-A, without Super, through the IME");
+    ime_chord(&mut s, &[CMD], 46);
+    ime_chord(&mut s, &[CMD], 15);
+    ime_chord(&mut s, &[CMD], 47);
+    poll_until(WAIT, "cross-app paste through Fcitx", || {
+        (read("destination")?["text"] == CONTENT).then_some(())
+    }).unwrap();
+    ime_chord(&mut s, &[CMD], 15);
+    ime_chord(&mut s, &[CMD], 16);
+    poll_until(WAIT, "source closed gracefully", || {
+        s.world().ok()?.window_matching("IME Probe source").is_none().then_some(())
+    }).unwrap();
+    ime_chord(&mut s, &[CTRL], 30); // Physical Control remains ordinary client input.
+    ime_chord(&mut s, &[], 14);
+    poll_until(WAIT, "destination cleared", || (read("destination")?["text"] == "").then_some(())).unwrap();
+    ime_chord(&mut s, &[CMD], 47);
+    poll_until(WAIT, "clipboard survives source quit with IME active", || {
+        (read("destination")?["text"] == CONTENT).then_some(())
+    }).unwrap();
+    // A translated chord followed by an untranslated one while Command is
+    // still held must restore Super before the second key reaches the IME.
+    s.door().key(CMD, true).unwrap();
+    s.door().tap_key(30).unwrap();
+    s.door().tap_key(53).unwrap(); // Command-/ has no GUI translation.
+    s.door().key(CMD, false).unwrap();
+    s.door().barrier().unwrap();
+    poll_until(WAIT, "untranslated chord restores physical modifiers", || {
+        let observed = read("destination")?;
+        let event = observed["events"].as_array()?.iter().rev().find(|e| e["key"] == "slash")?;
+        (event["modifiers"].as_u64()? & ((1 << 26) | 4) == 1 << 26).then_some(())
+    }).unwrap();
+    // Release Command before A, then type normally: no synthetic Control or
+    // Super may stick, and physical Shift must retain its ordinary behavior.
+    ime_chord(&mut s, &[CMD], 30);
+    s.door().key(CMD, true).unwrap();
+    s.door().key(30, true).unwrap();
+    s.door().key(CMD, false).unwrap();
+    s.door().key(30, false).unwrap();
+    ime_chord(&mut s, &[], 48);
+    ime_chord(&mut s, &[SHIFT], 48);
+    poll_until(WAIT, "normal typing after translated releases", || {
+        (read("destination")?["text"] == "bB").then_some(())
+    }).unwrap();
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn native_and_xwayland_copy_cut_paste_undo_and_releases() {
+    let mut s = boot("mac-clipboard");
+    let mut native = browser(&mut s, "wayland", "native");
+    focus(&mut s, &mut native, "source");
+    chord(&mut s, &[CMD], 30); // A
+    chord(&mut s, &[CMD], 46); // C
+    focus(&mut s, &mut native, "target");
+    chord(&mut s, &[CMD], 47); // V
+    expect(&mut native, "target", CONTENT);
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 45); // X
+    expect(&mut native, "target", "");
+    chord(&mut s, &[CMD], 44); // Z
+    expect(&mut native, "target", CONTENT);
+    chord(&mut s, &[CMD, SHIFT], 44);
+    expect(&mut native, "target", "");
+    let mut x11 = browser(&mut s, "x11", "x11");
+    focus(&mut s, &mut x11, "target");
+    chord(&mut s, &[CMD], 47);
+    expect(&mut x11, "target", CONTENT);
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 46);
+    focus(&mut s, &mut native, "target");
+    chord(&mut s, &[CMD], 47);
+    expect(&mut native, "target", CONTENT);
+    // Command released before the character: no synthetic Control remains.
+    s.door().key(CMD, true).unwrap();
+    s.door().key(30, true).unwrap();
+    s.door().key(CMD, false).unwrap();
+    s.door().key(30, false).unwrap();
+    s.door().tap_key(48).unwrap(); // b replaces selection
+    s.door().barrier().unwrap();
+    expect(&mut native, "target", "b");
+    // An invalid mode on reload cannot silently replace Mac with the
+    // legacy profile: the key is refused and the running mode is kept,
+    // which the refusal names.
+    std::fs::write(
+        s.dir.join("config/chonkstep/config.toml"),
+        "interaction_mode = 'invalid'",
+    )
+    .unwrap();
+    s.request_reload().unwrap();
+    poll_until(WAIT, "refused interaction_mode", || {
+        (s.log().contains("interaction_mode must be") && s.log().contains("keeping mac")).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 47);
+    expect(&mut native, "target", CONTENT);
+    // Physical Control still behaves normally, too.
+    chord(&mut s, &[CTRL], 30);
+    s.door().tap_key(46).unwrap();
+    s.door().barrier().unwrap();
+    expect(&mut native, "target", "c");
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn terminal_clipboard_control_and_copy_quit_paste() {
+    let mut s = boot("mac-terminal");
+    let mut b = browser(&mut s, "wayland", "native");
+    focus(&mut s, &mut b, "source");
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 46);
+    // Quit the actual source through the desktop shortcut, then paste into a
+    // terminal. No test process becomes clipboard owner on its behalf.
+    chord(&mut s, &[CMD], 16);
+    s.wait_for_window_gone("Mac Probe native").unwrap();
+    let output = s.dir.join("pty-bytes");
+    let script = s.dir.join("terminal.py");
+    std::fs::write(&script, "import os,sys,tty\ntty.setraw(0)\nf=open(sys.argv[1],'wb',buffering=0)\nos.write(1,b'TERMINAL_COPY\\r\\n')\nwhile True:\n b=os.read(0,4096)\n if not b: break\n f.write(b)\n").unwrap();
+    assert!(chonk_testkit::require_client("foot"));
+    s.launch_isolated(
+        "foot",
+        &[
+            "--title=Mac Terminal",
+            "--app-id=foot",
+            "--window-size-chars=60x12",
+            "python3",
+            script.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let terminal = s.wait_for_window("Mac Terminal").unwrap();
+    poll_until(WAIT, "terminal raw input ready", || output.exists().then_some(())).unwrap();
+    s.door()
+        .click(terminal.x as f64 + 30.0, terminal.y as f64 + 100.0)
+        .unwrap();
+    chord(&mut s, &[CMD], 47);
+    poll_until(WAIT, "paste after source quit", || {
+        (std::fs::read(&output).ok()? == CONTENT.replace('\n', "\r").as_bytes()).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CTRL], 46);
+    poll_until(WAIT, "physical Control-C reaches PTY", || {
+        std::fs::read(&output).ok()?.ends_with(&[3]).then_some(())
+    })
+    .unwrap();
+    let before = std::fs::read(&output).unwrap();
+    // Triple-click selects the printed line. PRIMARY selection alone is not
+    // the clipboard; Command-C must publish the terminal selection.
+    s.door()
+        .click(terminal.x as f64 + 30.0, terminal.y as f64 + 10.0)
+        .unwrap();
+    s.door()
+        .click(terminal.x as f64 + 30.0, terminal.y as f64 + 10.0)
+        .unwrap();
+    s.door()
+        .click(terminal.x as f64 + 30.0, terminal.y as f64 + 10.0)
+        .unwrap();
+    chord(&mut s, &[CMD], 46);
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        before,
+        "Command-C must not write an interrupt or any PTY input"
+    );
+    let mut destination = browser(&mut s, "wayland", "destination");
+    focus(&mut s, &mut destination, "target");
+    chord(&mut s, &[CMD], 47);
+    expect(&mut destination, "target", "TERMINAL_COPY\n");
+    chord(&mut s, &[CMD], 15);
+    chord(&mut s, &[CMD], 17); // close the single-window terminal
+    s.wait_for_window_gone("Mac Terminal").unwrap();
+    assert!(s.world().unwrap().window_matching("Mac Probe destination").is_some());
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn application_hide_desktop_switching_and_fullscreen_spaces() {
+    let mut s = boot("mac-desktop");
+    s.launch_isolated("foot", &["--title=Mac First", "--app-id=first", "sleep", "120"])
+        .unwrap();
+    let first = s.wait_for_window("Mac First").unwrap();
+    s.launch_isolated("foot", &["--title=Mac Second", "--app-id=second", "sleep", "120"])
+        .unwrap();
+    let second = s.wait_for_window("Mac Second").unwrap();
+    chord(&mut s, &[CMD], 15);
+    poll_until(WAIT, "Command-Tab switches applications", || {
+        (s.world().ok()?.logical_focus == Some(first.id)).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CMD], 35); // H
+    poll_until(WAIT, "hide reveals other app", || {
+        let w = s.world().ok()?;
+        (!w.frame_of(first.id)?.mapped && w.logical_focus == Some(second.id)).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CMD], 15);
+    poll_until(WAIT, "switch unhides app", || {
+        let w = s.world().ok()?;
+        (w.frame_of(first.id)?.mapped && w.logical_focus == Some(first.id)).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[], 87); // F11 show desktop
+    assert!(!s.world().unwrap().frame_of(first.id).unwrap().mapped);
+    chord(&mut s, &[], 87);
+    assert!(s.world().unwrap().frame_of(first.id).unwrap().mapped);
+    chord(&mut s, &[CMD, CTRL], 33); // F
+    poll_until(WAIT, "dedicated fullscreen Space", || {
+        let w = s.world().ok()?;
+        (w.workspace_count == 2 && w.current_workspace == 1).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CTRL], 105);
+    assert_eq!(s.world().unwrap().current_workspace, 0);
+    chord(&mut s, &[CTRL], 106);
+    assert_eq!(s.world().unwrap().current_workspace, 1);
+    chord(&mut s, &[CTRL], 106);
+    assert_eq!(
+        s.world().unwrap().workspace_count,
+        2,
+        "edge navigation cannot create desktops"
+    );
+    chord(&mut s, &[CMD, CTRL], 33);
+    poll_until(WAIT, "fullscreen Space removed on exit", || {
+        let w = s.world().ok()?;
+        (w.workspace_count == 1 && w.current_workspace == 0).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CTRL], 103); // Mission Control
+    poll_until(WAIT, "Mission Control", || s.world().ok()?.overview.map(|_| ())).unwrap();
+    chord(&mut s, &[], 1); // Escape
+    poll_until(WAIT, "Mission Control return animation finishes", || {
+        s.world().ok()?.overview.is_none().then_some(())
+    }).unwrap();
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn force_quit_requires_application_selection_and_confirmation() {
+    let mut s = boot("mac-force-quit");
+    s.launch_isolated("foot", &["--title=Force Quit Target", "--app-id=foot", "sleep", "120"])
+        .unwrap();
+    let target = s.wait_for_window("Force Quit Target").unwrap();
+    chord(&mut s, &[CMD, 56], 1);
+    poll_until(WAIT, "Force Quit chooser", || {
+        (!s.world().ok()?.menus().is_empty()).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[], 1);
+    assert!(
+        s.world().unwrap().windows.iter().any(|w| w.id == target.id),
+        "Escape must not close an application"
+    );
+    chord(&mut s, &[CMD, 56], 1);
+    chord(&mut s, &[], 108); // select application after Cancel
+    chord(&mut s, &[], 106); // open confirmation
+    poll_until(WAIT, "Force Quit confirmation", || {
+        (s.world().ok()?.menus().len() == 2).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[], 28); // default Cancel
+    assert!(
+        s.world().unwrap().windows.iter().any(|w| w.id == target.id),
+        "confirmation defaults to Cancel"
+    );
+    chord(&mut s, &[CMD, 56], 1);
+    chord(&mut s, &[], 108);
+    chord(&mut s, &[], 106);
+    chord(&mut s, &[], 108);
+    chord(&mut s, &[], 28); // explicit Force Quit
+    s.wait_for_window_gone("Force Quit Target").unwrap();
+    // The same chooser must really disconnect X11 clients too, including those
+    // advertising WM_DELETE_WINDOW; polite close is not a force-quit fallback.
+    let _b = browser(&mut s, "x11", "force-quit");
+    chord(&mut s, &[CMD, 56], 1);
+    chord(&mut s, &[], 108);
+    chord(&mut s, &[], 106);
+    chord(&mut s, &[], 108);
+    chord(&mut s, &[], 28);
+    s.wait_for_window_gone("Mac Probe force-quit").unwrap();
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn screenshot_file_and_clipboard_destinations_are_independent() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    let root = chonk_testkit::session_dir("mac-capture");
+    let exports = root.join("exports");
+    let fixture_bin = root.join("config/chonkstep/bin");
+    let mut paths = vec![fixture_bin.clone()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let review_wrapper = "#!/bin/sh\npublished=missing\nif [ \"$#\" -eq 1 ] && [ -s \"$1\" ]; then published=published; fi\nprintf '%s\\0' \"${0##*/}\" \"$1\" \"$published\" >> \"$MAC_REVIEW_LOG\"\n";
+    let mut s = Session::boot(
+        "mac-capture",
+        SessionOptions {
+            config_extra: "interaction_mode = 'mac'\nhyprland_config = false\nshow_dock = false\n".into(),
+            config_files: vec![
+                ("bin/imv".into(), review_wrapper.into()),
+                ("bin/notify-send".into(), "#!/bin/sh\nexit 0\n".into()),
+                ("bin/omacut".into(), review_wrapper.into()),
+            ],
+            env: vec![
+                ("OMARCHY_SCREENSHOT_DIR".into(), exports.display().to_string()),
+                ("OMARCHY_SCREENRECORD_DIR".into(), exports.display().to_string()),
+                (
+                    "PATH".into(),
+                    std::env::join_paths(paths).unwrap().into_string().unwrap(),
+                ),
+                (
+                    "MAC_REVIEW_LOG".into(),
+                    root.join("review-launched").display().to_string(),
+                ),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for name in ["imv", "notify-send", "omacut"] {
+        std::fs::set_permissions(fixture_bin.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut b = browser(&mut s, "wayland", "capture");
+    focus(&mut s, &mut b, "source");
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 46);
+    let files = || {
+        std::fs::read_dir(&exports)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|s| s == "png") && !p.file_name().unwrap().to_string_lossy().starts_with('.')
+            })
+            .collect::<Vec<_>>()
+    };
+    chord(&mut s, &[CMD, SHIFT], 4);
+    let path = poll_until(WAIT, "Command-Shift-3 saves PNG", || files().into_iter().next()).unwrap();
+    let screenshot = chonk_testkit::Screenshot::load(&path).unwrap();
+    assert_eq!((screenshot.width, screenshot.height), (1280, 800));
+    let reviews = || std::fs::read(root.join("review-launched")).unwrap_or_default();
+    let mut expected_reviews = format!("imv\0{}\0published\0", path.display()).into_bytes();
+    poll_until(WAIT, "saved Mac screenshot opens in imv after publication", || {
+        (reviews() == expected_reviews).then_some(())
+    }).unwrap();
+    focus(&mut s, &mut b, "target");
+    chord(&mut s, &[CMD], 47);
+    expect(&mut b, "target", CONTENT);
+    chord(&mut s, &[CMD, CTRL, SHIFT], 4);
+    let png = root.join("clipboard.png");
+    // Retry only until the image MIME appears; never replace the clipboard.
+    poll_until(WAIT, "clipboard PNG", || {
+        let mut child = Command::new("wl-paste")
+            .args(["--type", "image/png", "--no-newline"])
+            .env("WAYLAND_DISPLAY", &s.wayland_display)
+            .stdout(Stdio::from(std::fs::File::create(&png).unwrap()))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = poll_until(Duration::from_secs(2), "clipboard reader exits", || {
+            child.try_wait().ok().flatten()
+        });
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = poll_until(Duration::from_secs(2), "clipboard reader reaped", || {
+                child.try_wait().ok().flatten()
+            });
+            return None;
+        }
+        result.unwrap().success().then_some(())
+    })
+    .unwrap();
+    chonk_testkit::Screenshot::load(&png).unwrap();
+    assert_eq!(files().len(), 1, "clipboard capture must not save a user file");
+    assert_eq!(reviews(), expected_reviews, "clipboard-only capture must not open another viewer");
+    chord(&mut s, &[CMD, SHIFT], 5);
+    chord(&mut s, &[], 1);
+    assert_eq!(files().len(), 1, "Escape cancels the selection");
+    assert!(chonk_testkit::require_client("wf-recorder"));
+    assert!(chonk_testkit::require_client("ffprobe"));
+    chord(&mut s, &[CMD, SHIFT], 6); // Command-Shift-5 toolbar
+    chord(&mut s, &[], 6); // record area
+    s.door().drag_to((700.0, 300.0), (1000.0, 500.0)).unwrap();
+    s.door().button("left", false).unwrap();
+    chord(&mut s, &[], 28);
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < end {
+        s.door().motion(1100.0, 700.0).unwrap();
+        s.door().barrier().unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    chord(&mut s, &[CMD, CTRL], 1);
+    let recording = poll_until(WAIT, "Mac recording saved", || {
+        std::fs::read_dir(&exports).ok()?.flatten().map(|e| e.path()).find(|p| {
+            p.extension().is_some_and(|s| s == "mp4") && !p.file_name().unwrap().to_string_lossy().starts_with('.')
+        })
+    })
+    .unwrap();
+    let probe = root.join("recording-probe.json");
+    let mut child = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(&recording)
+        .stdout(Stdio::from(std::fs::File::create(&probe).unwrap()))
+        .spawn()
+        .unwrap();
+    assert!(
+        poll_until(WAIT, "recording decodes", || child.try_wait().ok().flatten())
+            .unwrap()
+            .success()
+    );
+    let info: Value = serde_json::from_slice(&std::fs::read(probe).unwrap()).unwrap();
+    assert_eq!(info["streams"][0]["width"], 300);
+    assert_eq!(info["streams"][0]["height"], 200);
+    assert!(info["format"]["duration"].as_str().unwrap().parse::<f64>().unwrap() > 1.0);
+    expected_reviews.extend_from_slice(format!("omacut\0{}\0published\0", recording.display()).as_bytes());
+    poll_until(WAIT, "saved Mac recording opens in omacut after publication", || {
+        (reviews() == expected_reviews).then_some(())
+    }).unwrap();
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn navigation_release_focus_resume_and_passthrough() {
+    let mut s = boot("mac-input-lifecycle");
+    let mut native = browser(&mut s, "wayland", "native");
+    focus(&mut s, &mut native, "nav");
+    chord(&mut s, &[CMD], 108); // document end
+    chord(&mut s, &[56], 105); // previous word
+    chord(&mut s, &[CMD, SHIFT], 106); // select to line end
+    s.door().tap_key(45).unwrap();
+    s.door().barrier().unwrap();
+    expect(&mut native, "nav", "one two x");
+    // Resume balances the remapped Home rather than sending a stray Left up.
+    native.evaluate("events.length=0;true").unwrap();
+    s.door().key(CMD, true).unwrap();
+    s.door().key(105, true).unwrap();
+    s.door().barrier().unwrap();
+    s.door().reset_input(true).unwrap();
+    s.door().barrier().unwrap();
+    poll_until(WAIT, "balanced Home after resume", || {
+        (native
+            .evaluate("events.filter(e=>e.key==='Home' && e.type==='keyup').length")
+            .ok()?
+            == 1)
+            .then_some(())
+    })
+    .unwrap();
+    assert_eq!(
+        native
+            .evaluate("events.filter(e=>e.key==='ArrowLeft' && e.type==='keyup').length")
+            .unwrap(),
+        0
+    );
+    s.door().tap_key(48).unwrap();
+    s.door().barrier().unwrap();
+    expect(&mut native, "nav", "bone two x");
+    // A held translated navigation press cannot cross focus through enter or release.
+    let mut x11 = browser(&mut s, "x11", "x11");
+    focus(&mut s, &mut native, "nav");
+    s.door().key(CMD, true).unwrap();
+    s.door().key(105, true).unwrap();
+    s.door().barrier().unwrap();
+    x11.evaluate("events.length=0;true").unwrap();
+    focus(&mut s, &mut x11, "target");
+    s.door().key(105, false).unwrap();
+    s.door().key(CMD, false).unwrap();
+    s.door().barrier().unwrap();
+    assert_eq!(x11.evaluate("events.filter(e=>e.key==='Home').length").unwrap(), 0);
+    // A remote/game passthrough profile owns both Command input and desktop shortcuts.
+    let app = s.world().unwrap().window_matching("Mac Probe x11").unwrap().app.clone();
+    s.rewrite_config(&format!("interaction_mode='mac'\nhyprland_config=false\nshow_dock=false\nomarchy_shell=false\n[mac.applications]\n{}='passthrough'\n",serde_json::to_string(&app).unwrap())).unwrap();
+    s.request_reload().unwrap();
+    poll_until(WAIT, "profile reload", || {
+        s.log().contains("reload requested").then_some(())
+    })
+    .unwrap();
+    s.door().barrier().unwrap();
+    x11.evaluate("events.length=0;true").unwrap();
+    chord(&mut s, &[CMD], 35);
+    poll_until(WAIT, "raw Command-H", || {
+        (x11.evaluate("events.some(e=>e.key==='h' && e.type==='keydown' && e.meta && !e.ctrl)")
+            .ok()?
+            == true)
+            .then_some(())
+    })
+    .unwrap();
+    assert!(s
+        .world()
+        .unwrap()
+        .frame_of(s.world().unwrap().window_matching("Mac Probe x11").unwrap().id)
+        .is_some());
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn overlapping_navigation_both_commands_caps_lock_and_mode_rollback() {
+    let mut s = boot("mac-key-balance");
+    let mut b = browser(&mut s, "wayland", "balance");
+    focus(&mut s, &mut b, "source");
+    s.door().tap_key(58).unwrap(); // Caps Lock must not change shortcut matching.
+    s.door().key(CMD, true).unwrap();
+    s.door().key(126, true).unwrap();
+    s.door().tap_key(30).unwrap();
+    s.door().key(CMD, false).unwrap();
+    s.door().tap_key(46).unwrap();
+    s.door().key(126, false).unwrap();
+    s.door().tap_key(58).unwrap();
+    focus(&mut s, &mut b, "target");
+    chord(&mut s, &[CMD], 47);
+    expect(&mut b, "target", CONTENT);
+    b.evaluate("events.length=0;true").unwrap();
+    s.door().key(CMD, true).unwrap();
+    s.door().key(105, true).unwrap(); // translated Home
+    s.door().key(102, true).unwrap();
+    s.door().key(102, false).unwrap(); // overlapping physical Home
+    s.door().key(105, false).unwrap();
+    s.door().key(CMD, false).unwrap();
+    s.door().barrier().unwrap();
+    poll_until(WAIT, "overlapping Home is balanced", || {
+        (b.evaluate("events.filter(e=>e.key==='Home' && e.type==='keyup').length")
+            .ok()?
+            == 1)
+            .then_some(())
+    })
+    .unwrap();
+    assert_eq!(
+        b.evaluate("events.filter(e=>e.key==='Home' && e.type==='keydown').length")
+            .unwrap(),
+        1
+    );
+    b.evaluate("events.length=0;true").unwrap();
+    s.door().key(CMD, true).unwrap();
+    s.door().key(105, true).unwrap();
+    s.door().barrier().unwrap();
+    let reloads = s.log().matches("reload requested").count();
+    s.rewrite_config("interaction_mode='desktop'\nhyprland_config=false\nshow_dock=false\nomarchy_shell=false\n")
+        .unwrap();
+    s.request_reload().unwrap();
+    poll_until(WAIT, "rollback applied", || {
+        (s.log().matches("reload requested").count() > reloads).then_some(())
+    })
+    .unwrap();
+    s.door().barrier().unwrap();
+    s.door().key(105, false).unwrap();
+    s.door().key(CMD, false).unwrap();
+    s.door().barrier().unwrap();
+    poll_until(WAIT, "translated release survives mode rollback", || {
+        (b.evaluate("events.filter(e=>e.key==='Home' && e.type==='keyup').length")
+            .ok()?
+            == 1)
+            .then_some(())
+    })
+    .unwrap();
+    assert_eq!(
+        b.evaluate("events.filter(e=>e.key==='ArrowLeft' && e.type==='keyup').length")
+            .unwrap(),
+        0
+    );
+    chord(&mut s, &[CTRL], 30);
+    s.door().tap_key(30).unwrap();
+    s.door().barrier().unwrap();
+    expect(&mut b, "target", "a");
+    // Exercise both directions repeatedly without replacing the application,
+    // keymap or compositor. Observe the actual browser-delivered modifiers.
+    for enabled in [true, false, true, false, true, false, true, false] {
+        let reloads = s.log().matches("reload requested").count();
+        s.rewrite_config(&format!("interaction_mode='{}'\nhyprland_config=false\nshow_dock=false\nomarchy_shell=false\n",
+            if enabled { "mac" } else { "desktop" })).unwrap();
+        s.request_reload().unwrap();
+        poll_until(WAIT, "repeated interaction mode toggle", || {
+            (s.log().matches("reload requested").count() > reloads).then_some(())
+        }).unwrap();
+        b.evaluate("events.length=0;true").unwrap();
+        chord(&mut s, &[CMD], 30);
+        let predicate = if enabled {
+            "events.some(e=>e.key==='a' && e.type==='keydown' && e.ctrl && !e.meta)"
+        } else {
+            "events.some(e=>e.key==='a' && e.type==='keydown' && e.meta && !e.ctrl)"
+        };
+        poll_until(WAIT, "client observes toggled Command behavior", || {
+            (b.evaluate(predicate).ok()? == true).then_some(())
+        }).unwrap();
+        b.evaluate("events.length=0;true").unwrap();
+        s.door().tap_key(48).unwrap();
+        poll_until(WAIT, "modifiers clear after toggled shortcut", || {
+            (b.evaluate("events.some(e=>e.key==='b' && e.type==='keydown' && !e.ctrl && !e.meta && !e.alt)").ok()? == true).then_some(())
+        }).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn german_and_french_layouts_use_their_own_letters_and_shifted_digits() {
+    use std::os::unix::fs::PermissionsExt;
+    for (layout, z) in [("de", 21), ("fr", 17)] {
+        let name = format!("mac-layout-{layout}");
+        let exports = chonk_testkit::session_dir(&name).join("exports");
+        let fixture_bin = chonk_testkit::session_dir(&name).join("config/chonkstep/bin");
+        let mut paths = vec![fixture_bin.clone()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let mut s = Session::boot(
+            &name,
+            SessionOptions {
+                config_extra: "interaction_mode='mac'\nhyprland_config=false\nshow_dock=false\n".into(),
+                config_files: vec![("bin/imv".into(), "#!/bin/sh\nexit 0\n".into())],
+                env: vec![
+                    ("XKB_DEFAULT_LAYOUT".into(), layout.into()),
+                    ("OMARCHY_SCREENSHOT_DIR".into(), exports.display().to_string()),
+                    ("PATH".into(), std::env::join_paths(paths).unwrap().into_string().unwrap()),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        std::fs::set_permissions(fixture_bin.join("imv"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut b = browser(&mut s, "wayland", layout);
+        focus(&mut s, &mut b, "source");
+        let a = if layout == "fr" { 16 } else { 30 };
+        chord(&mut s, &[CMD], a);
+        chord(&mut s, &[CMD], 46);
+        focus(&mut s, &mut b, "target");
+        chord(&mut s, &[CMD], 47);
+        expect(&mut b, "target", CONTENT);
+        chord(&mut s, &[CMD], z);
+        expect(&mut b, "target", "");
+        chord(&mut s, &[CMD, SHIFT], z);
+        expect(&mut b, "target", CONTENT);
+        // French has a double quote on this key's unshifted level.
+        chord(&mut s, &[CMD, SHIFT], 4);
+        poll_until(WAIT, "layout-aware screenshot", || {
+            let path = std::fs::read_dir(&exports)
+                .ok()?
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    p.extension().is_some_and(|s| s == "png")
+                        && !p.file_name().unwrap().to_string_lossy().starts_with('.')
+                })?;
+            chonk_testkit::Screenshot::load(&path).ok()
+        })
+        .unwrap();
+    }
+}
+
+fn type_ascii(s: &mut Session, text: &str) {
+    let letters = "qwertyuiopasdfghjklzxcvbnm";
+    let codes = [
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 44, 45, 46, 47, 48, 49, 50,
+    ];
+    for c in text.chars() {
+        let (code, shift) = if let Some(index) = letters.find(c) {
+            (codes[index], false)
+        } else if c.is_ascii_digit() {
+            (if c == '0' { 11 } else { c as u32 - '0' as u32 + 1 }, false)
+        } else {
+            match c {
+                '/' => (53, false),
+                '-' => (12, false),
+                '_' => (12, true),
+                '.' => (52, false),
+                ' ' => (57, false),
+                _ => panic!("unsupported fixture character {c}"),
+            }
+        };
+        if shift {
+            s.door().key(SHIFT, true).unwrap();
+        }
+        s.door().tap_key(code).unwrap();
+        if shift {
+            s.door().key(SHIFT, false).unwrap();
+        }
+    }
+    s.door().barrier().unwrap();
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn nautilus_copies_files_using_command_shortcuts() {
+    if !chonk_testkit::require_client("nautilus") {
+        return;
+    }
+    let mut s = boot("mac-files");
+    let source = s.dir.join("source");
+    let destination = s.dir.join("destination");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let bytes = "file clipboard: café 日本語 🍎\n";
+    std::fs::write(source.join("clipboard.txt"), bytes).unwrap();
+    s.launch_isolated(
+        "env",
+        &[
+            "GSETTINGS_BACKEND=memory",
+            "XDG_SESSION_TYPE=wayland",
+            "GTK_A11Y=none",
+            "GTK_THEME=Adwaita:dark",
+            "nautilus",
+            "--new-window",
+            source.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let window = s.wait_for_window("source").unwrap();
+    // Mapping the GTK window precedes its asynchronous directory listing. Wait
+    // for the only fixture file to be painted in the content area's first row;
+    // sending Select All while that row is empty cannot select a future file.
+    poll_until(WAIT, "Nautilus source file painted", || {
+        let shot = s.screenshot("source-loaded").ok()?;
+        let pixels: Vec<_> = (60..240).flat_map(|y| (220..window.w.saturating_sub(30)).map(move |x| (x, y)))
+            .map(|(x, y)| shot.pixel(window.x.max(0) as u32 + x, window.y.max(0) as u32 + y))
+            .collect();
+        let light = pixels.iter().filter(|p| p[..3].iter().all(|c| *c > 110)).count();
+        let dark = pixels.iter().filter(|p| p[..3].iter().all(|c| *c < 90)).count();
+        // A flat loading surface is not a file icon. Require contrasting
+        // icon/text pixels in either appearance: libadwaita can ignore
+        // GTK_THEME and follow the desktop's light preference instead.
+        (light > 100 && dark > 100).then_some(())
+    }).unwrap();
+    s.door()
+        .click(
+            window.x as f64 + window.w as f64 * 0.7,
+            window.y as f64 + window.h as f64 * 0.65,
+        )
+        .unwrap();
+    chord(&mut s, &[CMD], 30);
+    poll_until(WAIT, "Nautilus selection painted", || {
+        let shot = s.screenshot("source-selected").ok()?;
+        let selected = (60..300).flat_map(|y| (220..window.w.saturating_sub(30)).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = shot.pixel(window.x.max(0) as u32 + x, window.y.max(0) as u32 + y);
+                p[2] > 100 && u16::from(p[2]) > u16::from(p[0]) + 60
+            }).count();
+        (selected > 1000).then_some(())
+    }).unwrap();
+    chord(&mut s, &[CMD], 46);
+    poll_until(WAIT, "Command-C publishes the actual selected file URI", || {
+        let files = clipboard_output(&s, &["--type", "text/uri-list", "--no-newline"])?;
+        String::from_utf8(files).ok()?.contains("/source/clipboard.txt").then_some(())
+    }).unwrap();
+    chord(&mut s, &[CMD], 38); // location
+    type_ascii(&mut s, destination.to_str().unwrap());
+    chord(&mut s, &[], 28);
+    s.wait_for_window("destination").unwrap();
+    // The title changes before the destination view enables Paste. Observe
+    // its central empty-folder message, rather than sending input to a
+    // still-loading view. Adwaita:dark is fixed for both supported app versions.
+    poll_until(WAIT, "Nautilus destination view ready", || {
+        let shot = s.screenshot("destination-loaded").ok()?;
+        let ink = (200..400).flat_map(|y| (400..800).map(move |x| (x, y)))
+            .filter(|&(x,y)| shot.pixel(window.x.max(0) as u32+x,
+                window.y.max(0) as u32+y)[..3].iter().all(|c| *c > 150)).count();
+        (ink > 300).then_some(())
+    }).unwrap();
+    chord(&mut s, &[CMD], 47);
+    poll_until(WAIT, "Nautilus native file copy", || {
+        (std::fs::read_to_string(destination.join("clipboard.txt")).ok()? == bytes).then_some(())
+    })
+    .unwrap_or_else(|e| {
+        let _ = s.screenshot("files-failure");
+        panic!("{e}: {:?}", s.world().unwrap());
+    });
+    assert_eq!(std::fs::read_to_string(source.join("clipboard.txt")).unwrap(), bytes);
+    chord(&mut s, &[CMD], 16);
+    s.wait_for_window_gone("destination").unwrap();
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --test mac_mode"]
+fn libreoffice_and_browser_exchange_document_text() {
+    if !chonk_testkit::require_client("libreoffice") {
+        return;
+    }
+    let mut s = boot("mac-office");
+    let document = s.dir.join("mac-office.fodt");
+    let text = "Office → Browser: café 日本語 🍎";
+    std::fs::write(&document,format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text"><office:body><office:text><text:p>{text}</text:p></office:text></office:body></office:document>"#)).unwrap();
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        s.dir.join("office-profile").display()
+    );
+    s.launch_isolated(
+        "env",
+        &[
+            "GSETTINGS_BACKEND=memory",
+            "XDG_SESSION_TYPE=wayland",
+            "NO_AT_BRIDGE=1",
+            "SAL_USE_VCLPLUGIN=gtk3",
+            "libreoffice",
+            &profile,
+            "--writer",
+            "--norestore",
+            "--nologo",
+            "--nofirststartwizard",
+            document.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let window = poll_until(Duration::from_secs(60), "Writer document window", || {
+        s.world()
+            .ok()?
+            .window_matching("mac-office.fodt")
+            .filter(|w| w.mapped)
+            .cloned()
+    })
+    .unwrap_or_else(|e| panic!("{e}: {}", s.client_log("env")));
+    poll_until(Duration::from_secs(45), "Writer document painted", || {
+        let shot = s.screenshot("writer-paint").ok()?;
+        let mean = shot.mean_rgb(500, 300, 150, 150);
+        let ink = (230..290).flat_map(|y| (300..750).map(move |x| (x, y)))
+            .filter(|&(x,y)| shot.pixel(x,y)[..3].iter().all(|c| *c < 100)).count();
+        // Writer first maps a completely blank white surface. Require the
+        // fixture paragraph as well as paper before selecting and copying it.
+        (mean.iter().all(|channel| *channel > 180.0) && ink > 100).then_some(())
+    })
+    .unwrap();
+    s.door()
+        .click(window.x as f64 + window.w as f64 / 2.0, window.y as f64 + 250.0)
+        .unwrap();
+    s.screenshot("writer-ready").unwrap();
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 46);
+    // Copying is asynchronous as well: Writer publishes its selection after
+    // the chord, and a paste that beats it pastes the previous clipboard.
+    poll_until(WAIT, "Command-C publishes Writer's text", || {
+        let copied = clipboard_output(&s, &["--type", "text/plain;charset=utf-8", "--no-newline"])?;
+        (String::from_utf8(copied).ok()?.trim_end_matches('\n') == text).then_some(())
+    })
+    .unwrap();
+    let mut b = browser(&mut s, "wayland", "office");
+    focus(&mut s, &mut b, "target");
+    chord(&mut s, &[CMD], 47);
+    poll_until(WAIT, "Writer text pasted into browser", || {
+        let value = b.evaluate("document.getElementById('target').value").ok()?;
+        (value.as_str()?.trim_end_matches('\n') == text).then_some(())
+    })
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}: pasted {}, events {}",
+            b.evaluate("document.getElementById('target').value").unwrap(),
+            b.evaluate("events").unwrap()
+        )
+    });
+    focus(&mut s, &mut b, "source");
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 46);
+    // The switch and paste follow at once; without this wait Writer can
+    // paste its own earlier copy back.
+    poll_until(WAIT, "Command-C publishes the browser's text", || {
+        let copied = clipboard_output(&s, &["--type", "text/plain;charset=utf-8", "--no-newline"])?;
+        String::from_utf8(copied).ok()?.contains("second line").then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CMD], 15); // return to Writer
+    chord(&mut s, &[CMD], 30);
+    chord(&mut s, &[CMD], 47);
+    // Clipboard transfer is asynchronous. Wait for the new second line to be
+    // painted before Save; a compositor barrier does not drain Writer's queue.
+    poll_until(WAIT, "Writer pasted second line painted", || {
+        let shot = s.screenshot("writer-pasted").ok()?;
+        let ink = (272..288)
+            .flat_map(|y| (280..450).map(move |x| (x, y)))
+            .filter(|&(x, y)| shot.pixel(x, y)[..3].iter().all(|c| *c < 100))
+            .count();
+        (ink > 40).then_some(())
+    })
+    .unwrap();
+    chord(&mut s, &[CMD], 31);
+    poll_until(WAIT, "browser clipboard saved through Writer", || {
+        let xml = std::fs::read_to_string(&document).ok()?;
+        (xml.contains("second line") && xml.contains("日本語") && !xml.contains("Office → Browser")).then_some(())
+    })
+    .unwrap_or_else(|e| {
+        let _ = s.screenshot("writer-save-failure");
+        panic!("{e}: windows {:?}", s.world().unwrap().windows);
+    });
+}
+
+#[test]
+#[ignore = "scripts/e2e.sh --headless --host-renderer gl --test mac_mode"]
+fn delayed_real_copy_followed_by_one_burst_switch_and_paste_keeps_clipboard_order() {
+    // Command-Tab with no frame barrier between Tab's edges. A door tap holds
+    // Tab until its press has rendered; a loaded runner can stretch that past
+    // the 200 ms repeat delay, and the switcher's repeated Tab then cycles
+    // back to the application it started from.
+    fn command_tab(s: &mut Session) {
+        s.door().key(CMD, true).unwrap();
+        s.door().barrier().unwrap();
+        s.door().key(15, true).unwrap();
+        s.door().key(15, false).unwrap();
+        // The switcher must own the keyboard before Command's release commits it.
+        s.door().barrier().unwrap();
+        s.door().key(CMD, false).unwrap();
+        s.door().barrier().unwrap();
+    }
+    let mut s = boot("mac-copy-order");
+    let output = s.dir.join("pty-bytes");
+    let script = s.dir.join("terminal.py");
+    std::fs::write(&script, "import os,sys,tty\ntty.setraw(0)\nf=open(sys.argv[1],'wb',buffering=0)\nwhile True:\n b=os.read(0,4096)\n if not b: break\n f.write(b)\n").unwrap();
+    assert!(chonk_testkit::require_client("foot"));
+    s.launch_isolated("foot", &["--title=Copy Order Terminal", "--app-id=foot", "python3",
+        script.to_str().unwrap(), output.to_str().unwrap()]).unwrap();
+    s.wait_for_window("Copy Order Terminal").unwrap();
+    poll_until(WAIT, "terminal raw input ready", || output.exists().then_some(())).unwrap();
+    let mut source = browser(&mut s, "wayland", "copy-source");
+    focus(&mut s, &mut source, "source");
+    chord(&mut s, &[CMD], 30);
+    poll_until(WAIT, "source text selected", || {
+        (source.evaluate("source.selectionEnd-source.selectionStart === source.value.length").ok()? == true).then_some(())
+    }).unwrap();
+    // Stop actual copy handling until the later input is observably queued.
+    // A 150 ms busy wait raced the compositor's 250 ms deadline on loaded CI.
+    // Freeze only that deadline; no clipboard data or input is synthesized by
+    // DevTools. The browser will still publish its ordinary Wayland offer.
+    source.call("Debugger.enable", serde_json::json!({})).unwrap();
+    source.evaluate("document.addEventListener('keydown', function pauseCopy(e) { if(e.ctrlKey && e.key==='c') { document.removeEventListener('keydown', pauseCopy); debugger; } }); true").unwrap();
+    s.door().copy_order_clock("freeze").unwrap();
+    chord(&mut s, &[CMD], 46);
+    let paused = source.wait_for_pause().unwrap();
+    assert_eq!(paused["callFrames"][0]["functionName"], "pauseCopy");
+    let source_focus = s.world().unwrap().logical_focus;
+    assert!(source_focus.is_some());
+    // No barriers between Tab and Paste. Each WM focus change must settle
+    // before routing the later client key, including queued releases.
+    for (code, pressed) in [(CMD,true),(15,true),(15,false),(CMD,false),(CMD,true),(47,true),(47,false),(CMD,false)] {
+        s.door().key(code, pressed).unwrap();
+    }
+    assert_eq!(s.door().copy_order().unwrap(), (true, 8));
+    assert_eq!(s.world().unwrap().logical_focus, source_focus);
+    assert!(std::fs::read(&output).unwrap().is_empty());
+    s.door().copy_order_clock("advance 249").unwrap();
+    assert_eq!(s.door().copy_order().unwrap(), (true, 8));
+    // The clock stays below the deadline: only the real clipboard offer can
+    // release this queue. A compositor barrier cannot substitute for it.
+    source.call("Debugger.resume", serde_json::json!({})).unwrap();
+    s.door().barrier().unwrap();
+    assert_eq!(s.door().copy_order().unwrap(), (false, 0));
+    let expected = CONTENT.replace('\n', "\r");
+    poll_until(WAIT, "delayed source pasted into the actual terminal", || {
+        (std::fs::read(&output).ok()? == expected.as_bytes()).then_some(())
+    }).unwrap();
+    s.door().tap_key(30).unwrap();
+    poll_until(WAIT, "Command released after replay", || {
+        (std::fs::read(&output).ok()? == format!("{expected}a").as_bytes()).then_some(())
+    }).unwrap();
+    chord(&mut s, &[CTRL], 46);
+    poll_until(WAIT, "physical Control still reaches the PTY", || {
+        std::fs::read(&output).ok()?.ends_with(&[3]).then_some(())
+    }).unwrap();
+    // A copy with no selected text publishes no replacement offer. The bounded
+    // wait must expire and still deliver a later switch and ordinary typing.
+    command_tab(&mut s);
+    focus(&mut s, &mut source, "source");
+    source.evaluate("source.setSelectionRange(0,0);events.length=0;true").unwrap();
+    chord(&mut s, &[CMD], 46);
+    poll_until(WAIT, "browser handled copy with no selected text", || {
+        (source.evaluate("events.some(e=>e.type==='keydown' && e.ctrl && e.key==='c')").ok()? == true).then_some(())
+    }).unwrap();
+    for (code, pressed) in [(CMD,true),(15,true),(15,false),(CMD,false),(30,true),(30,false)] {
+        s.door().key(code, pressed).unwrap();
+    }
+    assert_eq!(s.door().copy_order().unwrap(), (true, 6));
+    s.door().copy_order_clock("advance 249").unwrap();
+    assert_eq!(s.door().copy_order().unwrap(), (true, 6));
+    assert_eq!(s.world().unwrap().logical_focus, source_focus);
+    assert!(std::fs::read(&output).unwrap().ends_with(&[3]));
+    s.door().copy_order_clock("advance 1").unwrap();
+    s.door().barrier().unwrap();
+    assert_eq!(s.door().copy_order().unwrap(), (false, 0));
+    poll_until(WAIT, "typing after clipboard wait expires", || {
+        std::fs::read(&output).ok()?.ends_with(&[3, b'a']).then_some(())
+    }).unwrap();
+    s.door().copy_order_clock("realtime").unwrap();
+    // The normal wall-clock path must still schedule a no-offer timeout.
+    // Its exact 250 ms boundary was checked above without a scheduling race.
+    command_tab(&mut s);
+    focus(&mut s, &mut source, "source");
+    source.evaluate("source.setSelectionRange(0,0);true").unwrap();
+    chord(&mut s, &[CMD], 46);
+    command_tab(&mut s);
+    s.door().tap_key(48).unwrap();
+    poll_until(WAIT, "typing after the real-clock clipboard timeout", || {
+        std::fs::read(&output).ok()?.ends_with(&[3, b'a', b'b']).then_some(())
+    }).unwrap();
+    assert!(s.compositor_alive());
+}

@@ -1,0 +1,751 @@
+//! The stuck-fullscreen desktop, spelled as assertions.
+//!
+//! # The incident
+//!
+//! 2026-09-03, live: the user fullscreened a video in Microsoft Edge
+//! and the desktop stopped answering. Edge appeared to vanish and
+//! right-clicking the desk did nothing — because Edge had not vanished
+//! at all. It was still fullscreen, an invisible sheet over the whole
+//! screen swallowing every click, and the session log said so: `entered
+//! fullscreen` with no `left fullscreen` after it, where every earlier
+//! fullscreen in the same log had its matching pair. The compositor's
+//! own `alt+shift+f` recovered it. Alongside that, a symptom the user
+//! had lived with for months: fullscreening a video in Edge took *two*
+//! clicks on the page's fullscreen control.
+//!
+//! # What the compositor was doing
+//!
+//! `XdgShellHandler::fullscreen_request` queued the request for
+//! `wm-core` and then, in the same breath, sent a configure — built
+//! from the toplevel's state at that instant, which is to say from
+//! before `wm-core` had seen the request. So a client that asked to
+//! become fullscreen was told, synchronously, that it was not.
+//! Chromium reads that as a refusal, drops the fullscreen session the
+//! page had just opened, and from then on the browser and the desktop
+//! disagree about what the window is. The second click is that
+//! disagreement being papered over. The freeze is its endgame: the page
+//! exits a fullscreen the browser no longer has a session for, sends no
+//! `unset_fullscreen`, and the compositor stays fullscreen with nothing
+//! left to tell it otherwise. See `WaylandBackend::flush_configures` in
+//! `wm-wayland` for the captured trace and the fix.
+//!
+//! # What these tests drive
+//!
+//! `chonk-fullscreen-probe` — a real xdg-shell client with a browser's
+//! memory of what it asked for (see its module doc). The `f` key is its
+//! fullscreen control; pressing it twice is fullscreen-then-exit, the
+//! exact gesture pair the incident was made of. On the old compositor
+//! the second press does not exit, because the probe's session was
+//! dropped by the refusal — so the desktop is left fullscreen and these
+//! tests fail loudly, which is the point of them.
+
+use std::time::Duration;
+
+use chonk_testkit::{
+    near, poll_until, profile_binary, Session, SessionOptions, WindowInfo, FAKE_BAR_RGB,
+};
+
+/// evdev `KEY_F` / `KEY_M`: the probe's two controls. Declared here as
+/// the tests' own vocabulary, the way `dock_toggle.rs` declares its
+/// `KEY_D` — `chonk_testkit::keys` carries only the keys the harness
+/// itself needs.
+const KEY_F: u32 = 33;
+const KEY_M: u32 = 50;
+const BAR: u32 = 48;
+const PROBE_RGB: [u8; 3] = [0x20, 0x40, 0x80];
+
+/// Boots a session with the probe mapped and focused, and hands back
+/// its windowed rect — the one an unfullscreen has to come back to.
+fn probe_session(name: &str) -> (Session, WindowInfo) {
+    let probe = profile_binary("chonk-fullscreen-probe")
+        .expect("cargo build -p chonk-testkit builds the probe");
+    let mut session = Session::boot(name, SessionOptions { scale: Some(1.0), ..SessionOptions::default() })
+        .expect("the nested compositor boots");
+    session
+        .launch(&probe.to_string_lossy(), &["chonk-fullscreen-probe", "chonk-fullscreen-probe", "delayed-configure"])
+        .expect("the probe launches against the nested session");
+    let window = session.wait_for_window("chonk-fullscreen-probe").expect("the probe maps a window");
+    // Click the window's middle before driving it: the injected keys go
+    // wherever the seat's keyboard focus is, and a click is how a user
+    // would have put it there. (A freshly mapped window is focused
+    // already; this makes the test say so rather than assume it.)
+    let door = session.door();
+    door.click(window.x as f64 + window.w as f64 / 2.0, window.y as f64 + window.h as f64 / 2.0)
+        .expect("a click lands on the probe");
+    door.barrier().expect("the click settles");
+    (session, window)
+}
+
+/// What the probe wrote about what it was told.
+fn probe_log(session: &Session) -> String {
+    std::fs::read_to_string(session.dir.join("client-0-chonk-fullscreen-probe.log")).unwrap_or_default()
+}
+
+/// A compositor barrier fences server work, not the client's event queue.
+/// Wait for this request's actual answer, and fail immediately on a refusal;
+/// a slow client must not be mistaken for a wrong configure.
+fn probe_answer(session: &Session, answer: &str) -> String {
+    poll_until(Duration::from_secs(10), answer, || {
+        let log = probe_log(session);
+        if log.contains("answer REFUSED") {
+            Some(Err(format!("a request was refused:\n{log}")))
+        } else {
+            log.contains(answer).then_some(Ok(log))
+        }
+    })
+    .and_then(|result| result)
+    .unwrap_or_else(|error| panic!("{error}\n{}\n{}", probe_log(session), session.log()))
+}
+
+/// Presses one of the probe's controls and lets the compositor settle.
+fn press(session: &mut Session, key: u32) {
+    let door = session.door();
+    door.tap_key(key).expect("the control key reaches the probe");
+    door.barrier().expect("the press settles");
+}
+
+/// The compositor's own account, ANSI-stripped: how many times it
+/// entered and left fullscreen. An `entered` with no `left` after it is
+/// precisely the incident.
+fn fullscreen_transitions(session: &Session) -> (usize, usize) {
+    let log = session.log();
+    (
+        log.lines().filter(|line| line.contains("entered fullscreen")).count(),
+        log.lines().filter(|line| line.contains("left fullscreen")).count(),
+    )
+}
+
+/// A client-controlled `xdg_surface.set_window_geometry` used to flow
+/// straight into the full-frame decoration allocator. Widths above
+/// tiny-skia's row limit made `Pixmap::new` return `None` and the
+/// compositor's main thread `expect`ed, taking the whole login session
+/// down. This probe declares that exact hostile width over a normal
+/// 400x300 buffer; surviving, mapping from the buffer, and logging one
+/// bounded rejection are all part of the contract.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn absurd_xdg_window_geometry_cannot_kill_or_bloat_the_session() {
+    let probe = profile_binary("chonk-fullscreen-probe")
+        .expect("cargo build -p chonk-testkit builds the probe");
+    let mut session = Session::boot(
+        "bounded-xdg-geometry",
+        SessionOptions { scale: Some(1.0), ..SessionOptions::default() },
+    )
+    .expect("the nested compositor boots");
+    session
+        .launch(
+            &probe.to_string_lossy(),
+            &["hostile-geometry", "hostile-geometry", "absurd-geometry"],
+        )
+        .expect("the hostile probe launches");
+
+    let window = session
+        .wait_for_window("hostile-geometry")
+        .expect("the session survives and maps the probe from its real buffer");
+    assert_eq!(
+        (window.w, window.h),
+        (400, 300),
+        "the rejected 600-million-pixel declaration must fall back to the committed buffer"
+    );
+    session
+        .door()
+        .barrier()
+        .expect("the compositor remains responsive after the hostile commit");
+    let log = session.log();
+    assert_eq!(
+        log.matches("client-declared xdg window geometry exceeded the desktop allocation limit")
+            .count(),
+        1,
+        "one surface gets one diagnostic, not one warning per later commit:\n{log}"
+    );
+}
+
+/// Waits for the real Top layer fixture to finish its first mapped
+/// commit. It is launched second in this module, after the probe.
+fn wait_for_bar(session: &Session) {
+    let log = session.dir.join("client-1-chonk-fake-bar.log");
+    poll_until(
+        Duration::from_secs(10),
+        "the Top layer fixture to map",
+        || {
+            std::fs::read_to_string(&log)
+                .ok()
+                .filter(|text| text.contains("mapped "))
+                .map(|_| ())
+        },
+    )
+    .expect("the Top layer fixture maps");
+}
+
+/// The load-bearing regression. Two presses of one control — enter,
+/// then exit — and the desktop must be back where it started.
+///
+/// On the unfixed compositor the first press is answered with a
+/// configure saying "not fullscreen", the probe drops its session, and
+/// the second press asks to *enter* again instead of leaving. Nothing
+/// ever sends `unset_fullscreen`, so `left fullscreen` never happens
+/// and the window stays welded over the whole output: the invisible
+/// sheet, reproduced.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn a_clients_fullscreen_control_enters_and_leaves_in_one_press_each() {
+    let (mut session, windowed) = probe_session("fullscreen-control");
+    let world = session.world().unwrap();
+    let (output_w, output_h) = (world.output_w, world.output_h);
+    assert!(
+        windowed.w < output_w && windowed.h < output_h,
+        "the probe starts windowed, or there is nothing for fullscreen to change: {windowed:?}"
+    );
+
+    // -- one press in ---------------------------------------------------
+    press(&mut session, KEY_F);
+    let full = poll_until(Duration::from_secs(10), "the probe to cover the whole output", || {
+        let world = session.world().ok()?;
+        world
+            .window_matching("chonk-fullscreen-probe")
+            .filter(|w| (w.x, w.y, w.w, w.h) == (0, 0, output_w, output_h))
+            .cloned()
+    })
+    .expect("one press of a fullscreen control fullscreens the window");
+    // Fullscreen deliberately takes the raw monitor rect, dock strip
+    // included — see `fullscreen_monitor_rect`.
+    assert_eq!((full.x, full.y), (0, 0));
+
+    // The client's half, and the invariant the fix states: the answer
+    // to a request describes the decision on that request. A refusal
+    // here is the bug even when the geometry above looks right.
+    let log = probe_answer(&session, "answer granted: asked fullscreen=true, told fullscreen=true");
+    assert!(
+        !log.contains("answer REFUSED"),
+        "a granted fullscreen must not be answered with a configure saying otherwise:\n{log}"
+    );
+    assert!(
+        log.contains("answer granted: asked fullscreen=true, told fullscreen=true"),
+        "the configure answering set_fullscreen must carry the fullscreen state:\n{log}"
+    );
+
+    // -- one press out --------------------------------------------------
+    press(&mut session, KEY_F);
+    let back = poll_until(Duration::from_secs(10), "the probe to return to its windowed rect", || {
+        let world = session.world().ok()?;
+        world
+            .window_matching("chonk-fullscreen-probe")
+            .filter(|w| (w.w, w.h) == (windowed.w, windowed.h))
+            .cloned()
+    })
+    .expect("a second press of the same control leaves fullscreen");
+    assert_eq!(
+        (back.x, back.y, back.w, back.h),
+        (windowed.x, windowed.y, windowed.w, windowed.h),
+        "unfullscreen restores the exact rect the window had before"
+    );
+
+    let log = probe_answer(&session, "answer granted: asked fullscreen=false, told fullscreen=false");
+    assert!(
+        log.contains("control exit fullscreen: sent unset"),
+        "the second press must be an exit, not another enter — a client whose \
+         request was refused has no session left to exit, which is how the \
+         desktop got stuck:\n{log}"
+    );
+    assert!(
+        log.contains("answer granted: asked fullscreen=false, told fullscreen=false"),
+        "the configure answering unset_fullscreen must carry no fullscreen state:\n{log}"
+    );
+    assert!(!log.contains("answer REFUSED"), "no request in this test was refused:\n{log}");
+
+    // The compositor's own ledger of the incident: every `entered` has
+    // its `left`.
+    let (entered, left) = fullscreen_transitions(&session);
+    assert_eq!(
+        (entered, left),
+        (1, 1),
+        "an `entered fullscreen` with no `left fullscreen` is the stuck desktop itself"
+    );
+}
+
+/// Fullscreen is an output plane, not merely a window resized to the
+/// output. The Omarchy bar (`Top`) must disappear behind it in both rendering and hit-testing, while a
+/// key still reaches the focused application and lets it leave.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn fullscreen_occludes_top_layers_and_covers_desktop_pixels_and_input() {
+    let (mut session, windowed) = probe_session("fullscreen-bands");
+    let bar =
+        profile_binary("chonk-fake-bar").expect("cargo build -p chonk-testkit builds the bar");
+    session
+        .launch(&bar.to_string_lossy(), &[&BAR.to_string()])
+        .expect("the Top layer fixture launches");
+    wait_for_bar(&session);
+
+    let world = session.world().expect("the scene ledger answers");
+    let top = (world.output_w as i32 / 2, BAR as i32 / 2);
+    assert!(world.shells.is_empty(), "there is no persistent core desktop UI");
+    let desktop_point = (world.output_w as i32 - 24, world.output_h as i32 - 24);
+    assert_eq!(
+        session.door().hit(top.0, top.1).unwrap(),
+        "layer",
+        "the visible bar owns its input before fullscreen"
+    );
+    let before = session
+        .screenshot("desktop-bands-before-fullscreen")
+        .unwrap();
+    assert!(
+        near(
+            before.mean_rgb(world.output_w / 2 - 20, 8, 40, 24),
+            FAKE_BAR_RGB
+        ),
+        "the Top fixture must visibly cover the pre-fullscreen strip"
+    );
+
+    // Mapping a non-interactive layer must not be assumed to preserve
+    // keyboard focus. Re-clicking the probe establishes the exact
+    // precondition Omarchy's screensaver relies on.
+    session
+        .door()
+        .click(
+            windowed.x as f64 + windowed.w as f64 / 2.0,
+            windowed.y as f64 + windowed.h as f64 / 2.0,
+        )
+        .expect("the probe regains keyboard focus");
+    press(&mut session, KEY_F);
+    poll_until(
+        Duration::from_secs(10),
+        "the probe to cover the output",
+        || {
+            let world = session.world().ok()?;
+            world
+                .window_matching("chonk-fullscreen-probe")
+                .filter(|window| {
+                    (window.x, window.y, window.w, window.h)
+                        == (0, 0, world.output_w, world.output_h)
+                })
+                .map(|_| ())
+        },
+    )
+    .expect("the probe enters fullscreen");
+
+    // The ledger changes as soon as the configure is sent; the client
+    // commits its newly sized buffer asynchronously afterward. Poll
+    // pixels so this asserts the committed scene, not the configure.
+    let full = poll_until(
+        Duration::from_secs(10),
+        "the fullscreen buffer to cover the bar strip",
+        || {
+            session.door().barrier().ok()?;
+            let shot = session.screenshot("desktop-bands-under-fullscreen").ok()?;
+            near(shot.mean_rgb(world.output_w / 2 - 20, 8, 40, 24), PROBE_RGB).then_some(shot)
+        },
+    )
+    .expect("fullscreen pixels replace the bar strip");
+
+    assert_eq!(
+        session.door().hit(top.0, top.1).unwrap(),
+        "content",
+        "the invisible Top layer must not retain input"
+    );
+    assert_eq!(
+        session.door().hit(desktop_point.0, desktop_point.1).unwrap(),
+        "content",
+        "fullscreen owns input at the former desktop point"
+    );
+    assert!(
+        near(
+            full.mean_rgb(desktop_point.0 as u32 - 8, desktop_point.1 as u32 - 8, 16, 16),
+            PROBE_RGB
+        ),
+        "fullscreen pixels must cover the desktop: {:?}",
+        full.mean_rgb(desktop_point.0 as u32 - 8, desktop_point.1 as u32 - 8, 16, 16)
+    );
+
+    // The same key the screensaver's PTY waits for reaches the focused
+    // fullscreen client. This probe turns that byte into unset_fullscreen,
+    // giving us an observable dismissal instead of merely assuming focus.
+    press(&mut session, KEY_F);
+    poll_until(
+        Duration::from_secs(10),
+        "the focused fullscreen probe to dismiss",
+        || {
+            let world = session.world().ok()?;
+            world
+                .window_matching("chonk-fullscreen-probe")
+                .filter(|window| (window.w, window.h) == (windowed.w, windowed.h))
+                .map(|_| ())
+        },
+    )
+    .expect("a keypress exits the focused fullscreen client");
+}
+
+/// The same request/answer pair one interface up: `set_maximized` had
+/// byte-for-byte the same defect (queue the request, answer with the
+/// state that preceded it), and shares the fix. A maximized window
+/// stops at the Dock's reserved strip rather than covering it, so this
+/// asserts on the answer and on the window having grown, not on an
+/// exact rect.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn a_clients_maximize_control_is_answered_with_maximized() {
+    let (mut session, windowed) = probe_session("maximize-control");
+
+    press(&mut session, KEY_M);
+    let big = poll_until(Duration::from_secs(10), "the probe to grow into a maximized rect", || {
+        let world = session.world().ok()?;
+        world.window_matching("chonk-fullscreen-probe").filter(|w| w.w > windowed.w).cloned()
+    })
+    .expect("one press of a maximize control maximizes the window");
+    assert!(big.h > windowed.h, "maximize grows both axes");
+    let log = probe_answer(&session, "answer granted: asked maximized=true, told maximized=true");
+    assert!(
+        log.contains("answer granted: asked maximized=true, told maximized=true"),
+        "the configure answering set_maximized must carry the maximized state:\n{log}"
+    );
+
+    press(&mut session, KEY_M);
+    let back = poll_until(Duration::from_secs(10), "the probe to return to its windowed rect", || {
+        let world = session.world().ok()?;
+        world
+            .window_matching("chonk-fullscreen-probe")
+            .filter(|w| (w.w, w.h) == (windowed.w, windowed.h))
+            .cloned()
+    })
+    .expect("a second press of the same control unmaximizes");
+    assert_eq!((back.w, back.h), (windowed.w, windowed.h));
+    let log = probe_answer(&session, "answer granted: asked maximized=false, told maximized=false");
+    assert!(
+        log.contains("answer granted: asked maximized=false, told maximized=false"),
+        "the configure answering unset_maximized must carry no maximized state:\n{log}"
+    );
+    assert!(!log.contains("answer REFUSED"), "no request in this test was refused:\n{log}");
+}
+
+/// Omarchy's first window rule, `suppress_event maximize` on every
+/// window: an application's own maximize control is answered with its
+/// unchanged state, and neither it nor its neighbour leaves its Mosaic
+/// cell.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn a_suppressed_maximize_request_keeps_every_tile_in_its_cell() {
+    use std::io::{Read, Write};
+
+    fn settled(session: &mut Session) -> chonk_testkit::World {
+        poll_until(Duration::from_secs(5), "layout settlement", || {
+            let world = session.world().ok()?;
+            (!world.spatial.moving && world.gesture.is_none()).then_some(world)
+        })
+        .expect("the layout settles")
+    }
+    fn cell(world: &chonk_testkit::World, app: &str) -> (i32, i32, u32, u32) {
+        let window = world.window_matching(app).expect("the tile is in the world");
+        (window.x, window.y, window.w, window.h)
+    }
+
+    let probe = profile_binary("chonk-fullscreen-probe").expect("cargo build -p chonk-testkit builds the probe");
+    let mut session = Session::boot(
+        "maximize-suppressed",
+        SessionOptions {
+            scale: Some(1.0),
+            config_extra: "desktop = \"omarchy\"\nomarchy_bar = false\nshow_dock = false\n".into(),
+            config_root_files: vec![(
+                "hypr/hyprland.conf".into(),
+                "windowrule = suppress_event maximize, match:class .*\nbind = SUPER, F12, workspace, 1\n".into(),
+            )],
+            ..SessionOptions::default()
+        },
+    )
+    .expect("the nested compositor boots");
+    for (title, app) in [("TileA", "tile-a"), ("TileB", "tile-b")] {
+        session.launch(&probe.to_string_lossy(), &[title, app]).expect("the probe launches");
+        session.wait_for_window(app).expect("the probe maps");
+    }
+    let socket = std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap())
+        .join("hypr")
+        .join(session.hyprland_signature().unwrap())
+        .join(".socket.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(b"/dispatch layout mosaic").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "ok", "Mosaic is selected");
+    session.door().barrier().unwrap();
+
+    let before = settled(&mut session);
+    let (a, b) = (cell(&before, "tile-a"), cell(&before, "tile-b"));
+    assert_ne!(a, b, "two tiles share the output");
+    let door = session.door();
+    door.click(f64::from(b.0) + f64::from(b.2) / 2.0, f64::from(b.1) + f64::from(b.3) / 2.0)
+        .expect("a click focuses the second tile");
+    door.barrier().unwrap();
+    press(&mut session, KEY_M);
+
+    let log_path = session.dir.join("client-1-chonk-fullscreen-probe.log");
+    let log = poll_until(Duration::from_secs(10), "the refused maximize to be answered", || {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        log.contains("asked maximized=true, told maximized=false").then_some(log)
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}\n{}", std::fs::read_to_string(&log_path).unwrap_or_default(), session.log()));
+    let after = settled(&mut session);
+    assert_eq!(cell(&after, "tile-b"), b, "the requesting tile keeps its cell:\n{log}");
+    assert_eq!(cell(&after, "tile-a"), a, "its neighbour does not move");
+    assert!(session.compositor_alive());
+}
+
+/// One request on the Hyprland IPC socket, exactly as `hyprctl` sends it.
+fn hypr_request(session: &Session, request: &str) -> String {
+    use std::io::{Read, Write};
+    let socket = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR"))
+        .join("hypr")
+        .join(session.hyprland_signature().expect("the Hyprland IPC announced its signature"))
+        .join(".socket.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket)
+        .unwrap_or_else(|error| panic!("{}: {error}", socket.display()));
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    reply
+}
+
+fn hypr_json(session: &Session, request: &str) -> serde_json::Value {
+    let reply = hypr_request(session, request);
+    serde_json::from_str(&reply).unwrap_or_else(|error| panic!("{request}: {error}: {reply}"))
+}
+
+/// The last `configure` the probe named `client` logged, with the
+/// states it carried.
+fn last_configure(session: &Session, client: &str) -> Option<String> {
+    let log = std::fs::read_to_string(session.dir.join(client)).unwrap_or_default();
+    log.lines().rev().find(|line| line.starts_with("configure ")).map(str::to_string)
+}
+
+/// Runs Omarchy's tiled-fullscreen toggle once, the way `SUPER + CTRL + F`
+/// does: the installed script itself when this machine has it (it reads
+/// `hyprctl activewindow -j` through `jq` and dispatches through
+/// `hyprctl`), otherwise the exact requests the script sends, on the
+/// socket. Returns which of the two ran.
+fn omarchy_tiled_fullscreen_toggle(session: &mut Session) -> &'static str {
+    const SCRIPT: &str = "omarchy-hyprland-window-tiled-fullscreen-toggle";
+    let on_path = |program: &str| {
+        std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+    };
+    let installed = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).map(|dir| dir.join(SCRIPT)).find(|path| path.is_file()))
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            let path = std::path::Path::new(&home).join(".local/share/omarchy/bin").join(SCRIPT);
+            path.is_file().then_some(path)
+        });
+    match installed {
+        Some(script) if on_path("hyprctl") && on_path("jq") => {
+            session.launch(&script.to_string_lossy(), &[]).expect("the Omarchy script launches");
+            let status = poll_until(Duration::from_secs(10), "the Omarchy script to finish", || {
+                session.client_status(SCRIPT).ok().flatten()
+            })
+            .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log(SCRIPT)));
+            assert!(status.success(), "{SCRIPT} exited {status}:\n{}", session.client_log(SCRIPT));
+            "the installed Omarchy script"
+        }
+        _ => {
+            let told = hypr_json(session, "j/activewindow")["fullscreenClient"].as_i64().unwrap_or(0);
+            let client = if told == 2 { 0 } else { 2 };
+            let reply = hypr_request(
+                session,
+                &format!("dispatch hl.dsp.window.fullscreen_state({{ internal = 0, client = {client} }})"),
+            );
+            assert_eq!(reply, "ok", "the script's request is served");
+            "the script's requests on the socket"
+        }
+    }
+}
+
+/// Omarchy's `SUPER + CTRL + F`, "tiled full screen": the application is
+/// told it is fullscreen, so a browser or player drops its own chrome,
+/// while its tile, its neighbour and the bar stay exactly where they
+/// are. The compositor's own fullscreen is never entered. A second run
+/// turns it back off, which works only because `fullscreenClient`
+/// reports the state the script branches on. Afterwards, the maximize
+/// `SUPER + ALT + F` dispatches reports as Hyprland's mode 1 on both
+/// fields.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn omarchys_tiled_fullscreen_toggle_tells_the_tile_and_reads_its_own_state_back() {
+    fn settled(session: &mut Session) -> chonk_testkit::World {
+        poll_until(Duration::from_secs(5), "layout settlement", || {
+            let world = session.world().ok()?;
+            (!world.spatial.moving && world.gesture.is_none()).then_some(world)
+        })
+        .expect("the layout settles")
+    }
+    fn cell(world: &chonk_testkit::World, app: &str) -> (i32, i32, u32, u32) {
+        let window = world.window_matching(app).expect("the tile is in the world");
+        (window.x, window.y, window.w, window.h)
+    }
+    const TILE_B_LOG: &str = "client-1-chonk-fullscreen-probe.log";
+
+    let probe = profile_binary("chonk-fullscreen-probe").expect("cargo build -p chonk-testkit builds the probe");
+    let bar = profile_binary("chonk-fake-bar").expect("cargo build -p chonk-testkit builds the bar");
+    let mut session = Session::boot(
+        "tiled-fullscreen",
+        SessionOptions {
+            scale: Some(1.0),
+            config_extra: "desktop = \"omarchy\"\nomarchy_bar = false\nshow_dock = false\n".into(),
+            config_root_files: vec![("hypr/hyprland.conf".into(), "bind = SUPER, F12, workspace, 1\n".into())],
+            ..SessionOptions::default()
+        },
+    )
+    .expect("the nested compositor boots");
+    for (title, app) in [("TileA", "tile-a"), ("TileB", "tile-b")] {
+        session.launch(&probe.to_string_lossy(), &[title, app]).expect("the probe launches");
+        session.wait_for_window(app).expect("the probe maps");
+    }
+    session.launch(&bar.to_string_lossy(), &[&BAR.to_string()]).expect("the Top layer fixture launches");
+    poll_until(Duration::from_secs(10), "the Top layer fixture to map", || {
+        session.client_log("chonk-fake-bar").contains("mapped ").then_some(())
+    })
+    .expect("the Top layer fixture maps");
+    assert_eq!(hypr_request(&session, "/dispatch layout mosaic"), "ok", "Mosaic is selected");
+    session.door().barrier().unwrap();
+
+    let before = settled(&mut session);
+    let (a, b) = (cell(&before, "tile-a"), cell(&before, "tile-b"));
+    assert_ne!(a, b, "two tiles share the output");
+    let strip = (before.output_w / 2 - 20, 8, 40, 24);
+    let top = (before.output_w as i32 / 2, BAR as i32 / 2);
+    let bar_before = session.screenshot("tiled-fullscreen-before").unwrap();
+    assert!(near(bar_before.mean_rgb(strip.0, strip.1, strip.2, strip.3), FAKE_BAR_RGB), "the bar is visible before");
+    let door = session.door();
+    door.click(f64::from(b.0) + f64::from(b.2) / 2.0, f64::from(b.1) + f64::from(b.3) / 2.0)
+        .expect("a click focuses the second tile");
+    door.barrier().unwrap();
+    let address = hypr_json(&session, "j/activewindow")["address"].as_str().expect("tile B is active").to_string();
+
+    // -- on --------------------------------------------------------------
+    let how = omarchy_tiled_fullscreen_toggle(&mut session);
+    eprintln!("tiled fullscreen toggled through {how}");
+    let active = poll_until(Duration::from_secs(10), "activewindow to report fullscreenClient 2", || {
+        let active = hypr_json(&session, "j/activewindow");
+        (active["fullscreenClient"] == 2).then_some(active)
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.log()));
+    assert_eq!(active["address"], address);
+    assert_eq!(active["fullscreen"], 0, "the compositor's own fullscreen is untouched");
+    let told = poll_until(Duration::from_secs(10), "the probe to be told it is fullscreen", || {
+        last_configure(&session, TILE_B_LOG).filter(|line| line.contains("fullscreen"))
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log("chonk-fullscreen-probe")));
+    assert!(told.contains("fullscreen"), "{told}");
+    session.door().barrier().unwrap();
+    let during = settled(&mut session);
+    assert_eq!(cell(&during, "tile-b"), b, "the told tile keeps its cell");
+    assert_eq!(cell(&during, "tile-a"), a, "its neighbour does not move");
+    poll_until(Duration::from_secs(10), "the bar strip to stay painted", || {
+        session.door().barrier().ok()?;
+        let shot = session.screenshot("tiled-fullscreen-during").ok()?;
+        near(shot.mean_rgb(strip.0, strip.1, strip.2, strip.3), FAKE_BAR_RGB).then_some(())
+    })
+    .expect("the bar is still rendered over a tile told it is fullscreen");
+    assert_eq!(session.door().hit(top.0, top.1).unwrap(), "layer", "the bar keeps its input");
+    assert_eq!(fullscreen_transitions(&session), (0, 0), "no compositor fullscreen was entered");
+    let workspaces = hypr_json(&session, "j/workspaces");
+    assert!(
+        workspaces.as_array().unwrap().iter().all(|workspace| workspace["hasfullscreen"] == false),
+        "hasfullscreen stays compositor-only: {workspaces}"
+    );
+
+    // -- off -------------------------------------------------------------
+    let how = omarchy_tiled_fullscreen_toggle(&mut session);
+    eprintln!("tiled fullscreen toggled back through {how}");
+    poll_until(Duration::from_secs(10), "activewindow to report fullscreenClient 0", || {
+        (hypr_json(&session, "j/activewindow")["fullscreenClient"] == 0).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.log()));
+    poll_until(Duration::from_secs(10), "the probe to be told it is no longer fullscreen", || {
+        last_configure(&session, TILE_B_LOG).filter(|line| !line.contains("fullscreen"))
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.client_log("chonk-fullscreen-probe")));
+    session.door().barrier().unwrap();
+    let after = settled(&mut session);
+    assert_eq!(cell(&after, "tile-b"), b, "the tile is where it was");
+    assert_eq!(cell(&after, "tile-a"), a);
+    assert_eq!(fullscreen_transitions(&session), (0, 0));
+
+    // -- SUPER + ALT + F reports as mode 1 ---------------------------------
+    assert_eq!(hypr_request(&session, "/dispatch fullscreen 1"), "ok", "Omarchy's full width maximizes");
+    poll_until(Duration::from_secs(10), "clients to report the maximized tile as fullscreen 1", || {
+        let clients = hypr_json(&session, "j/clients");
+        let window = clients.as_array()?.iter().find(|client| client["address"] == address.as_str())?;
+        (window["fullscreen"] == 1 && window["fullscreenClient"] == 1).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{}\n{}", hypr_request(&session, "j/clients"), session.log()));
+    assert_eq!(fullscreen_transitions(&session), (0, 0), "maximize is not fullscreen");
+    assert!(session.compositor_alive());
+}
+
+/// A client that asks for fullscreen or maximize during setup, before its
+/// initial commit, opens in that state. Under Omarchy's `suppress_event
+/// maximize` rule the maximize asked for at launch is refused like any
+/// other, and the window opens at its own size.
+#[test]
+#[ignore = "needs a live Wayland session to nest in: scripts/e2e.sh, or cargo test -p chonk-testkit -- --ignored --test-threads=1"]
+fn state_requested_before_the_first_commit_is_applied_at_map() {
+    let probe = profile_binary("chonk-fullscreen-probe").expect("cargo build -p chonk-testkit builds the probe");
+    for (mode, rules) in [
+        ("premap-fullscreen", None),
+        ("premap-maximize", None),
+        ("premap-maximize", Some("windowrule = suppress_event maximize, match:class .*\nbind = SUPER, F12, workspace, 1\n")),
+    ] {
+        let name = format!("{mode}{}", if rules.is_some() { "-suppressed" } else { "" });
+        let mut options = SessionOptions { scale: Some(1.0), ..SessionOptions::default() };
+        match rules {
+            Some(rules) => {
+                options.config_extra = "desktop = \"omarchy\"\nomarchy_bar = false\nshow_dock = false\n".into();
+                options.config_root_files = vec![("hypr/hyprland.conf".into(), rules.into())];
+            }
+            None => options.config_extra = "hyprland_config = false\n".into(),
+        }
+        let mut session = Session::boot(&name, options).expect("the nested compositor boots");
+        session.launch(&probe.to_string_lossy(), &["premap-probe", "premap-probe", mode]).expect("the probe launches");
+        session.wait_for_window("premap-probe").expect("the probe maps");
+        let settled = poll_until(Duration::from_secs(10), "the window to settle in its opening state", || {
+            let world = session.world().ok()?;
+            let window = world.window_matching("premap-probe")?.clone();
+            let covers = (window.x, window.y, window.w, window.h) == (0, 0, world.output_w, world.output_h);
+            let large = window.w * 4 >= world.output_w * 3 && window.h * 2 >= world.output_h;
+            let windowed = (window.w, window.h) == (400, 300);
+            let expected = match (mode, rules.is_some()) {
+                ("premap-fullscreen", _) => covers,
+                (_, false) => large && !covers,
+                (_, true) => windowed,
+            };
+            expected.then_some(window)
+        })
+        .unwrap_or_else(|error| {
+            panic!("{error}: {name}\n{:?}\n{}", session.world().ok().map(|world| world.windows), session.log())
+        });
+        assert!(session.compositor_alive(), "{name}: {settled:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs a nested session: scripts/e2e.sh --headless --release"]
+fn screensaver_covers_the_output_without_any_imported_window_rules() {
+    for scale in [1.0, 1.5, 2.0] {
+        let mut session = Session::boot(&format!("screensaver-default-{scale}"), SessionOptions {
+            scale: Some(scale),
+            config_extra: "hyprland_config = false\n".into(),
+            ..Default::default()
+        }).unwrap();
+        let probe = profile_binary("chonk-fullscreen-probe").unwrap();
+        // Like Omarchy's launcher, supply only the service identity. There is
+        // deliberately no client request or keypress to enter fullscreen.
+        session.launch(probe.to_str().unwrap(), &["screensaver", "org.omarchy.screensaver"]).unwrap();
+        session.wait_for_window("org.omarchy.screensaver").unwrap();
+        poll_until(Duration::from_secs(10), "screensaver fullscreen geometry and committed pixels", || {
+            let world = session.world().ok()?;
+            let saver = world.window_matching("org.omarchy.screensaver")?;
+            if (saver.x, saver.y, saver.w, saver.h) != (0, 0, world.output_w, world.output_h) { return None; }
+            let shot = session.screenshot("screensaver-fullscreen").ok()?;
+            [(8, 8), (world.output_w - 24, 8), (8, world.output_h - 24), (world.output_w - 24, world.output_h - 24)]
+                .iter().all(|&(x,y)| near(shot.mean_rgb(x, y, 16, 16), PROBE_RGB)).then_some(())
+        }).unwrap();
+    }
+}

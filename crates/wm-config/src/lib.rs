@@ -1,0 +1,4904 @@
+
+pub mod hyprland;
+pub mod preset;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+pub use wm_core::DecorationRules;
+pub use wm_core::{FocusDirection, FocusPolicy};
+use wm_core::{KeyCombo, Modifiers, PlacementPolicy};
+
+/// Everything a keybinding can do. Deliberately a closed set of verbs
+/// rather than free-form commands: the WM owns the semantics (which
+/// window, which workspace, what "toggle" means mid-drag), so exposing
+/// anything finer-grained than these verbs would leak state-machine
+/// internals into the config format.
+///
+/// Config files name these in kebab-case (`"spawn-terminal"`,
+/// `"workspace-carry-next"`, ...). The pseudo-action `"none"` is *not*
+/// a variant on purpose — it means "remove the binding", and letting it
+/// exist as an `Action` would force every dispatch site to handle a
+/// do-nothing case that should have been filtered out at parse time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    CycleApplications(i32),
+    CycleAppWindows(i32),
+    QuitApplication,
+    ForceQuitApplications,
+    ApplicationOverview,
+    HideApplication,
+    HideOtherApplications,
+    MiniaturizeApplication,
+    ShowDesktop,
+    /// Native Wayland screenshot / recording workflow.
+    Capture(CaptureMode),
+    SpawnTerminal,
+    Close,
+    ToggleMaximize,
+    ToggleShade,
+    Miniaturize,
+    ToggleFullscreen,
+    /// Hyprland's `fullscreenstate <internal> <client>`: what the
+    /// compositor does with the focused window and what the window is
+    /// told, set independently. `toggle-tiled-fullscreen` is the one
+    /// pair with a name of its own, `(None, Fullscreen)`: Omarchy's
+    /// tiled fullscreen, where the client drops its own chrome inside a
+    /// tile that stays put. Asking for the state the window already has
+    /// clears both axes, so a bound pair is a toggle.
+    FullscreenState { internal: wm_core::FullscreenMode, client: wm_core::FullscreenMode },
+    Layout(wm_core::LayoutMode),
+    ToggleLayout,
+    Floating(Option<bool>),
+    Move(FocusDirection),
+    Resize(wm_core::Point),
+    LayoutNoop,
+    /// Focus the nearest visible window in this root-coordinate
+    /// direction, using the workspace style's spatial navigation policy.
+    Focus(FocusDirection),
+    WorkspaceNext,
+    WorkspacePrev,
+    /// Step to the next / previous workspace that has windows on it,
+    /// wrapping, and counting the current one as a stop — Hyprland's
+    /// `workspace e+1` / `e-1`, which Omarchy binds to `SUPER + TAB`.
+    /// A distinct verb from [`Self::WorkspaceNext`] on purpose: that
+    /// one steps by index and grows the row past its end, which is
+    /// this desktop's own semantics and stays so; this one never lands
+    /// on an empty workspace and never creates one.
+    WorkspaceNextOccupied,
+    WorkspacePrevOccupied,
+    /// Go back to the workspace the desktop was on before the last
+    /// switch — Hyprland's `workspace previous`, a two-workspace flip.
+    WorkspacePrevious,
+    WorkspaceCarryNext,
+    WorkspaceCarryPrev,
+    /// Focus an output — Hyprland's `focusmonitor`: the pointer warps
+    /// to it, the keyboard goes to its most recent window, and the
+    /// next window opens there. `"focus-monitor +1"`, `"focus-monitor
+    /// left"`, `"focus-monitor DP-1"`.
+    FocusMonitor(wm_core::OutputTarget),
+    /// Move the active Space to another display under separate Spaces
+    /// — Hyprland's `movecurrentworkspacetomonitor`. Refused with a
+    /// reason on the shared desktop, where a workspace spans every
+    /// display. `"move-workspace-to-monitor right"`.
+    MoveWorkspaceToMonitor(wm_core::OutputTarget),
+    /// Switch to a workspace by number — `"workspace 4"`.
+    ///
+    /// The payload is the **0-based** index `wm_core` speaks, already
+    /// converted from the 1-based number the config file spells. The
+    /// two vocabularies are deliberately different and the conversion
+    /// happens exactly once, here at the parser, for the same reason
+    /// the window menu's `Move To` submenu labels index 0 "Workspace
+    /// 1": a person counts workspaces from one, and every desktop this
+    /// one has to feel like — Omarchy's and Hyprland's included —
+    /// counts them from one too, while `Client::workspace` has been
+    /// 0-based since the first commit. Making the file 0-based to
+    /// match the internals would mean `SUPER + 1` going to the second
+    /// workspace on an Omarchy user's muscle memory; making the
+    /// internals 1-based would touch every workspace call site in the
+    /// window manager. Converting at the door costs one subtraction.
+    ///
+    /// Growing is the semantics, not an error: naming workspace 7 on a
+    /// desk with three creates the four in between, exactly as
+    /// [`Self::WorkspaceNext`] grows the row one at a time and as
+    /// Hyprland does. Chonkstep's workspaces have always grown on
+    /// demand and cannot be destroyed, so there is no state in which
+    /// this verb could sensibly refuse.
+    Workspace(usize),
+    /// Send the focused window to a workspace by number without
+    /// following it there — `"workspace-send 4"`. 0-based payload and
+    /// grow-on-demand semantics exactly as [`Self::Workspace`]. The
+    /// exposed window, when there is one, becomes focused.
+    WorkspaceSend(usize),
+    /// Carry the focused window to a workspace by number and follow it
+    /// there — `"workspace-carry 4"`, the by-number
+    /// [`Self::WorkspaceCarryNext`]. 0-based payload and grow-on-demand
+    /// semantics exactly as [`Self::Workspace`]; a silent no-op when
+    /// nothing is focused, like every other window-targeted verb.
+    WorkspaceCarry(usize),
+    /// Show the named special workspace — Omarchy's scratchpad — as an
+    /// overlay on the active output, or hide it if it is the one shown
+    /// there: `"toggle-special scratchpad"`. The name alone selects the
+    /// default special workspace, `special`.
+    ToggleSpecial(String),
+    /// Send the focused window to the named special workspace.
+    /// `"special-send NAME"` leaves it hidden until that special is
+    /// shown; `"special-carry NAME"` (`follow`) shows the special and
+    /// keeps the keyboard on the window.
+    SendToSpecial { name: String, follow: bool },
+    /// Toggle the modal Overview: every window on the current
+    /// workspace as a grid of live thumbnails plus a workspace strip,
+    /// drawn and driven by the desktop shell. One verb on purpose —
+    /// while the Overview is open the shell owns the whole keyboard
+    /// (arrows move, Return commits, Escape dismisses), so those keys
+    /// are modal machinery like the Alt-Tab switcher's, not
+    /// per-binding config.
+    Overview,
+    /// Open the desktop's root menu from a configured keybinding.
+    RootMenu,
+    /// Open the desktop shortcut guide and quick reference.
+    Help,
+    /// Trigger a portal-registered global shortcut identified by the
+    /// Hyprland protocol's `app_id:id` key.
+    GlobalShortcut(String),
+    /// Open the window commands menu for the focused window, at the
+    /// keyboard rather than by right-clicking a titlebar.
+    ///
+    /// The titlebar is not always there to right-click: a client that
+    /// negotiated client-side decorations has no chrome of ours at all,
+    /// and before this verb existed the only route to its commands was
+    /// the Overview. Window Maker's `Control+Escape`, and its inspector
+    /// says why it exists: "To access the window commands menu of a
+    /// window without its titlebar, press Control+Esc."
+    WindowMenu,
+    /// Re-read this file and apply it to the running session — theme,
+    /// UI scale, focus policy, placement, edge resistance and these
+    /// very bindings, with no restart and nothing closed.
+    Reload,
+    /// Force the focused window opaque for the rest of the session, or
+    /// let its opacity rule apply again — Omarchy's `SUPER + BACKSPACE`.
+    /// A session toggle only: nothing is written anywhere, and a window
+    /// no rule makes translucent is unchanged by it.
+    ToggleOpaque,
+    /// Pin the focused window to every workspace, or unpin it —
+    /// Hyprland's `pin`, and the same sticky flag `hyprctl dispatch
+    /// pin` sets for Omarchy's window pop-out. A managed window comes
+    /// out of its layout to be pinned, as it does there.
+    TogglePin,
+    /// Centre the focused window in the workarea of the output it is
+    /// on, keeping its size — Hyprland's `centerwindow`, through the
+    /// same operation `hyprctl dispatch centerwindow` performs.
+    Center,
+    /// Re-exec the session's on-disk binary. Distinct from [`Self::Reload`]
+    /// on purpose: reloading applies a changed *config*, restarting
+    /// applies a changed *build*, and only the second one has to cost
+    /// the user anything.
+    Restart,
+    /// Run the argv named by this string in the `[commands]` table.
+    ///
+    /// The verb set above is closed because the WM owns its own
+    /// semantics, and that rule still holds: this variant carries a
+    /// *name*, never a command line. Bindings stay a closed vocabulary
+    /// the parser can validate; the argv lives in one table where it is
+    /// declared once, checked once, and can be reported on by name when
+    /// something is wrong with it.
+    ///
+    /// The distinction is not pedantry. It is what lets an unknown
+    /// command in a binding be diagnosed as "no such command" at parse
+    /// time — before any key is ever pressed — instead of failing
+    /// silently at spawn time with no line number to blame. A binding
+    /// naming a command that does not exist is dropped by [`parse`],
+    /// exactly as an unparsable key spec is.
+    ///
+    /// It exists because a desktop that cannot launch anything the user
+    /// names cannot host another desktop's tooling. Omarchy publishes
+    /// 382 commands through one router; without this verb not one of
+    /// them can reach a key.
+    Run(String),
+}
+
+impl Action {
+    /// The name `[keybindings]` spells this action with, the inverse of
+    /// the binding parser: `overview`, `workspace 4`, `run lock`. `None`
+    /// for the few values no name produces, such as a resize by a delta
+    /// other than the four named ones or `Floating` with a direction.
+    pub fn config_name(&self) -> Option<String> {
+        use wm_core::LayoutMode;
+        let direction = |direction: &FocusDirection| match direction {
+            FocusDirection::Left => "left",
+            FocusDirection::Right => "right",
+            FocusDirection::Up => "up",
+            FocusDirection::Down => "down",
+        };
+        let name = match self {
+            Action::CycleApplications(1) => "application-next",
+            Action::CycleApplications(-1) => "application-prev",
+            Action::CycleApplications(_) => return None,
+            Action::CycleAppWindows(1) => "application-window-next",
+            Action::CycleAppWindows(-1) => "application-window-prev",
+            Action::CycleAppWindows(_) => return None,
+            Action::QuitApplication => "quit-application",
+            Action::ForceQuitApplications => "force-quit-applications",
+            Action::ApplicationOverview => "application-overview",
+            Action::HideApplication => "hide-application",
+            Action::HideOtherApplications => "hide-other-applications",
+            Action::MiniaturizeApplication => "miniaturize-application",
+            Action::ShowDesktop => "show-desktop",
+            Action::Capture(mode) => match mode {
+                CaptureMode::ScreenClipboard => "capture-screen-clipboard",
+                CaptureMode::AreaClipboard => "capture-area-clipboard",
+                CaptureMode::WindowClipboard => "capture-window-clipboard",
+                CaptureMode::Screen => "capture-screen",
+                CaptureMode::Area => "capture-area",
+                CaptureMode::Window => "capture-window",
+                CaptureMode::Toolbar => "capture",
+                CaptureMode::Stop => "capture-stop",
+            },
+            Action::SpawnTerminal => "spawn-terminal",
+            Action::Close => "close",
+            Action::ToggleMaximize => "toggle-maximize",
+            Action::ToggleShade => "toggle-shade",
+            Action::Miniaturize => "miniaturize",
+            Action::ToggleFullscreen => "toggle-fullscreen",
+            Action::FullscreenState {
+                internal: wm_core::FullscreenMode::None,
+                client: wm_core::FullscreenMode::Fullscreen,
+            } => "toggle-tiled-fullscreen",
+            Action::FullscreenState { .. } => return None,
+            Action::Layout(LayoutMode::Freeform) => "layout-freeform",
+            Action::Layout(LayoutMode::Mosaic) => "layout-mosaic",
+            Action::Layout(LayoutMode::Flow) => "layout-flow",
+            Action::ToggleLayout => "toggle-layout",
+            Action::Floating(None) => "toggle-floating",
+            Action::Floating(Some(_)) => return None,
+            Action::Move(to) => return Some(format!("move-{}", direction(to))),
+            Action::Resize(delta) => match (delta.x, delta.y) {
+                (25, 0) => "grow-width",
+                (-25, 0) => "shrink-width",
+                (0, 25) => "grow-height",
+                (0, -25) => "shrink-height",
+                _ => return None,
+            },
+            Action::LayoutNoop => "layout-noop",
+            Action::Focus(to) => return Some(format!("focus-{}", direction(to))),
+            Action::WorkspaceNext => "workspace-next",
+            Action::WorkspacePrev => "workspace-prev",
+            Action::WorkspaceNextOccupied => "workspace-next-occupied",
+            Action::WorkspacePrevOccupied => "workspace-prev-occupied",
+            Action::WorkspacePrevious => "workspace-previous",
+            Action::FocusMonitor(target) => return Some(format!("focus-monitor {}", output_target_name(target))),
+            Action::MoveWorkspaceToMonitor(target) => {
+                return Some(format!("move-workspace-to-monitor {}", output_target_name(target)))
+            }
+            Action::WorkspaceCarryNext => "workspace-carry-next",
+            Action::WorkspaceCarryPrev => "workspace-carry-prev",
+            Action::Workspace(index) => return Some(format!("workspace {}", index + 1)),
+            Action::WorkspaceSend(index) => return Some(format!("workspace-send {}", index + 1)),
+            Action::WorkspaceCarry(index) => return Some(format!("workspace-carry {}", index + 1)),
+            Action::ToggleSpecial(name) => return Some(format!("toggle-special {name}")),
+            Action::SendToSpecial { name, follow: false } => return Some(format!("special-send {name}")),
+            Action::SendToSpecial { name, follow: true } => return Some(format!("special-carry {name}")),
+            Action::Overview => "overview",
+            Action::RootMenu => "root-menu",
+            Action::Help => "help",
+            Action::GlobalShortcut(target) => return Some(format!("global-shortcut {target}")),
+            Action::WindowMenu => "window-menu",
+            Action::Reload => "reload",
+            Action::ToggleOpaque => "toggle-opaque",
+            Action::TogglePin => "toggle-pin",
+            Action::Center => "center",
+            Action::Restart => "restart",
+            Action::Run(name) => return Some(format!("run {name}")),
+        };
+        Some(name.to_string())
+    }
+}
+
+/// The argument `focus-monitor` and `move-workspace-to-monitor` spell an
+/// output target with: `+N` / `-N`, `left` / `right` / `up` / `down`,
+/// or an output name as `chonkstep-ctl outputs` and `hyprctl monitors`
+/// report it. The inverse of [`output_target`].
+fn output_target_name(target: &wm_core::OutputTarget) -> String {
+    use wm_core::OutputTarget;
+    match target {
+        OutputTarget::Relative(step) => format!("{step:+}"),
+        OutputTarget::Direction(FocusDirection::Left) => "left".into(),
+        OutputTarget::Direction(FocusDirection::Right) => "right".into(),
+        OutputTarget::Direction(FocusDirection::Up) => "up".into(),
+        OutputTarget::Direction(FocusDirection::Down) => "down".into(),
+        OutputTarget::Name(name) => name.clone(),
+    }
+}
+
+/// Reads an output target as a binding spells it. A step is bounded to
+/// a small number because it wraps anyway; a name keeps its case, since
+/// connector names (`eDP-1`, `HDMI-A-1`) are case-sensitive, and is
+/// bounded the way every name in this file is.
+fn output_target(argument: &str) -> Option<wm_core::OutputTarget> {
+    use wm_core::OutputTarget;
+    let argument = argument.trim();
+    if argument.is_empty() || argument.len() > 256 || argument.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(step) = argument.strip_prefix('+').and_then(|digits| digits.parse::<i32>().ok()) {
+        return (step.abs() <= 64).then_some(OutputTarget::Relative(step));
+    }
+    if let Some(step) = argument.strip_prefix('-').and_then(|digits| digits.parse::<i32>().ok()) {
+        return (step.abs() <= 64).then_some(OutputTarget::Relative(step.saturating_neg()));
+    }
+    // A sign that did not read as a step is a malformed step, not an
+    // output called `+`.
+    if argument_starts_with_sign(argument) {
+        return None;
+    }
+    Some(match argument.to_ascii_lowercase().as_str() {
+        "l" | "left" => OutputTarget::Direction(FocusDirection::Left),
+        "r" | "right" => OutputTarget::Direction(FocusDirection::Right),
+        "u" | "up" => OutputTarget::Direction(FocusDirection::Up),
+        "d" | "down" => OutputTarget::Direction(FocusDirection::Down),
+        _ => OutputTarget::Name(argument.to_string()),
+    })
+}
+
+fn argument_starts_with_sign(argument: &str) -> bool {
+    argument.starts_with('+') || argument.starts_with('-')
+}
+
+/// Entry points to the native Wayland capture tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    ScreenClipboard,
+    AreaClipboard,
+    WindowClipboard,
+    Screen,
+    Area,
+    Window,
+    Toolbar,
+    Stop,
+}
+
+/// A configured binding with the behavioral facts Hyprland attaches
+/// to it. The legacy `Config::keybindings` projection remains the
+/// press-action map used by both window-manager backends.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding {
+    pub combo: KeyCombo,
+    pub action: Action,
+    pub description: Option<String>,
+    pub locked: bool,
+    pub repeating: bool,
+    pub release: bool,
+}
+
+/// Which edge of a hardware switch a [`SwitchBinding`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchEdge {
+    /// The switch turned on: a lid closed, tablet mode entered.
+    On,
+    /// The switch turned off: a lid opened, tablet mode left.
+    Off,
+    /// Either edge.
+    Any,
+}
+
+/// A binding on a hardware switch, Hyprland's `switch:on:Lid Switch`.
+///
+/// Keyed by the libinput device name, matched exactly. Apple Silicon
+/// names its lid differently, which is why Omarchy binds both names;
+/// a fuzzy match would run one machine's handler on another's switch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwitchBinding {
+    pub device: String,
+    pub edge: SwitchEdge,
+    pub action: Action,
+    /// Runs while the session is locked too (`bindl`, `locked = true`).
+    pub locked: bool,
+}
+
+impl SwitchBinding {
+    /// The most switch bindings one configuration holds.
+    pub const MAX: usize = 32;
+
+    /// Whether `device` turning `on` (or off) runs this binding, given
+    /// whether the session is locked.
+    pub fn runs(&self, device: &str, on: bool, locked: bool) -> bool {
+        (self.locked || !locked)
+            && self.device == device
+            && match self.edge {
+                SwitchEdge::On => on,
+                SwitchEdge::Off => !on,
+                SwitchEdge::Any => true,
+            }
+    }
+}
+
+/// Keyboard settings imported from Hyprland's `input {}` table.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputConfig {
+    /// Compositor-owned three/four-finger swipes on the native Wayland seat.
+    pub gestures: wm_core::GestureConfig,
+    pub rules: Option<String>,
+    pub model: Option<String>,
+    pub layout: Option<String>,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+    /// Keyboard repeats per second; zero disables repeat. Wayland bounds
+    /// direct configuration to 0..=1000, matching the Hyprland reader.
+    pub repeat_rate: Option<i32>,
+    /// Initial repeat delay in milliseconds, including zero (0..=5000).
+    pub repeat_delay: Option<i32>,
+    /// Libinput pointer/touchpad settings. `scroll_factor` is applied
+    /// after libinput so it scales both continuous and v120 axes.
+    pub sensitivity: Option<f64>,
+    /// Mouse-class scrolling: `[input]`, `input:natural_scroll`.
+    pub natural_scroll: Option<bool>,
+    pub tap_to_click: Option<bool>,
+    pub disable_while_typing: Option<bool>,
+    pub clickfinger_behavior: Option<bool>,
+    pub scroll_factor: Option<f64>,
+    /// Touchpad-class scrolling: `[input.touchpad]`, `input:touchpad:*`.
+    /// Kept apart from the mouse pair so Omarchy's touchpad settings never
+    /// invert and slow a wheel.
+    pub touchpad_natural_scroll: Option<bool>,
+    pub touchpad_scroll_factor: Option<f64>,
+    /// Hyprland's `cursor` section and chonkstep's own `[cursor]` table.
+    pub cursor: wm_core::CursorBehaviour,
+    pub left_handed: Option<bool>,
+    pub accel_profile: Option<String>,
+    /// Num Lock when a keymap is installed; see [`wm_core::KeyboardConfig`].
+    pub numlock_by_default: Option<bool>,
+    /// Mouse-class `scroll_method`, `scroll_button` and middle-button
+    /// emulation (`[input]`, `input:scroll_method`).
+    pub scroll_method: Option<wm_core::ScrollMethod>,
+    pub scroll_button: Option<u32>,
+    pub middle_button_emulation: Option<bool>,
+    /// The touchpad-class trio (`[input.touchpad]`, `input:touchpad:*`).
+    pub touchpad_scroll_method: Option<wm_core::ScrollMethod>,
+    pub touchpad_scroll_button: Option<u32>,
+    pub touchpad_middle_button_emulation: Option<bool>,
+    /// Tapping settings, which only touchpads have.
+    pub tap_and_drag: Option<bool>,
+    pub drag_lock: Option<bool>,
+    pub tap_button_map: Option<wm_core::TapButtonMap>,
+    pub drag_3fg: Option<wm_core::MultiFingerDrag>,
+    /// The outputs a touchscreen and a tablet cover, by connector name
+    /// (`input:touchdevice:output`, `input:tablet:output`).
+    pub touch_output: Option<String>,
+    pub tablet_output: Option<String>,
+    /// Rules for single devices by exact name: Hyprland's `device` blocks and
+    /// `hl.device` calls, and Omarchy's persisted touchpad and touchscreen
+    /// disables.
+    pub devices: Vec<wm_core::DeviceRule>,
+}
+
+/// The system's own keyboard configuration: the `XKB*` keys of
+/// `/etc/vconsole.conf`, the file `systemd-localed` and `localectl`
+/// maintain. Each is `None` when the file does not set it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemKeyboard {
+    pub layout: Option<String>,
+    pub model: Option<String>,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+}
+
+/// Reads a [`SystemKeyboard`] out of `vconsole.conf` text. Pure, since
+/// the caller reads the file, and total: a line it cannot read is
+/// passed over, so malformed text yields no values rather than an error.
+///
+/// Parsed the way Omarchy's `input.lua` parses the same file, because
+/// its answer is what this stands in for: `KEY=value` with whitespace
+/// allowed around either side, a trailing ` # comment` dropped, then one
+/// layer of double and then single quotes removed. An empty value sets
+/// nothing.
+pub fn system_keyboard(vconsole_conf: &str) -> SystemKeyboard {
+    let mut keyboard = SystemKeyboard::default();
+    for line in vconsole_conf.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut value = value.trim();
+        if let Some((hash, _)) = value
+            .char_indices()
+            .find(|&(at, c)| c == '#' && value[..at].ends_with(char::is_whitespace))
+        {
+            value = value[..hash].trim_end();
+        }
+        for quote in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+                value = &value[1..value.len() - 1];
+            }
+        }
+        if value.is_empty() {
+            continue;
+        }
+        let slot = match key {
+            "XKBLAYOUT" => &mut keyboard.layout,
+            "XKBMODEL" => &mut keyboard.model,
+            "XKBVARIANT" => &mut keyboard.variant,
+            "XKBOPTIONS" => &mut keyboard.options,
+            _ => continue,
+        };
+        *slot = Some(value.to_string());
+    }
+    keyboard
+}
+
+impl InputConfig {
+    /// Fills each xkb setting still unset from the system's keyboard
+    /// configuration, and names the ones it filled. A value the
+    /// configuration set is kept, even an empty one like Omarchy's
+    /// `kb_model = ""`. Per setting, a non-empty `XKB_DEFAULT_*` in the
+    /// environment wins (the compositor applies it), then the
+    /// configuration, then the system file, then libxkbcommon's default.
+    pub fn fill_keyboard_from(&mut self, system: &SystemKeyboard) -> Vec<&'static str> {
+        let mut filled = Vec::new();
+        for (name, slot, value) in [
+            ("kb_layout", &mut self.layout, &system.layout),
+            ("kb_model", &mut self.model, &system.model),
+            ("kb_variant", &mut self.variant, &system.variant),
+            ("kb_options", &mut self.options, &system.options),
+        ] {
+            if slot.is_none() && value.is_some() {
+                slot.clone_from(value);
+                filled.push(name);
+            }
+        }
+        filled
+    }
+}
+
+/// Maps a kebab-case action name from a config file to its [`Action`].
+/// Case-insensitive for the same reason key specs are: nothing is
+/// gained by making `"Close"` a startup-breaking typo. Returns `None`
+/// for unknown names — including `"none"`, which the caller must treat
+/// as unbinding *before* asking here.
+pub(crate) fn action_from_name(name: &str) -> Option<Action> {
+    let name = name.trim();
+    let normalized = name.to_ascii_lowercase();
+    if normalized.starts_with("global-shortcut ") {
+        let target = name.get("global-shortcut ".len()..)?.trim();
+        let (app_id, id) = target.split_once(':')?;
+        return (!app_id.is_empty() && !id.is_empty())
+            .then(|| Action::GlobalShortcut(target.to_string()));
+    }
+    // The two monitor verbs carry an output name, whose case matters,
+    // so their argument is read from the name as written.
+    if normalized.starts_with("focus-monitor ") {
+        return output_target(name.get("focus-monitor ".len()..)?).map(Action::FocusMonitor);
+    }
+    if normalized.starts_with("move-workspace-to-monitor ") {
+        return output_target(name.get("move-workspace-to-monitor ".len()..)?).map(Action::MoveWorkspaceToMonitor);
+    }
+    match normalized.as_str() {
+        "application-next" => Some(Action::CycleApplications(1)),
+        "application-prev" => Some(Action::CycleApplications(-1)),
+        "application-window-next" => Some(Action::CycleAppWindows(1)),
+        "application-window-prev" => Some(Action::CycleAppWindows(-1)),
+        "quit-application" => Some(Action::QuitApplication),
+        "force-quit-applications" => Some(Action::ForceQuitApplications),
+        "application-overview" => Some(Action::ApplicationOverview),
+        "hide-application" => Some(Action::HideApplication),
+        "hide-other-applications" => Some(Action::HideOtherApplications),
+        "miniaturize-application" => Some(Action::MiniaturizeApplication),
+        "show-desktop" => Some(Action::ShowDesktop),
+        "spawn-terminal" => Some(Action::SpawnTerminal),
+        "close" => Some(Action::Close),
+        "layout-freeform" => Some(Action::Layout(wm_core::LayoutMode::Freeform)),
+        "layout-mosaic" => Some(Action::Layout(wm_core::LayoutMode::Mosaic)),
+        "layout-flow" => Some(Action::Layout(wm_core::LayoutMode::Flow)),
+        "toggle-layout" => Some(Action::ToggleLayout),
+        "grow-width" => Some(Action::Resize(wm_core::Point::new(25, 0))),
+        "shrink-width" => Some(Action::Resize(wm_core::Point::new(-25, 0))),
+        "grow-height" => Some(Action::Resize(wm_core::Point::new(0, 25))),
+        "shrink-height" => Some(Action::Resize(wm_core::Point::new(0, -25))),
+        "layout-noop" => Some(Action::LayoutNoop),
+        "toggle-floating" => Some(Action::Floating(None)),
+        "move-left" => Some(Action::Move(FocusDirection::Left)),
+        "move-right" => Some(Action::Move(FocusDirection::Right)),
+        "move-up" => Some(Action::Move(FocusDirection::Up)),
+        "move-down" => Some(Action::Move(FocusDirection::Down)),
+        "toggle-maximize" => Some(Action::ToggleMaximize),
+        "toggle-shade" => Some(Action::ToggleShade),
+        "miniaturize" => Some(Action::Miniaturize),
+        "toggle-fullscreen" => Some(Action::ToggleFullscreen),
+        "toggle-tiled-fullscreen" => Some(Action::FullscreenState {
+            internal: wm_core::FullscreenMode::None,
+            client: wm_core::FullscreenMode::Fullscreen,
+        }),
+        "focus-left" => Some(Action::Focus(FocusDirection::Left)),
+        "focus-right" => Some(Action::Focus(FocusDirection::Right)),
+        "focus-up" => Some(Action::Focus(FocusDirection::Up)),
+        "focus-down" => Some(Action::Focus(FocusDirection::Down)),
+        "workspace-next" => Some(Action::WorkspaceNext),
+        "workspace-prev" => Some(Action::WorkspacePrev),
+        "workspace-next-occupied" => Some(Action::WorkspaceNextOccupied),
+        "workspace-prev-occupied" => Some(Action::WorkspacePrevOccupied),
+        "workspace-previous" => Some(Action::WorkspacePrevious),
+        "workspace-carry-next" => Some(Action::WorkspaceCarryNext),
+        "workspace-carry-prev" => Some(Action::WorkspaceCarryPrev),
+        "capture-screen-clipboard" => Some(Action::Capture(CaptureMode::ScreenClipboard)),
+        "capture-area-clipboard" => Some(Action::Capture(CaptureMode::AreaClipboard)),
+        "capture-window-clipboard" => Some(Action::Capture(CaptureMode::WindowClipboard)),
+        "capture-screen" => Some(Action::Capture(CaptureMode::Screen)),
+        "capture-area" => Some(Action::Capture(CaptureMode::Area)),
+        "capture-window" => Some(Action::Capture(CaptureMode::Window)),
+        "capture" => Some(Action::Capture(CaptureMode::Toolbar)),
+        "capture-stop" => Some(Action::Capture(CaptureMode::Stop)),
+        "overview" => Some(Action::Overview),
+        "root-menu" => Some(Action::RootMenu),
+        "help" => Some(Action::Help),
+        "window-menu" => Some(Action::WindowMenu),
+        "reload" => Some(Action::Reload),
+        "toggle-opaque" => Some(Action::ToggleOpaque),
+        "toggle-pin" => Some(Action::TogglePin),
+        "center" => Some(Action::Center),
+        "restart" => Some(Action::Restart),
+        // The two verbs that carry a workspace *number* rather than a
+        // name. Parameterised rather than eighteen literal spellings
+        // (`workspace-1`, `workspace-2`, ...) because the parser can
+        // carry the number cleanly and a table of nine strings would
+        // have to grow a tenth the first time somebody wanted ten
+        // workspaces — which is exactly what Omarchy's `SUPER + 0`
+        // wants. `run <name>` already established the shape: verb,
+        // space, argument.
+        rest if rest.starts_with("workspace ")
+            || rest.starts_with("workspace-send ")
+            || rest.starts_with("workspace-carry ") => {
+            let (verb, number) = rest.split_once(' ')?;
+            let index = workspace_index(number)?;
+            Some(match verb {
+                "workspace" => Action::Workspace(index),
+                "workspace-send" => Action::WorkspaceSend(index),
+                _ => Action::WorkspaceCarry(index),
+            })
+        }
+        // The special-workspace verbs carry a name. A bare
+        // `toggle-special` is the default special workspace, as a bare
+        // `togglespecialworkspace` is in Hyprland; the name is bounded
+        // and checked by the core's own rule so a config file cannot
+        // name a special the compositor would refuse to create.
+        rest if rest == "toggle-special"
+            || rest.starts_with("toggle-special ")
+            || rest.starts_with("special-send ")
+            || rest.starts_with("special-carry ") => {
+            let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
+            let name = wm_core::normalize_special_name(name)?;
+            Some(match verb {
+                "toggle-special" => Action::ToggleSpecial(name),
+                "special-send" => Action::SendToSpecial { name, follow: false },
+                _ => Action::SendToSpecial { name, follow: true },
+            })
+        }
+        // `run <name>` carries an argument like the three workspace
+        // verbs above, but its argument is a key into `[commands]` —
+        // not a command line. Everything after the verb is taken
+        // whole, including inner whitespace, so a command may be named
+        // "lock screen" if its author prefers that to "lock-screen";
+        // only the ends are trimmed. An empty name is rejected here rather than becoming
+        // a lookup for "" that could never match anything.
+        //
+        // The name arrives already lowercased by the caller, and
+        // `[commands]` lowercases its keys for the same reason, so
+        // `run Lock` and a `Lock = ...` entry find each other. Command
+        // names are case-insensitive like every other name in this
+        // file; nothing is gained by making capitalization a silent
+        // way to lose a binding.
+        rest => {
+            let name = rest.strip_prefix("run ")?.trim();
+            (!name.is_empty()).then(|| Action::Run(name.to_string()))
+        }
+    }
+}
+
+/// The largest one-based workspace number a binding may name.
+///
+/// The workspace row grows to any admitted index and never shrinks, so
+/// the core imposes a ceiling before workspace-sized publications and
+/// allocations can be amplified without bound. Two digits is more
+/// workspaces than any keyboard can reach and far more than anyone has
+/// ever wanted; a number past it is a mistake, and a mistake is better
+/// refused at parse time with a warning naming the line than deferred
+/// to the core guard at the first keypress.
+///
+/// This public config spelling is [`hypr_dispatch::MAX_WORKSPACE`],
+/// the value the Hyprland IPC clamps to as well, restated by value
+/// from [`wm_core::MAX_WORKSPACES`], the authoritative core ceiling:
+/// the shared crate cannot depend on the core, so this is where the
+/// two are checked against each other. The assertion below makes any
+/// drift a compile error.
+pub const MAX_WORKSPACE: usize = hypr_dispatch::MAX_WORKSPACE;
+
+/// Overview arrangement, independent of the palette and window decorations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverviewStyle {
+    /// Mission Control: a desktop strip above large live window previews.
+    #[default]
+    Classic,
+    /// Workspace cards, when the selected theme supplies modern chrome tokens.
+    Cards,
+}
+
+impl OverviewStyle {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "classic" => Some(Self::Classic),
+            "cards" => Some(Self::Cards),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Cards => "cards",
+        }
+    }
+}
+
+const _: () = assert!(MAX_WORKSPACE == wm_core::MAX_WORKSPACES);
+
+/// Reads the workspace number a `workspace` / `workspace-carry`
+/// binding names, as the 0-based index `wm_core` speaks.
+///
+/// The file counts from 1 and the window manager counts from 0, and
+/// this function is the only place the two ever meet — see
+/// [`Action::Workspace`]. `0` is rejected rather than quietly read as
+/// the first workspace: a user who writes it is either counting from
+/// zero (and would be off by one on every other number too) or has a
+/// generated file with an off-by-one in it, and both are worth a
+/// warning. So is a number past [`MAX_WORKSPACE`], and so is anything
+/// that is not a number at all.
+fn workspace_index(number: &str) -> Option<usize> {
+    let number: usize = number.trim().parse().ok()?;
+    (1..=MAX_WORKSPACE).contains(&number).then(|| number - 1)
+}
+
+/// The resolved configuration the binary runs with.
+///
+/// `keybindings` holds at most one entry per [`KeyCombo`] — the merge
+/// in [`parse`] maintains that invariant — so the caller can grab each
+/// combo exactly once without deduplicating. `scale` and `theme` stay
+/// `Option` so the binary's precedence rules (env var over config over
+/// built-in, persisted theme state over config) can distinguish an
+/// absent setting from an explicit one. `placement` and
+/// `edge_resistance` are plain values, not `Option`s, because nothing
+/// outside the config file competes over them — "user said nothing"
+/// and "user chose the default" are indistinguishable on purpose.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub focus_follows_mouse: bool,
+    /// Whether a window that takes focus is also brought to the front.
+    ///
+    /// Orthogonal to [`Self::focus_follows_mouse`], and only that
+    /// setting makes it interesting: a click always raises what it
+    /// lands on, so with click-to-focus this changes nothing. With
+    /// sloppy focus, `false` is what stops the pointer from reordering
+    /// every window it travels across. Defaults to `true`, which is the
+    /// behaviour every earlier release had.
+    pub autoraise: bool,
+    pub scale: Option<f32>,
+    pub theme: Option<String>,
+    /// The session-wide light/dark appearance the desktop starts in:
+    /// `"light"` or `"dark"`, validated at parse time so only those two
+    /// spellings ever reach a caller. Kept an `Option<String>` for the
+    /// same reason `theme` is: the shell's precedence rules (the
+    /// published appearance state file over this value over the
+    /// selected theme's own native mood) must be able to tell "user
+    /// said nothing" apart from "user chose dark". The enum itself
+    /// lives in `wm-theme`, which this crate deliberately does not
+    /// depend on.
+    pub appearance: Option<String>,
+    pub decoration_style: wm_theme_api::DecorationStyle,
+    pub overview_style: OverviewStyle,
+    /// Where newly mapped windows go when the client expressed no
+    /// position preference. Fed to the WM's placement engine verbatim.
+    pub placement: PlacementPolicy,
+    /// Snap distance for interactive moves, in pixels: a dragged frame
+    /// edge within this many pixels of a screen or window edge lands
+    /// flush against it. `0` disables snapping entirely.
+    pub edge_resistance: u32,
+    /// Pixel size of the spawned terminal's font *at 1x*, which the UI
+    /// scale then multiplies exactly as it multiplies the chrome — so
+    /// this is one number for "how big is terminal text", independent
+    /// of the display it lands on. Not per-theme on purpose: a theme
+    /// restyles the terminal's colors, never its metrics.
+    pub terminal_font_px: f32,
+    /// Decoration overrides: the per-application lists, in both
+    /// directions, and `frame_client_drawn`. Empty and off by default:
+    /// the compositor concludes every xdg-decoration negotiation with its
+    /// own chrome and answers a client that draws its own titlebar with
+    /// edge chrome around it, which is right for every client observed,
+    /// and a list is the exception, not the mechanism.
+    pub decorations: DecorationRules,
+    /// The modifier that turns a drag anywhere on a window into a move
+    /// (left button) or a resize (right button), the way every stacking
+    /// window manager since the eighties has offered.
+    ///
+    /// This is the floor under the whole decoration policy, not a
+    /// convenience: a window whose client asked to draw its own chrome
+    /// and then drew none has no titlebar to grab, and without this
+    /// gesture it cannot be moved or resized at all. Window Maker binds
+    /// it to Alt and grabs on the *client* window for exactly that
+    /// reason; KWin moved to Meta in Plasma 5.20 and labwc to Super in
+    /// 0.9.0, because Alt collides with CAD and creative applications.
+    /// Alt is the default here to match the ancestor this desktop
+    /// imitates; `drag_modifier = "super"` picks the modern convention,
+    /// and `"none"` disables the gesture.
+    pub drag_modifier: Option<Modifiers>,
+    /// Whether switching workspace hides the special workspace shown
+    /// on the output the switch lands on — Hyprland's
+    /// `binds:hide_special_on_workspace_change`, which Omarchy sets.
+    /// Off by default, as in Hyprland: the scratchpad stays where it
+    /// was dropped until the same chord takes it away.
+    pub hide_special_on_workspace_change: bool,
+    /// Whether a focused client may take every chord through
+    /// `zwp_keyboard_shortcuts_inhibit_v1` — a VM console or a remote
+    /// desktop viewer asking to receive the chords the host would
+    /// otherwise take. On by default; `false` answers every request
+    /// with no grant, which is Hyprland's
+    /// `binds:disable_keybind_grabbing = true`.
+    pub allow_shortcut_inhibit: bool,
+    /// The chord that takes the shortcuts back from a client holding an
+    /// inhibitor (and releases an XWayland keyboard grab), and hands
+    /// them back to that client on its next press. `None` unbinds it —
+    /// then nothing on the keyboard but a VT switch leaves an
+    /// inhibiting fullscreen client. Defaults to
+    /// [`DEFAULT_SHORTCUTS_INHIBIT_ESCAPE`], which no preset keymap
+    /// binds.
+    pub shortcuts_inhibit_escape: Option<KeyCombo>,
+    /// Whether an application's own `xdg_activation_v1` request takes
+    /// the keyboard even when no input of the user's stands behind it —
+    /// Hyprland's `misc:focus_on_activate`, which Omarchy turns on.
+    /// Off by default, as in Hyprland: a request the user did not
+    /// cause marks the window urgent instead of stealing the keys the
+    /// user is typing. A `focus_on_activate` window rule still refuses
+    /// per window whatever this says.
+    pub focus_on_activate: bool,
+    /// Whether the one-second re-read of the desktop's Hyprland
+    /// configuration is off until an explicit `reload` — Hyprland's
+    /// `misc:disable_autoreload`. The configuration's own baseline;
+    /// Omarchy's upgrade hooks flip the same switch live over the IPC
+    /// for the length of a package transaction.
+    pub disable_autoreload: bool,
+    /// Relaunch the previous session's windows at startup, restoring
+    /// each one's geometry, workspace and shape flags from the layout
+    /// file the shell keeps. Off by default — a session that spawns
+    /// applications the user did not just ask for has to be something
+    /// the user opted into, not something an update turned on.
+    pub restore_session: bool,
+    /// A screen locker command line (e.g. `"swaylock"`), split on
+    /// whitespace. Only consulted on the Wayland session, and only
+    /// when the compositor comes back up after a crash: the watchdog
+    /// re-execs a crashed compositor, and a desktop that reappears
+    /// with the user away from the keyboard must reappear locked. No
+    /// Omarchy's desktop preset supplies its normal lock entry point;
+    /// an explicit value overrides that default. If recovery has no
+    /// resolved command, the compositor refuses to expose an unlocked
+    /// desktop and exits so the supervisor can return to the login
+    /// boundary instead.
+    pub lock_command: Option<String>,
+    /// Named argv lists a binding can reach through [`Action::Run`],
+    /// keyed by lowercased name. Empty by default: the desktop's own
+    /// verbs need no entry here, and this table exists for the things
+    /// only the user knows the name of.
+    ///
+    /// A `BTreeMap` rather than a `Vec` of pairs because the only
+    /// operation is lookup by name, and because a stable order makes
+    /// the "no such command" diagnostic list candidates the same way
+    /// twice.
+    pub commands: BTreeMap<String, Vec<String>>,
+    /// The terminal emulator `spawn-terminal` launches, as argv.
+    ///
+    /// `None` means the built-in default, which is the only terminal
+    /// this desktop can theme end-to-end — the palette is passed on its
+    /// command line, so a replacement gets the desktop's colors only if
+    /// it happens to read them from somewhere else. That tradeoff is
+    /// the user's to make: a session hosting another desktop's tooling
+    /// has to be able to use that desktop's terminal.
+    pub terminal: Option<Vec<String>>,
+    /// Commands to run once, in order, when the session comes up.
+    ///
+    /// Named argv like [`Self::commands`] but a list rather than a map:
+    /// these are not addressed by name, they are simply run, and the
+    /// order they appear in the file is the order they start in. Empty
+    /// by default — a desktop that launches processes the user did not
+    /// ask for is the thing `restore_session` is deliberately opt-in to
+    /// avoid, and this is the same rule.
+    pub autostart: Vec<Vec<String>>,
+    /// Whether the root menu carries an `Omarchy` submenu mirroring
+    /// Omarchy's own JSONC-defined command menu (see
+    /// `chonk_shell::omarchy_menu`). On by default, and inert on a
+    /// machine without Omarchy — the submenu only appears when the menu
+    /// definition file exists — so the key is there to turn the
+    /// integration *off* on a machine that has Omarchy but wants a
+    /// plain chonkstep root menu.
+    pub omarchy_menu: bool,
+    /// Show restorable window previews on the desktop when minimized.
+    pub minimized_previews: bool,
+    /// Whether a Wayland session starts Omarchy's shell — the Quickshell
+    /// process behind its bar, menus, panels, notifications, OSD and
+    /// lock screen — the way Omarchy's own Hyprland configuration does
+    /// (see `chonk_shell::omarchy_shell`). On by default, and inert on
+    /// a machine without Omarchy's shell or on the X11 stack, where
+    /// Quickshell cannot run. Most rows of the Omarchy menu are only
+    /// half a feature without it: a speed test, a theme picker or a
+    /// volume key each ends in a panel that shell draws.
+    pub omarchy_shell: bool,
+    pub omarchy_bar: Option<bool>,
+    /// Which posture's defaults this file was read over
+    /// ([`preset::Desktop`]). Carried so a session can *report* what it
+    /// resolved as; nothing downstream branches on it, because a preset
+    /// is only ever the starting value of the keys it sets.
+    pub desktop: preset::Desktop,
+    /// Which binding vocabulary [`Self::keybindings`] started from
+    /// ([`preset::Keymap`]), carried for the same reason.
+    pub keymap: preset::Keymap,
+    pub interaction: wm_core::InteractionConfig,
+    /// Whether to read the machine's live Hyprland configuration —
+    /// `~/.config/hypr/**` and Omarchy's shipped defaults — for
+    /// bindings, window rules, autostart and session environment (see
+    /// [`hyprland`]).
+    ///
+    /// `None` means "decide from the posture", which is the shipped
+    /// behaviour and is spelled out in [`hyprland::wanted`]: a session
+    /// that has already asked for Omarchy's keymap gets the live
+    /// version of it rather than the transcription, and a plain
+    /// chonkstep desk reads nobody else's files. `Some(false)` turns
+    /// it off outright — the escape hatch — and `Some(true)` turns it
+    /// on for a chonkstep desk that wants it anyway.
+    pub hyprland_config: Option<bool>,
+    /// Per-window float rules from that read, or `None` for the
+    /// built-in behaviour. Carried as the trait object
+    /// `wm_core::WindowManager` consults, for the reason
+    /// `wm_core::FloatPolicy`'s own docs give: matching them needs a
+    /// regular-expression engine `wm-core` has no other use for.
+    pub float_policy: Option<std::sync::Arc<dyn wm_core::FloatPolicy>>,
+    /// `env` lines from that read: the environment the guest desktop's
+    /// own tooling expects to find, applied to the session before
+    /// anything is started under it.
+    pub session_env: Vec<(String, String)>,
+    pub input: InputConfig,
+    pub monitor_rules: Vec<hyprland::directive::Monitor>,
+    /// The style every workspace starts in, from the live Hyprland
+    /// read's `general.layout` (`dwindle` is Mosaic, `scrolling` is
+    /// Flow). `None` — the built-in default — is Freeform.
+    pub default_layout: Option<wm_core::LayoutMode>,
+    /// Styles for particular workspaces, by 0-based index, from the
+    /// workspace rules in that same read. Ranked above
+    /// [`Self::default_layout`] for the workspaces they name.
+    pub workspace_layouts: BTreeMap<usize, wm_core::LayoutMode>,
+    pub bindings: Vec<Binding>,
+    pub layer_bindings: BTreeMap<String, Vec<Binding>>,
+    /// Bindings on hardware switches, from the live Hyprland read.
+    pub switch_bindings: Vec<SwitchBinding>,
+    pub keybindings: Vec<(KeyCombo, Action)>,
+    /// Human-readable refusals retained for `hyprctl configerrors` and
+    /// the offline inspection commands.
+    pub diagnostics: Vec<String>,
+    /// Last writer of each effective setting: built-in, preset, live
+    /// Hyprland configuration, or the chonkstep config file.
+    pub provenance: BTreeMap<String, String>,
+    /// Whether, and how fast, the compositor's own transitions move: the
+    /// `[motion]` table, over Omarchy's `animations.enabled` and
+    /// `hl.animation` switches (see [`hyprland`]). Always sanitized:
+    /// `speed` is within `MotionPolicy::MIN_SPEED..=MAX_SPEED`.
+    pub motion: wm_core::MotionPolicy,
+}
+
+/// Logs a refused configuration item and keeps it for `hyprctl
+/// configerrors`, `--check-config` and the reload paths — the single
+/// path every per-item refusal takes, so the log and the diagnostics
+/// channel can never disagree about what the file lost. Without a
+/// subscriber the log half costs nothing, which keeps [`parse`]
+/// trivially callable from tests.
+pub(crate) fn refuse(diagnostics: &mut Vec<String>, message: String) {
+    tracing::warn!("{message}");
+    diagnostics.push(message);
+}
+
+/// [`refuse`] with `format!` arguments. The first argument is the
+/// diagnostics list the refusal lands in — `config.diagnostics` in the
+/// walk, the borrowed list in the helpers below it.
+macro_rules! refuse {
+    ($diagnostics:expr, $($arg:tt)*) => {{
+        let message = format!($($arg)*);
+        refuse(&mut $diagnostics, message)
+    }};
+}
+
+/// A refused value as its diagnostic shows it: a scalar as the user
+/// wrote it, an array or table by shape, so one refusal stays one line
+/// however large the table behind it was.
+fn shown(value: &toml::Value) -> String {
+    match value {
+        toml::Value::Array(items) => format!("an array of {} entries", items.len()),
+        toml::Value::Table(_) => "a table".into(),
+        other => other.to_string(),
+    }
+}
+
+/// The `hyprland_config` key, read out of the raw table before the
+/// walk because the read it gates has to happen there — the same
+/// chicken-and-egg `preset::base` solves for `desktop` and `keymap`,
+/// solved the same way.
+fn hyprland_switch(table: &toml::Table, diagnostics: &mut Vec<String>) -> Option<bool> {
+    match table.get("hyprland_config")? {
+        toml::Value::Boolean(b) => Some(*b),
+        other => {
+            refuse!(*diagnostics, "config: hyprland_config must be a boolean, deciding from the posture instead (got {})", shown(other));
+            None
+        }
+    }
+}
+
+/// Terminal font size when the config says nothing, in 1x pixels.
+/// Matches Omarchy's Foot default of 9pt at 96 DPI.
+pub const DEFAULT_TERMINAL_FONT_PX: f32 = 12.0;
+
+/// The modifier the move/resize drag gesture rides on when the config
+/// says nothing: Alt, as Window Maker has always bound it.
+pub const DEFAULT_DRAG_MODIFIER: Modifiers = Modifiers::ALT;
+
+/// The chord that takes the keyboard shortcuts back from a client
+/// holding a `zwp_keyboard_shortcuts_inhibit_v1` grant, when the
+/// config says nothing. Chosen to be free in every preset keymap:
+/// Omarchy has the system menu on `super+escape`, chonkstep stops a
+/// recording on `super+ctrl+escape`, and the Mac profile force-quits
+/// on `cmd+opt+escape`; `preset_doc.rs` keeps it that way.
+pub const DEFAULT_SHORTCUTS_INHIBIT_ESCAPE: &str = "super+shift+escape";
+
+/// The range a `terminal_font_px` value has to land in. Below the floor
+/// the terminal is unreadable; above the ceiling a default-sized window
+/// has room for almost no columns. Both ends are rejected loudly rather
+/// than clamped silently, so a typo'd `2000` is reported instead of
+/// quietly becoming something else.
+const TERMINAL_FONT_PX_RANGE: std::ops::RangeInclusive<f32> = 6.0..=96.0;
+
+impl Config {
+    /// The configuration used when no file exists (and the base every
+    /// file merges over). The default bindings deliberately mirror the
+    /// NeXTSTEP-style alt+shift chords the rest of the WM was designed
+    /// around; workspace switching sits on alt+ctrl so that carry
+    /// (alt+shift) and plain switch differ by exactly one modifier.
+    pub fn default_config() -> Config {
+        // Routing the defaults through parse_key keeps them honest:
+        // they exercise the exact same parser user specs go through, so
+        // a parser regression fails the default-config test instead of
+        // silently shipping different combos than the docs promise.
+        fn bind(spec: &str, action: Action) -> (KeyCombo, Action) {
+            let combo = parse_key(spec)
+                .expect("default keybinding specs are constants and must always parse");
+            (combo, action)
+        }
+        let mut config = Config {
+            focus_follows_mouse: false,
+            autoraise: true,
+            hide_special_on_workspace_change: false,
+            allow_shortcut_inhibit: true,
+            shortcuts_inhibit_escape: parse_key(DEFAULT_SHORTCUTS_INHIBIT_ESCAPE),
+            focus_on_activate: false,
+            disable_autoreload: false,
+            scale: None,
+            theme: None,
+            appearance: None,
+            decoration_style: wm_theme_api::DecorationStyle::Auto,
+            overview_style: OverviewStyle::Classic,
+            // Smart is the classic default placement, and 10px
+            // matches the stock edge-resistance feel: strong enough
+            // to catch a deliberate drag toward an edge, weak enough
+            // that sailing past it never feels sticky.
+            placement: PlacementPolicy::Smart,
+            edge_resistance: 10,
+            terminal_font_px: DEFAULT_TERMINAL_FONT_PX,
+            // Deliberately empty, in both directions. The `client_side`
+            // list this desktop once decided *from* held the Chromium
+            // family, and it was wrong in both directions within a day:
+            // it matched `chrome-<host>-<profile>` (a `--app` window,
+            // which asks for *server*-side decorations and draws none)
+            // while missing `google-chrome` (the browser window, which
+            // asks for client-side and draws its own). A `server_side`
+            // list naming Omarchy's terminals lasted about as long: the
+            // `org.omarchy.*` classes are an open set, one per script.
+            // The compositor answering every xdg negotiation with its
+            // own chrome gets all of them right with no list at all
+            // (see `wm-wayland`'s `decoration` module).
+            decorations: DecorationRules::default(),
+            drag_modifier: Some(DEFAULT_DRAG_MODIFIER),
+            restore_session: false,
+            lock_command: None,
+            commands: BTreeMap::from([(
+                "omarchy-menu".into(),
+                vec!["omarchy-menu".into(), "toggle".into()],
+            )]),
+            terminal: None,
+            autostart: Vec::new(),
+            omarchy_menu: true,
+            minimized_previews: true,
+            omarchy_shell: true,
+            omarchy_bar: None,
+            desktop: preset::Desktop::Chonkstep,
+            keymap: preset::Keymap::Chonkstep,
+            interaction: wm_core::InteractionConfig::default(),
+            // The read is decided by the posture, not by this value:
+            // see `Config::hyprland_config`.
+            hyprland_config: None,
+            float_policy: None,
+            session_env: Vec::new(),
+            input: InputConfig::default(),
+            monitor_rules: Vec::new(),
+            default_layout: None,
+            workspace_layouts: BTreeMap::new(),
+            bindings: Vec::new(),
+            layer_bindings: BTreeMap::new(),
+            switch_bindings: Vec::new(),
+            keybindings: vec![
+                bind("super+t", Action::Floating(None)),
+                bind("super+l", Action::ToggleLayout),
+                bind(
+                    "super+shift+l",
+                    Action::Layout(wm_core::LayoutMode::Freeform),
+                ),
+                bind("super+ctrl+left", Action::Focus(FocusDirection::Left)),
+                bind("super+ctrl+right", Action::Focus(FocusDirection::Right)),
+                bind("super+ctrl+up", Action::Focus(FocusDirection::Up)),
+                bind("super+ctrl+down", Action::Focus(FocusDirection::Down)),
+                bind("super+shift+left", Action::Move(FocusDirection::Left)),
+                bind("super+shift+right", Action::Move(FocusDirection::Right)),
+                bind("super+shift+up", Action::Move(FocusDirection::Up)),
+                bind("super+shift+down", Action::Move(FocusDirection::Down)),
+                bind("super+equal", Action::Resize(wm_core::Point::new(25, 0))),
+                bind("super+minus", Action::Resize(wm_core::Point::new(-25, 0))),
+                bind(
+                    "super+shift+equal",
+                    Action::Resize(wm_core::Point::new(0, 25)),
+                ),
+                bind(
+                    "super+shift+minus",
+                    Action::Resize(wm_core::Point::new(0, -25)),
+                ),
+                bind("alt+shift+return", Action::SpawnTerminal),
+                bind("super+space", Action::Run("omarchy-menu".into())),
+                bind("alt+shift+q", Action::Close),
+                bind("alt+shift+x", Action::ToggleMaximize),
+                bind("alt+shift+s", Action::ToggleShade),
+                bind("alt+shift+m", Action::Miniaturize),
+                bind("alt+shift+f", Action::ToggleFullscreen),
+                bind("alt+ctrl+right", Action::WorkspaceNext),
+                bind("alt+ctrl+left", Action::WorkspacePrev),
+                bind("alt+shift+right", Action::WorkspaceCarryNext),
+                bind("alt+shift+left", Action::WorkspaceCarryPrev),
+                // Super+Up "steps back" from the desk for the modal
+                // Overview: keep the established chord, while Ctrl+arrows focus, and
+                // the arrow pairs with the arrows that then drive the
+                // selection inside it.
+                bind("super+up", Action::Overview),
+                bind("super+shift+3", Action::Capture(CaptureMode::Screen)),
+                bind("super+shift+4", Action::Capture(CaptureMode::Area)),
+                bind("super+shift+5", Action::Capture(CaptureMode::Toolbar)),
+                bind("super+ctrl+escape", Action::Capture(CaptureMode::Stop)),
+                // The window commands menu, reachable without a
+                // titlebar to right-click. Window Maker binds exactly
+                // this, on exactly this key, and documents it as the
+                // way into a window with `NoTitlebar` — the escape
+                // hatch that makes honoring a client's request to
+                // decorate itself a safe policy rather than a gamble.
+                bind("control+escape", Action::WindowMenu),
+            ],
+            diagnostics: Vec::new(),
+            provenance: BTreeMap::new(),
+            motion: wm_core::MotionPolicy::default(),
+        };
+        for key in [
+            "focus_follows_mouse",
+            "scale",
+            "theme",
+            "appearance",
+            "decoration_style",
+            "overview_style",
+            "placement",
+            "edge_resistance",
+            "terminal_font_px",
+            "decorations",
+            "drag_modifier",
+            "allow_shortcut_inhibit",
+            "shortcuts_inhibit_escape",
+            "restore_session",
+            "lock_command",
+            "commands",
+            "terminal",
+            "autostart",
+            "omarchy_menu",
+            "omarchy_shell",
+            "show_dock",
+            "minimized_previews",
+            "omarchy_bar",
+            "desktop",
+            "keymap",
+            "hyprland_config",
+            "window_opacity",
+            "input",
+            "monitor_rules",
+            "keybindings",
+            "motion",
+        ] {
+            config
+                .provenance
+                .insert(key.to_string(), "built-in".to_string());
+        }
+        config
+    }
+}
+
+/// Maps a single (already lowercased, trimmed) key token to its X11
+/// keysym. Only the tokens the WM documents — guessing at arbitrary
+/// keysym names here would make config files silently non-portable
+/// across whatever name table we happened to guess from.
+fn keysym_for(token: &str) -> Option<u32> {
+    // Single-character tokens: letters and digits carry their ASCII
+    // value as keysym (X11 keeps Latin-1 keysyms identical to their
+    // character codes).
+    if token.len() == 1 {
+        let b = token.as_bytes()[0];
+        if b.is_ascii_lowercase() || b.is_ascii_digit() {
+            return Some(b as u32);
+        }
+        return None;
+    }
+    let keysym = match token {
+        // "enter" accepted alongside "return" because both names are in
+        // common use and rejecting one would be a pointless papercut.
+        "return" | "enter" => 0xff0d,
+        "tab" => 0xff09,
+        "space" => 0x20,
+        "escape" => 0xff1b,
+        "left" => 0xff51,
+        "up" => 0xff52,
+        "right" => 0xff53,
+        "down" => 0xff54,
+        "home" => 0xff50,
+        "end" => 0xff57,
+        "pageup" => 0xff55,
+        "pagedown" => 0xff56,
+        // Punctuation gets word names ("minus", not "-") because "+" is
+        // the spec separator and a literal "-"/"=" next to it reads
+        // like a typo; word names keep specs unambiguous.
+        "minus" => 0x2d,
+        "equal" => 0x3d,
+        "comma" => 0x2c,
+        "period" => 0x2e,
+        "bracketleft" => 0x5b,
+        "bracketright" => 0x5d,
+        // The rest of the printable punctuation on a standard board,
+        // and the three editing keys. Added when this parser grew a
+        // reader for the user's *own* Hyprland configuration: Omarchy
+        // binds `SUPER + SHIFT + SLASH` to the password manager and
+        // `SUPER + BACKSPACE`, `SUPER + CTRL + Delete` and
+        // `code:118` to three more, and a key this format has no name
+        // for is not merely unbound — it is unbindable, so a user
+        // could not have taken it back with a `[keybindings]` line
+        // either.
+        "slash" => 0x2f,
+        "semicolon" => 0x3b,
+        "apostrophe" => 0x27,
+        "grave" => 0x60,
+        "backslash" => 0x5c,
+        "backspace" => 0xff08,
+        "delete" => 0xffff,
+        "insert" => 0xff63,
+        // The key with a picture of a screen on it. It has no `XF86`
+        // prefix and predates that block by decades, but it is here for
+        // the same reason the block below is: every desktop's screenshot
+        // binding lands on it, and a parser with no name for it cannot
+        // host another desktop's capture tooling. Omarchy binds four
+        // chords on this one key.
+        "print" => 0xff61,
+        // Function keys spelled out rather than computed so exactly
+        // f1..f12 exist — no accidental "f01"/"f13" acceptance.
+        "f1" => 0xffbe,
+        "f2" => 0xffbf,
+        "f3" => 0xffc0,
+        "f4" => 0xffc1,
+        "f5" => 0xffc2,
+        "f6" => 0xffc3,
+        "f7" => 0xffc4,
+        "f8" => 0xffc5,
+        "f9" => 0xffc6,
+        "f10" => 0xffc7,
+        "f11" => 0xffc8,
+        "f12" => 0xffc9,
+        "f23" => 0xffd4,
+        // The XF86 block: the keys with pictures on them rather than
+        // letters. Spelled here in the same run-together style as
+        // "pageup" rather than as their X11 names, because
+        // `XF86AudioRaiseVolume` in a config file is shouting a
+        // vendor prefix at someone who just wants the volume key.
+        //
+        // These exist because a desktop cannot host another desktop's
+        // tooling without them. Every volume, brightness and media
+        // binding any Linux desktop ships lands on one of these
+        // keysyms, and until now this parser had no name for a single
+        // one of them — a laptop's volume keys were not merely
+        // unbound, they were unbindable.
+        "volumeup" => 0x1008ff13,
+        "volumedown" => 0x1008ff11,
+        "volumemute" | "mute" => 0x1008ff12,
+        "micmute" => 0x1008ffb2,
+        "playpause" | "audioplay" => 0x1008ff14,
+        "audiopause" => 0x1008ff31,
+        "audiostop" => 0x1008ff15,
+        "audionext" => 0x1008ff17,
+        "audioprev" => 0x1008ff16,
+        "brightnessup" => 0x1008ff02,
+        "brightnessdown" => 0x1008ff03,
+        "kbdbrightnessup" => 0x1008ff05,
+        "kbdbrightnessdown" => 0x1008ff06,
+        "poweroff" => 0x1008ff2a,
+        "search" => 0x1008ff1b,
+        "touchpadtoggle" => 0x1008ffa9,
+        "touchpadon" => 0x1008ffb0,
+        "touchpadoff" => 0x1008ffb1,
+        // The rest of the laptop's picture keys Omarchy binds: the
+        // backlight's own on/off/cycle key beside the two ramps above
+        // it, the calculator, and the eject key.
+        "kbdlightonoff" => 0x1008ff04,
+        "calculator" => 0x1008ff1d,
+        "eject" => 0x1008ff2c,
+        // The numeric keypad. Every name here is a name for a *key*,
+        // and the keysym each one resolves to is the one the
+        // compositor will actually be handed when that key is pressed
+        // — which for half the pad is NOT the keysym its X11 name
+        // suggests, so this block needs its reasoning stated.
+        //
+        // A binding is matched against the LEVEL-0 keysym of the
+        // keycode (`wm-wayland`'s `input.rs`: the unshifted sym, so
+        // that Alt+Shift+T matches T with SHIFT in the mask rather
+        // than the shifted sym). The keypad's digits do not live at
+        // level 0. On the stock US map every one of them is at level
+        // 2, behind NumLock — `xkbcli how-to-type --keysym KP_1` says
+        // `keycode 87, level 2, [ Mod2 NumLock ]`, while level 1 of
+        // that same keycode is `KP_End`. So `KP_1` (0xffb1) is a
+        // keysym this compositor can never see for a binding, and a
+        // table that mapped `kp1` to it would hand back a spec that
+        // parses, warns about nothing, and never fires — the exact
+        // silent failure this block exists to end.
+        //
+        // Each digit therefore names its key by the keysym that key
+        // actually delivers, which is the NumLock-off (cursor-mode)
+        // one. The upshot is the behaviour a user wants and would
+        // assume: `kp1` means the numpad's 1 key, and it fires
+        // whichever way NumLock happens to be set, because level-0
+        // lookup does not consult NumLock at all. Both spellings are
+        // accepted for the same key — the digit a user reads off the
+        // keycap, and the X11 cursor-mode name someone who knows the
+        // keysym table would reach for — in the same way "return" and
+        // "enter" are one key above.
+        "kp0" | "kpinsert" => 0xff9e,
+        "kp1" | "kpend" => 0xff9c,
+        "kp2" | "kpdown" => 0xff99,
+        "kp3" | "kpnext" | "kppagedown" => 0xff9b,
+        "kp4" | "kpleft" => 0xff96,
+        "kp5" | "kpbegin" => 0xff9d,
+        "kp6" | "kpright" => 0xff98,
+        "kp7" | "kphome" => 0xff95,
+        "kp8" | "kpup" => 0xff97,
+        "kp9" | "kpprior" | "kppageup" => 0xff9a,
+        "kpdecimal" | "kpdelete" => 0xff9f,
+        // The operators and Enter have no second level to hide behind:
+        // each is a single-level key whose own keysym is at level 0
+        // (`xkbcli` puts KP_Add, KP_Subtract, KP_Multiply, KP_Divide,
+        // KP_Enter and KP_Equal all at level 1, no modifiers), so
+        // these names mean exactly what they say.
+        //
+        // `kpenter` is the numpad's own Enter, and a different key
+        // from `return` — 0xff8d against 0xff0d. The Hyprland reader
+        // used to alias `kp_enter` to `return`, which would have made
+        // a numpad-Enter binding quietly replace the main Enter key's
+        // (see `hyprland::keys`'s alias table for why that never
+        // actually fired, and why it had to be fixed anyway).
+        "kpenter" => 0xff8d,
+        "kpadd" => 0xffab,
+        "kpsubtract" => 0xffad,
+        "kpmultiply" => 0xffaa,
+        "kpdivide" => 0xffaf,
+        "kpequal" => 0xffbd,
+        // Not on the US map at all, where <KPDL> is KP_Delete/
+        // KP_Decimal; layouts that use a comma as the decimal mark put
+        // it at level 0 of that key. Named for the same reason as the
+        // rest: a key this format cannot name is unbindable, and a
+        // user on such a layout cannot take it back by hand either.
+        "kpseparator" => 0xffac,
+        _ => return None,
+    };
+    Some(keysym)
+}
+
+/// Parses a `"alt+shift+return"`-style key spec into a [`KeyCombo`].
+///
+/// Case-insensitive; tokens are `+`-separated and whitespace around
+/// each token is ignored. Modifier tokens: `alt`, `shift`, `ctrl` (or
+/// `control`), `super` (or `mod4`, `win`). Exactly one non-modifier
+/// key token is required and it must come last — a modifier *after*
+/// the key (`"return+alt"`) is rejected rather than reordered, because
+/// silently accepting it would also silently accept `"a+b"`-style
+/// two-key typos as "b with some garbage".
+///
+/// Returns `None` (rather than an error type) because every caller —
+/// the config merge, the defaults table — has the same reaction to a
+/// bad spec: skip it and say which spec was bad; the spec string itself
+/// is the only diagnostic worth carrying.
+pub fn parse_key(spec: &str) -> Option<KeyCombo> {
+    let mut modifiers = Modifiers::empty();
+    let mut keysym: Option<u32> = None;
+    for raw in spec.split('+') {
+        // Once the key token has been seen, *any* further token —
+        // second key, trailing modifier, trailing '+' — is malformed.
+        if keysym.is_some() {
+            return None;
+        }
+        let token = raw.trim().to_ascii_lowercase();
+        match token.as_str() {
+            "alt" | "option" | "opt" => modifiers |= Modifiers::ALT,
+            "shift" => modifiers |= Modifiers::SHIFT,
+            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
+            "super" | "mod4" | "win" | "command" | "cmd" => modifiers |= Modifiers::SUPER,
+            // Not a modifier, so it must be the key token; unknown
+            // names (and the empty token from "" / "alt+") fail here.
+            other => keysym = Some(keysym_for(other)?),
+        }
+    }
+    // Modifier-only specs ("alt+shift") fall through with no keysym.
+    keysym.map(|keysym| KeyCombo { keysym, modifiers })
+}
+
+/// `shortcuts_inhibit_escape`'s value: `Some(None)` for `"none"`,
+/// `Some(Some(combo))` for a chord that parses, `None` for anything
+/// else — the same three-way answer `drag_modifier_from_name` gives,
+/// so the caller can tell "unbound on purpose" from "typo".
+fn shortcuts_inhibit_escape_from_spec(spec: &str) -> Option<Option<KeyCombo>> {
+    if spec.trim().eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    parse_key(spec).map(Some)
+}
+
+/// Applies a `[keybindings]` table on top of the current binding list,
+/// entry by entry in document order (last spelling of a combo wins).
+///
+/// Every failure mode here is per-entry: a bad key spec, a non-string
+/// value, or an unknown action name each warn and skip that one entry,
+/// leaving the combo's default binding (if any) intact. Skipping —
+/// rather than erroring, and rather than unbinding — is what makes a
+/// typo cost the user one binding at most, never the file or a default
+/// they still rely on.
+fn apply_keybindings(
+    bindings: &mut Vec<(KeyCombo, Action)>,
+    table: &toml::Table,
+    diagnostics: &mut Vec<String>,
+) {
+    for (spec, value) in table {
+        let Some(combo) = parse_key(spec) else {
+            refuse!(*diagnostics, "config: unparsable key spec {spec:?} in [keybindings], skipping entry");
+            continue;
+        };
+        let toml::Value::String(name) = value else {
+            refuse!(
+                *diagnostics,
+                "config: [keybindings] value for {spec:?} must be an action name string, skipping entry (got {})",
+                shown(value)
+            );
+            continue;
+        };
+        // "none" means "this combo does nothing": drop any existing
+        // binding (default or earlier file entry) for it.
+        if name.trim().eq_ignore_ascii_case("none") {
+            bindings.retain(|(existing, _)| *existing != combo);
+            continue;
+        }
+        let Some(action) = action_from_name(name) else {
+            refuse!(
+                *diagnostics,
+                "config: unknown action name {name:?} for {spec:?}, skipping entry (any default binding for this combo is kept)"
+            );
+            continue;
+        };
+        // Replace-then-append keeps the one-entry-per-combo invariant
+        // and gives "last occurrence in the file wins" for combos the
+        // file spells more than once (case / alias variants).
+        bindings.retain(|(existing, _)| *existing != combo);
+        bindings.push((combo, action));
+    }
+}
+
+/// Validates a `scale` value from the file. Integers are accepted
+/// alongside floats because `scale = 2` is the obvious thing to type;
+/// non-positive or non-finite values are rejected as nonsense that
+/// would otherwise propagate NaN/zero into every geometry computation.
+fn scale_from_value(value: &toml::Value) -> Option<f32> {
+    let scale = match value {
+        toml::Value::Float(f) => *f as f32,
+        toml::Value::Integer(i) => *i as f32,
+        _ => return None,
+    };
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
+/// Validates a `terminal_font_px` value. Integers are accepted beside
+/// floats for the same reason `scale` accepts them — `terminal_font_px
+/// = 20` is the obvious thing to type — and the value must land inside
+/// [`TERMINAL_FONT_PX_RANGE`].
+fn terminal_font_px_from_value(value: &toml::Value) -> Option<f32> {
+    let px = match value {
+        toml::Value::Float(f) => *f as f32,
+        toml::Value::Integer(i) => *i as f32,
+        _ => return None,
+    };
+    (px.is_finite() && TERMINAL_FONT_PX_RANGE.contains(&px)).then_some(px)
+}
+
+/// Maps a `placement` value from the file to its policy. Only a string
+/// is meaningful; matching is trimmed and case-insensitive for the
+/// same reason action names are — `"Cascade"` should not silently cost
+/// the user their placement preference.
+fn placement_from_value(value: &toml::Value) -> Option<PlacementPolicy> {
+    let toml::Value::String(name) = value else {
+        return None;
+    };
+    match name.trim().to_ascii_lowercase().as_str() {
+        "smart" => Some(PlacementPolicy::Smart),
+        "cascade" => Some(PlacementPolicy::Cascade),
+        "center" => Some(PlacementPolicy::Center),
+        _ => None,
+    }
+}
+
+/// Validates an `edge_resistance` value: a non-negative integer that
+/// fits the `u32` the WM's snap threshold takes (zero included — it is
+/// the documented way to disable snapping). Floats are rejected rather
+/// than truncated: `edge_resistance = 7.5` misunderstands the unit
+/// (whole pixels), and silently picking a rounding direction would
+/// hide that from the user.
+fn edge_resistance_from_value(value: &toml::Value) -> Option<u32> {
+    let toml::Value::Integer(px) = value else {
+        return None;
+    };
+    u32::try_from(*px).ok()
+}
+
+fn input_number(value: &toml::Value) -> Option<f64> {
+    match value {
+        toml::Value::Float(number) if number.is_finite() => Some(*number),
+        toml::Value::Integer(number) => Some(*number as f64),
+        _ => None,
+    }
+}
+
+/// Apply chonkstep's native `[input]` spelling over whichever pointer
+/// defaults came from a preset or the Hyprland compatibility reader.
+///
+/// `touchpad` is accepted as a nested table because that is the shape
+/// Omarchy users already know. Until per-device matching lands, both the
+/// flat and nested spellings describe the libinput pointer fallback; the
+/// nested table is applied last so an explicitly touchpad-shaped value wins.
+/// `[motion]`: four switches and a speed. Every key is validated on its
+/// own and an invalid one keeps the inherited value, so a typo in one
+/// line cannot turn motion back on or off elsewhere in the table.
+fn apply_motion_table(
+    policy: &mut wm_core::MotionPolicy,
+    entries: &toml::Table,
+    diagnostics: &mut Vec<String>,
+) {
+    for (key, value) in entries {
+        match (key.as_str(), value) {
+            ("enabled", toml::Value::Boolean(on)) => policy.enabled = *on,
+            ("layout", toml::Value::Boolean(on)) => policy.layout = *on,
+            ("overview", toml::Value::Boolean(on)) => policy.overview = *on,
+            ("gesture_settle", toml::Value::Boolean(on)) => policy.gesture_settle = *on,
+            ("speed", value)
+                if input_number(value).is_some_and(|speed| {
+                    (wm_core::MotionPolicy::MIN_SPEED..=wm_core::MotionPolicy::MAX_SPEED)
+                        .contains(&speed)
+                }) =>
+            {
+                policy.speed = input_number(value).unwrap();
+            }
+            _ => refuse!(
+                *diagnostics,
+                "config: invalid [motion] setting {key} = {}; use enabled, layout, overview, gesture_settle (booleans) or speed (0.25..=4)",
+                shown(value)
+            ),
+        }
+    }
+    *policy = policy.sanitized();
+}
+
+fn apply_input_table(
+    config: &mut InputConfig,
+    entries: &toml::Table,
+    prefix: &str,
+    diagnostics: &mut Vec<String>,
+) {
+    for (key, value) in entries {
+        let setting = if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match key.as_str() {
+            "gestures" if prefix.is_empty() => match value.as_table() {
+                Some(settings) => {
+                    for (key, value) in settings {
+                        match (key.as_str(), value) {
+                            ("enabled", toml::Value::Boolean(enabled)) => {
+                                config.gestures.enabled = *enabled
+                            }
+                            ("fingers", toml::Value::Integer(fingers))
+                                if matches!(fingers, 0 | 3 | 4) =>
+                            {
+                                config.gestures.fingers = *fingers as u32;
+                            }
+                            ("distance", value)
+                                if input_number(value)
+                                    .is_some_and(|v| (24.0..=1000.0).contains(&v)) =>
+                            {
+                                config.gestures.distance = input_number(value).unwrap();
+                            }
+                            _ => refuse!(
+                                *diagnostics,
+                                "config: invalid gesture setting {key} = {}; use enabled (boolean), fingers (0, 3 or 4), distance (24..1000)",
+                                shown(value)
+                            ),
+                        }
+                    }
+                }
+                None => refuse!(
+                    *diagnostics,
+                    "config: [input.gestures] must be a table, ignoring it (got {})",
+                    shown(value)
+                ),
+            },
+            "sensitivity" => match input_number(value) {
+                Some(speed) if (-1.0..=1.0).contains(&speed) => config.sensitivity = Some(speed),
+                _ => refuse!(*diagnostics, "config: input {setting} must be a number from -1 to 1, ignoring it (got {})", shown(value)),
+            },
+            "natural_scroll" => match value.as_bool() {
+                Some(enabled) if prefix == "touchpad" => config.touchpad_natural_scroll = Some(enabled),
+                Some(enabled) => config.natural_scroll = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "tap_to_click" => match value.as_bool() {
+                Some(enabled) => config.tap_to_click = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "disable_while_typing" => match value.as_bool() {
+                Some(enabled) => config.disable_while_typing = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "clickfinger_behavior" => match value.as_bool() {
+                Some(enabled) => config.clickfinger_behavior = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "left_handed" => match value.as_bool() {
+                Some(enabled) => config.left_handed = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "scroll_factor" => match input_number(value) {
+                Some(factor) if factor > 0.0 && prefix == "touchpad" => config.touchpad_scroll_factor = Some(factor),
+                Some(factor) if factor > 0.0 => config.scroll_factor = Some(factor),
+                _ => refuse!(*diagnostics, "config: input {setting} must be a positive number, ignoring it (got {})", shown(value)),
+            },
+            "accel_profile" => match value.as_str().map(str::trim) {
+                Some(profile) if profile.eq_ignore_ascii_case("flat") => {
+                    config.accel_profile = Some("flat".into())
+                }
+                Some(profile) if profile.eq_ignore_ascii_case("adaptive") => {
+                    config.accel_profile = Some("adaptive".into())
+                }
+                _ => refuse!(*diagnostics, "config: input {setting} must be \"flat\" or \"adaptive\", ignoring it (got {})", shown(value)),
+            },
+            "numlock_by_default" if prefix.is_empty() => match value.as_bool() {
+                Some(enabled) => config.numlock_by_default = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "middle_button_emulation" => match value.as_bool() {
+                Some(enabled) if prefix == "touchpad" => config.touchpad_middle_button_emulation = Some(enabled),
+                Some(enabled) => config.middle_button_emulation = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "scroll_method" => match value.as_str().and_then(wm_core::ScrollMethod::from_name) {
+                Some(method) if prefix == "touchpad" => config.touchpad_scroll_method = Some(method),
+                Some(method) => config.scroll_method = Some(method),
+                None => refuse!(*diagnostics, "config: input {setting} must be \"2fg\", \"edge\", \"on_button_down\" or \"no_scroll\", ignoring it (got {})", shown(value)),
+            },
+            "scroll_button" => match value.as_integer().and_then(|button| u32::try_from(button).ok()) {
+                Some(button) if button <= wm_core::MAX_SCROLL_BUTTON && prefix == "touchpad" => {
+                    config.touchpad_scroll_button = Some(button)
+                }
+                Some(button) if button <= wm_core::MAX_SCROLL_BUTTON => config.scroll_button = Some(button),
+                _ => refuse!(*diagnostics, "config: input {setting} must be an evdev button code from 0 through 300, ignoring it (got {})", shown(value)),
+            },
+            "tap_and_drag" => match value.as_bool() {
+                Some(enabled) => config.tap_and_drag = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "drag_lock" => match value.as_bool() {
+                Some(enabled) => config.drag_lock = Some(enabled),
+                None => refuse!(*diagnostics, "config: input {setting} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "tap_button_map" => match value.as_str().and_then(wm_core::TapButtonMap::from_name) {
+                Some(map) => config.tap_button_map = Some(map),
+                None => refuse!(*diagnostics, "config: input {setting} must be \"lrm\" or \"lmr\", ignoring it (got {})", shown(value)),
+            },
+            "drag_3fg" => match value.as_integer().and_then(wm_core::MultiFingerDrag::from_number) {
+                Some(drag) => config.drag_3fg = Some(drag),
+                None => refuse!(*diagnostics, "config: input {setting} must be 0, 1 (three fingers) or 2 (four fingers), ignoring it (got {})", shown(value)),
+            },
+            "touchpad" if prefix.is_empty() => match value.as_table() {
+                Some(touchpad) => apply_input_table(config, touchpad, "touchpad", diagnostics),
+                None => refuse!(*diagnostics, "config: [input.touchpad] must be a table, ignoring it (got {})", shown(value)),
+            },
+            _ => refuse!(*diagnostics, "config: unknown input setting {setting}, ignoring it"),
+        }
+    }
+}
+
+/// `[cursor]`: when the compositor hides the pointer on its own. A value
+/// of the wrong type is warned about and leaves that key as it was.
+fn apply_cursor_table(
+    cursor: &mut wm_core::CursorBehaviour,
+    entries: &toml::Table,
+    diagnostics: &mut Vec<String>,
+) {
+    for (key, value) in entries {
+        match key.as_str() {
+            "hide_on_key_press" => match value.as_bool() {
+                Some(enabled) => cursor.hide_on_key_press = Some(enabled),
+                None => refuse!(*diagnostics, "config: [cursor] {key} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "hide_on_touch" => match value.as_bool() {
+                Some(enabled) => cursor.hide_on_touch = Some(enabled),
+                None => refuse!(*diagnostics, "config: [cursor] {key} must be a boolean, ignoring it (got {})", shown(value)),
+            },
+            "inactive_timeout" => match input_number(value) {
+                Some(seconds) if seconds.is_finite() && seconds >= 0.0 => cursor.inactive_timeout = Some(seconds),
+                _ => refuse!(
+                    *diagnostics,
+                    "config: [cursor] inactive_timeout must be a non-negative number of seconds (0 never hides), ignoring it (got {})",
+                    shown(value)
+                ),
+            },
+            unknown => refuse!(*diagnostics, "config: unknown [cursor] setting {unknown}, ignoring it"),
+        }
+    }
+}
+
+/// The pure core [`load`] wraps: parses config-file text into a
+/// [`Config`], merging over [`Config::default_config`].
+///
+/// `Err` is reserved for text that is not valid TOML at all — the one
+/// case where nothing can be salvaged. Everything below that (wrongly
+/// typed fields, unknown keys, bad `[keybindings]` entries, a mode or
+/// `[mac]` value the compositor does not know) degrades per-item
+/// through [`refuse`], keeping the rest of the file: each refusal is
+/// logged *and* kept in [`Config::diagnostics`], which is what
+/// `hyprctl configerrors` and `--check-config` serve. A file may
+/// therefore parse with any number of diagnostics and still apply.
+pub fn parse(text: &str) -> Result<Config, String> {
+    parse_with(text, &|| None)
+}
+
+/// [`parse`], with a source for the machine's live Hyprland
+/// configuration.
+///
+/// # Why the live read is a parameter and not a call
+///
+/// [`parse`] is a *pure function of its text*, and it has to stay one.
+/// Every test in this crate, every doc example, and the example-config
+/// checker all call it; if it read `~/.config/hypr` on its own, the
+/// same config file would parse differently on two machines and the
+/// preset tests would assert whatever Omarchy happened to be installed
+/// on the machine running them. That is not a testing inconvenience,
+/// it is a correctness property: "what does this file mean" must not
+/// depend on files it does not mention.
+///
+/// So the read is supplied. [`load`] — which is already the I/O half,
+/// and already the only caller that has a machine to read — passes the
+/// real one; everything else passes nothing and gets the baked preset,
+/// which is exactly what a hermetic parse of `desktop = "omarchy"`
+/// means.
+///
+/// The closure is lazy on purpose: it is called only when
+/// [`hyprland::wanted`] says this config asked for a live read, so a
+/// plain chonkstep session does no I/O at all.
+pub fn parse_with(
+    text: &str,
+    live: &dyn Fn() -> Option<hyprland::Reading>,
+) -> Result<Config, String> {
+    parse_in_session(text, live, None)
+}
+
+/// [`parse_with`], inside a session that is already running in a mode.
+///
+/// `interaction_mode` and `keyboard_mode` decide how the rest of the
+/// file is read — which keymap, whose drag modifier, whether the Mac
+/// profile owns focus — so a refused mode key needs a fallback before
+/// any other key is looked at. At startup the built-in default is the
+/// right one: nothing is running yet. On a live reload it is not: a
+/// Spaces or Mac-keyboard session whose file gained one typo in that
+/// key would drop back to desktop mode, which is the one outcome a
+/// reload must never produce on its own (`docs/mac-mode.md`: an invalid
+/// reload retains the working configuration). So the reload path
+/// passes `running`, and a refused mode key keeps *that* mode — the
+/// resulting config is then consistent with itself, keymap included,
+/// rather than a running mode stapled onto a default-mode read.
+///
+/// Still a pure function of its inputs: the running mode is an
+/// argument, not a global.
+pub fn parse_in_session(
+    text: &str,
+    live: &dyn Fn() -> Option<hyprland::Reading>,
+    running: Option<&wm_core::InteractionConfig>,
+) -> Result<Config, String> {
+    let table: toml::Table = text
+        .parse()
+        .map_err(|err: toml::de::Error| format!("invalid TOML: {err}"))?;
+    // The presets, applied to the defaults *before* the file's own keys
+    // are read — which is the whole of "an explicit setting always beats
+    // a preset default" (see `preset::base`, which also explains why
+    // this cannot happen inside the walk below).
+    let mut config = preset::base(&table);
+    // The mode keys, read before everything else because everything
+    // else is read *in* the mode they select (see `parse_in_session`).
+    // A refused value keeps the mode in force — the running session's,
+    // or the default — and says so, like any other bad key: one typo
+    // here used to cost the whole file, `desktop = "omarchy"` included.
+    if let Some(value) = table.get("interaction_mode") {
+        match value.as_str().and_then(wm_core::InteractionMode::from_name) {
+            Some(mode) => {
+                config.interaction.mode = mode;
+                config.provenance.insert("interaction_mode".into(), "config file".into());
+            }
+            None => {
+                if let Some(running) = running {
+                    config.interaction.mode = running.mode;
+                }
+                refuse!(
+                    config.diagnostics,
+                    "config: interaction_mode must be 'desktop', 'spaces' or 'mac', keeping {} (got {})",
+                    config.interaction.mode.id(),
+                    shown(value)
+                );
+            }
+        }
+    }
+    if let Some(value) = table.get("keyboard_mode") {
+        match value.as_str().and_then(wm_core::KeyboardMode::from_name) {
+            Some(mode) => {
+                config.interaction.keyboard_mode = Some(mode);
+                config.provenance.insert("keyboard_mode".into(), "config file".into());
+            }
+            None => {
+                if let Some(running) = running {
+                    config.interaction.keyboard_mode = Some(running.keyboard_mode());
+                }
+                refuse!(
+                    config.diagnostics,
+                    "config: keyboard_mode must be 'desktop' or 'mac', keeping {} (got {})",
+                    config.interaction.keyboard_mode().id(),
+                    shown(value)
+                );
+            }
+        }
+    }
+    if config.interaction.mac_keyboard() {
+        if table.contains_key("keymap") {
+            // The profile wins and the key is what the user loses —
+            // the outcome the old whole-file error asked them to
+            // produce by hand, minus the hand.
+            refuse!(
+                config.diagnostics,
+                "config: the Mac keyboard profile owns its keymap; ignoring keymap (individual [keybindings] overrides are supported)"
+            );
+        }
+        config.keybindings = preset::mac_keybindings(config.desktop);
+        config.drag_modifier = None;
+        config.provenance.insert("drag_modifier".into(), "Mac interaction profile".into());
+        config.bindings = config.keybindings.iter().filter(|(key,_)| key.keysym >= 0x10080000)
+            .map(|(combo, action)| Binding { combo: *combo, action: action.clone(), description: None,
+                locked: true, repeating: matches!(combo.keysym, 0x1008ff02 | 0x1008ff03 | 0x1008ff12 | 0x1008ff13 | 0x1008ff05 | 0x1008ff06), release: false }).collect();
+        config.layer_bindings.clear();
+        config.commands.extend(preset::mac_commands());
+        config.provenance.insert("keybindings".into(), "Mac interaction profile".into());
+    }
+    // `desktop = "omarchy"` asks for all of Omarchy's non-keymap
+    // integration too, so it still has to read the live files when an
+    // explicit `keymap = "chonkstep"` peels just the bindings back off
+    // the posture. Preserve that selected keymap across the read. This
+    // cannot be recovered afterwards from `config.keymap` alone:
+    // Chonkstep is also the implicit default, where
+    // `hyprland_config = true` deliberately *does* ask for live
+    // bindings.
+    let preserve_keymap = (config.interaction.mac_keyboard() || matches!(
+        table.get("keymap"),
+        Some(toml::Value::String(name))
+            if preset::Keymap::from_name(name) == Some(preset::Keymap::Chonkstep)
+    ))
+    .then(|| {
+        (
+            config.keybindings.clone(),
+            config.bindings.clone(),
+            config.layer_bindings.clone(),
+            config.commands.clone(),
+        )
+    });
+    // The user's live Hyprland configuration, read over the preset and
+    // under the file's own keys — the exact position the presets
+    // themselves occupy, and for the same reason: by the time any key
+    // below is read, this is just the starting value that key
+    // overwrites. So `[keybindings]` in this file still has the last
+    // word on any chord, `"none"` still unbinds one, and a `[commands]`
+    // entry still replaces one the read declared.
+    //
+    // Applied here rather than inside `preset::base` because it is not
+    // a preset: a preset is a constant, and this reads the disk. Its
+    // *place* in the order is the preset's, which is what matters.
+    config.hyprland_config = hyprland_switch(&table, &mut config.diagnostics);
+    if hyprland::wanted(&config) {
+        let reading = live();
+        if let Some(reading) = &reading {
+            config.diagnostics.extend(
+                reading
+                    .skipped
+                    .iter()
+                    .map(|skip| format!("{}: {} — {}", skip.kind, skip.what, skip.why)),
+            );
+            for key in [
+                "keybindings",
+                "commands",
+                "autostart",
+                "input",
+                "monitor_rules",
+                "default_layout",
+                "workspace_layouts",
+                "motion",
+            ] {
+                config
+                    .provenance
+                    .insert(key.into(), "live Hyprland config".into());
+            }
+        }
+        hyprland::apply(&mut config, reading.as_ref());
+    }
+    if let Some((keybindings, bindings, layer_bindings, commands)) = preserve_keymap {
+        config.keybindings = keybindings;
+        config.bindings = bindings;
+        config.layer_bindings = layer_bindings;
+        if config.interaction.mac_keyboard() {
+            // Keep imported service commands, but restore profile-owned names.
+            config.commands.extend(commands);
+            config.provenance.insert("keybindings".into(), "Mac interaction profile".into());
+        } else {
+            config.commands = commands;
+        }
+    }
+    if config.interaction.mac_keyboard() {
+        config.focus_follows_mouse = false;
+        config.drag_modifier = None;
+        config.provenance.insert("focus_follows_mouse".into(), "Mac interaction profile".into());
+        config.provenance.insert("drag_modifier".into(), "Mac interaction profile".into());
+    }
+    for (key, value) in &table {
+        match key.as_str() {
+            "focus_follows_mouse" => match value {
+                toml::Value::Boolean(b) => config.focus_follows_mouse = *b,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: focus_follows_mouse must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "autoraise" => match value {
+                toml::Value::Boolean(b) => config.autoraise = *b,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: autoraise must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            // The kill switch for `opacity` window rules. `false` draws
+            // every window opaque and gives back the occlusion a
+            // translucent window costs; the session toggle and
+            // `dim_inactive` are unaffected.
+            "window_opacity" => match value {
+                toml::Value::Boolean(enabled) => config.decorations.opacity_rules_disabled = !enabled,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: window_opacity must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "scale" => match scale_from_value(value) {
+                Some(scale) => config.scale = Some(scale),
+                None => refuse!(
+                    config.diagnostics,
+                    "config: scale must be a positive number, ignoring it (got {})",
+                    shown(value)
+                ),
+            },
+            "theme" => match value {
+                toml::Value::String(name) => config.theme = Some(name.clone()),
+                other => refuse!(
+                    config.diagnostics,
+                    "config: theme must be a string, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            // Trimmed and case-insensitive like every other name in
+            // this file, and normalized here so consumers only ever
+            // see the two canonical spellings. An unknown mood is
+            // skipped, not guessed at: "drak" must cost the user this
+            // one setting, never a mode they did not ask for.
+            "appearance" => match value {
+                toml::Value::String(name)
+                    if matches!(name.trim().to_ascii_lowercase().as_str(), "light" | "dark") =>
+                {
+                    config.appearance = Some(name.trim().to_ascii_lowercase());
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: appearance must be \"light\" or \"dark\", ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            "decoration_style" => match value.as_str().and_then(wm_theme_api::DecorationStyle::from_name) {
+                Some(style) => config.decoration_style = style,
+                None => refuse!(
+                    config.diagnostics,
+                    "config: decoration_style must be \"auto\", \"windowmaker\", \"system7\", \"beos\", \"os2warp\" or \"modern\", keeping default (got {})",
+                    shown(value)
+                ),
+            },
+            "overview_style" => match value.as_str().and_then(OverviewStyle::from_name) {
+                Some(style) => config.overview_style = style,
+                None => refuse!(
+                    config.diagnostics,
+                    "config: overview_style must be \"classic\" or \"cards\", keeping default (got {})",
+                    shown(value)
+                ),
+            },
+            "placement" => match placement_from_value(value) {
+                Some(policy) => config.placement = policy,
+                None => refuse!(
+                    config.diagnostics,
+                    "config: placement must be \"smart\", \"cascade\", or \"center\", keeping default (got {})",
+                    shown(value)
+                ),
+            },
+            "edge_resistance" => match edge_resistance_from_value(value) {
+                Some(px) => config.edge_resistance = px,
+                None => refuse!(
+                    config.diagnostics,
+                    "config: edge_resistance must be a non-negative integer, keeping default (got {})",
+                    shown(value)
+                ),
+            },
+            "terminal_font_px" => match terminal_font_px_from_value(value) {
+                Some(px) => config.terminal_font_px = px,
+                None => refuse!(
+                    config.diagnostics,
+                    "config: terminal_font_px must be a number between 6 and 96, keeping default (got {})",
+                    shown(value)
+                ),
+            },
+            "restore_session" => match value {
+                toml::Value::Boolean(b) => config.restore_session = *b,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: restore_session must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "omarchy_menu" => match value {
+                toml::Value::Boolean(b) => config.omarchy_menu = *b,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: omarchy_menu must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "omarchy_shell" => match value {
+                toml::Value::Boolean(b) => config.omarchy_shell = *b,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: omarchy_shell must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            // The preset keys are resolved by `preset::base` and the
+            // mode keys above it, each of which refuses a bad value
+            // itself. Listed here only so they are not reported as
+            // unknown top-level keys.
+            "desktop" | "keymap" | "interaction_mode" | "keyboard_mode" => {}
+            // Per entry, like every table in this walk: one bad
+            // profile costs that profile, not the other profiles and
+            // not the file.
+            "mac" => match value {
+                toml::Value::Table(settings) => {
+                    for (key, value) in settings {
+                        match key.as_str() {
+                            "separate_spaces" => match value {
+                                toml::Value::Boolean(on) => config.interaction.separate_spaces = *on,
+                                other => refuse!(
+                                    config.diagnostics,
+                                    "config: mac.separate_spaces must be a boolean, keeping default (got {})",
+                                    shown(other)
+                                ),
+                            },
+                            "clipboard_persistence" => match value {
+                                toml::Value::Boolean(on) => config.interaction.clipboard_persistence = *on,
+                                other => refuse!(
+                                    config.diagnostics,
+                                    "config: mac.clipboard_persistence must be a boolean, keeping default (got {})",
+                                    shown(other)
+                                ),
+                            },
+                            "applications" => match value {
+                                toml::Value::Table(applications) => {
+                                    // Bounded like every list a client
+                                    // or file can grow: the profiles are
+                                    // scanned per window identity.
+                                    const MAX_PROFILES: usize = 256;
+                                    if applications.len() > MAX_PROFILES {
+                                        refuse!(
+                                            config.diagnostics,
+                                            "config: at most {MAX_PROFILES} Mac application profiles are supported, reading the first {MAX_PROFILES} of {}",
+                                            applications.len()
+                                        );
+                                    }
+                                    for (identity, profile) in applications.iter().take(MAX_PROFILES) {
+                                        match profile.as_str().and_then(wm_core::AppProfile::from_name) {
+                                            Some(profile) => config.interaction.applications.push((identity.clone(), profile)),
+                                            None => refuse!(
+                                                config.diagnostics,
+                                                "config: invalid Mac profile for {identity}: use gui, terminal, terminal-window, browser, files, native, or passthrough; skipping it (got {})",
+                                                shown(profile)
+                                            ),
+                                        }
+                                    }
+                                }
+                                other => refuse!(
+                                    config.diagnostics,
+                                    "config: [mac.applications] must be a table, ignoring it (got {})",
+                                    shown(other)
+                                ),
+                            },
+                            unknown => refuse!(
+                                config.diagnostics,
+                                "config: unknown Mac setting {unknown}, ignoring it"
+                            ),
+                        }
+                    }
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [mac] must be a table, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            "omarchy_bar" => match value {
+                toml::Value::Boolean(b) => config.omarchy_bar = Some(*b),
+                other => refuse!(
+                    config.diagnostics,
+                    "config: omarchy_bar must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "show_dock" => {},
+            "minimized_previews" => match value {
+                toml::Value::Boolean(on) => config.minimized_previews = *on,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: minimized_previews must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "lock_command" => match value {
+                // An empty or whitespace-only command means the same
+                // thing as no key at all: nothing to run. Filtering it
+                // here keeps every consumer from having to guard
+                // against spawning "".
+                toml::Value::String(command) if !command.trim().is_empty() => {
+                    config.lock_command = Some(command.clone());
+                }
+                toml::Value::String(_) => {
+                    refuse!(config.diagnostics, "config: lock_command is empty, treating it as unset")
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: lock_command must be a command-line string, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            // The one-directional ancestor of `[decorations]`, kept
+            // reading so an existing config file does not start
+            // warning about an unknown key and silently lose the
+            // override it was written for. It only ever meant "do not
+            // frame these", which is exactly `decorations.client_side`.
+            "self_decorating_apps" => match value {
+                toml::Value::Array(_) => {
+                    refuse!(
+                        config.diagnostics,
+                        "config: self_decorating_apps is now decorations.client_side — reading it as that; \
+                         see docs/config.example.toml for the [decorations] table, which also forces chrome ON"
+                    );
+                    config.decorations.client_side =
+                        string_list(value, "self_decorating_apps", &mut config.diagnostics);
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: self_decorating_apps must be an array of strings, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            "drag_modifier" => match value {
+                toml::Value::String(name) => match drag_modifier_from_name(name) {
+                    Some(mods) => config.drag_modifier = mods,
+                    None => refuse!(
+                        config.diagnostics,
+                        "config: drag_modifier must be \"alt\", \"super\", \"control\" or \"none\", keeping default (got {name:?})"
+                    ),
+                },
+                other => refuse!(
+                    config.diagnostics,
+                    "config: drag_modifier must be a string, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "allow_shortcut_inhibit" => match value {
+                toml::Value::Boolean(allow) => config.allow_shortcut_inhibit = *allow,
+                other => refuse!(
+                    config.diagnostics,
+                    "config: allow_shortcut_inhibit must be a boolean, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            // A chord, or `"none"` to have no keyboard route out of an
+            // inhibiting client at all. A spec that does not parse
+            // keeps the default rather than silently unbinding the
+            // one chord that works while every other is inhibited.
+            "shortcuts_inhibit_escape" => match value {
+                toml::Value::String(spec) => match shortcuts_inhibit_escape_from_spec(spec) {
+                    Some(escape) => config.shortcuts_inhibit_escape = escape,
+                    None => refuse!(
+                        config.diagnostics,
+                        "config: shortcuts_inhibit_escape must be a key spec or \"none\", keeping default (got {spec:?})"
+                    ),
+                },
+                other => refuse!(
+                    config.diagnostics,
+                    "config: shortcuts_inhibit_escape must be a string, keeping default (got {})",
+                    shown(other)
+                ),
+            },
+            "decorations" => match value {
+                toml::Value::Table(entries) => {
+                    for (key, value) in entries {
+                        match key.as_str() {
+                            "server_side" => {
+                                config.decorations.server_side = string_list(
+                                    value,
+                                    "decorations.server_side",
+                                    &mut config.diagnostics,
+                                )
+                            }
+                            "client_side" => {
+                                config.decorations.client_side = string_list(
+                                    value,
+                                    "decorations.client_side",
+                                    &mut config.diagnostics,
+                                )
+                            }
+                            "frame_client_drawn" => match value {
+                                toml::Value::Boolean(frame) => {
+                                    config.decorations.frame_client_drawn = *frame
+                                }
+                                other => refuse!(
+                                    config.diagnostics,
+                                    "config: decorations.frame_client_drawn must be true or false, keeping default (got {})",
+                                    shown(other)
+                                ),
+                            },
+                            unknown => refuse!(
+                                config.diagnostics,
+                                "config: unknown key {unknown} in [decorations], ignoring it"
+                            ),
+                        }
+                    }
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [decorations] must be a table, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            "input" => match value {
+                toml::Value::Table(entries) => {
+                    apply_input_table(&mut config.input, entries, "", &mut config.diagnostics)
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [input] must be a table, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            // Over the live Hyprland configuration's animation switches,
+            // like every key in this walk.
+            "motion" => match value {
+                toml::Value::Table(entries) => {
+                    apply_motion_table(&mut config.motion, entries, &mut config.diagnostics)
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [motion] must be a table, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            // Read after the live Hyprland configuration, like every key in
+            // this walk, so a `[cursor]` setting here overrides Omarchy's.
+            "cursor" => match value {
+                toml::Value::Table(entries) => {
+                    apply_cursor_table(&mut config.input.cursor, entries, &mut config.diagnostics)
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [cursor] must be a table, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            "commands" => match value {
+                toml::Value::Table(entries) => {
+                    for (name, value) in entries {
+                        let name = name.trim().to_ascii_lowercase();
+                        if name.is_empty() {
+                            refuse!(
+                                config.diagnostics,
+                                "config: [commands] entry with an empty name, skipping it"
+                            );
+                            continue;
+                        }
+                        match argv_from_value(value) {
+                            Ok(argv) => {
+                                config.commands.insert(name, argv);
+                            }
+                            Err(why) => refuse!(
+                                config.diagnostics,
+                                "config: [commands] entry {name} {why}, skipping it"
+                            ),
+                        }
+                    }
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [commands] must be a table, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            "terminal" => match argv_from_value(value) {
+                Ok(argv) => config.terminal = Some(argv),
+                Err(why) => refuse!(
+                    config.diagnostics,
+                    "config: terminal {why}, keeping the built-in terminal"
+                ),
+            },
+            // A list of command lines rather than a table: these are
+            // run, not named, and their file order is their start
+            // order — which a table could not promise.
+            "autostart" => match value {
+                toml::Value::Array(items) => {
+                    for item in items {
+                        match argv_from_value(item) {
+                            Ok(argv) => config.autostart.push(argv),
+                            Err(why) => refuse!(
+                                config.diagnostics,
+                                "config: autostart entry {why}, skipping it"
+                            ),
+                        }
+                    }
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: autostart must be an array of command lines, ignoring it (got {})",
+                    shown(other)
+                ),
+            },
+            // Read in `preset::base`'s company, before the walk (see
+            // below); accepted here so it is not reported as unknown.
+            "hyprland_config" => {}
+            "keybindings" => match value {
+                toml::Value::Table(entries) => {
+                    apply_keybindings(&mut config.keybindings, entries, &mut config.diagnostics)
+                }
+                other => refuse!(
+                    config.diagnostics,
+                    "config: [keybindings] must be a table, keeping default bindings (got {})",
+                    shown(other)
+                ),
+            },
+            unknown => refuse!(
+                config.diagnostics,
+                "config: unknown top-level key {unknown}, ignoring it"
+            ),
+        }
+    }
+    for (key, value) in &table {
+        // Provenance describes the setting that actually won, not just
+        // the last layer that mentioned its name. Reuse the same
+        // validators as the application pass above so a rejected typo
+        // continues to point at the inherited source.
+        let provenance_key = match key.as_str() {
+            "focus_follows_mouse"
+            | "restore_session"
+            | "omarchy_menu"
+            | "omarchy_shell"
+            | "omarchy_bar"
+            | "show_dock"
+            | "minimized_previews"
+            | "hyprland_config"
+            | "window_opacity"
+            | "allow_shortcut_inhibit"
+                if value.is_bool() =>
+            {
+                Some(key.as_str())
+            }
+            "shortcuts_inhibit_escape"
+                if value.as_str().and_then(shortcuts_inhibit_escape_from_spec).is_some() =>
+            {
+                Some("shortcuts_inhibit_escape")
+            }
+            "scale" if scale_from_value(value).is_some() => Some("scale"),
+            "theme" if value.is_str() => Some("theme"),
+            "overview_style" if value.as_str().and_then(OverviewStyle::from_name).is_some() => Some("overview_style"),
+            "decoration_style"
+                if value.as_str().and_then(wm_theme_api::DecorationStyle::from_name).is_some() =>
+            {
+                Some("decoration_style")
+            }
+            "appearance"
+                if value.as_str().is_some_and(|name| {
+                    matches!(name.trim().to_ascii_lowercase().as_str(), "light" | "dark")
+                }) =>
+            {
+                Some("appearance")
+            }
+            "placement" if placement_from_value(value).is_some() => Some("placement"),
+            "edge_resistance" if edge_resistance_from_value(value).is_some() => {
+                Some("edge_resistance")
+            }
+            "terminal_font_px" if terminal_font_px_from_value(value).is_some() => {
+                Some("terminal_font_px")
+            }
+            "lock_command"
+                if value
+                    .as_str()
+                    .is_some_and(|command| !command.trim().is_empty()) =>
+            {
+                Some("lock_command")
+            }
+            "drag_modifier" if value.as_str().and_then(drag_modifier_from_name).is_some() => {
+                Some("drag_modifier")
+            }
+            "terminal" if argv_from_value(value).is_ok() => Some("terminal"),
+            "self_decorating_apps" if value.is_array() => Some("decorations"),
+            "decorations" if value.is_table() => Some("decorations"),
+            "input" if value.is_table() => Some("input"),
+            "motion" if value.is_table() => Some("motion"),
+            "commands" if value.is_table() => Some("commands"),
+            "autostart" if value.is_array() => Some("autostart"),
+            "keybindings" if value.is_table() => Some("keybindings"),
+            _ => None,
+        };
+        if let Some(key) = provenance_key {
+            config
+                .provenance
+                .insert(key.to_string(), "config file".to_string());
+        }
+    }
+    // `run <name>` is checked here, after the whole file has been read,
+    // rather than inside `apply_keybindings`. TOML tables reach us in
+    // an order we do not control, so a binding may well be parsed
+    // before the `[commands]` table it refers to; validating during the
+    // walk would reject perfectly good configs based on where the user
+    // happened to put a section.
+    //
+    // A binding naming a command that does not exist is dropped, not
+    // kept and failed at spawn time. The whole point of routing argv
+    // through a named table is that a typo becomes one warning at
+    // startup naming both the key and the command, instead of a key
+    // that silently does nothing whenever it is pressed.
+    if config.interaction.mac_keyboard() {
+        if let Some(command) = config.lock_command.as_ref() {
+            if !table.get("commands").and_then(toml::Value::as_table).is_some_and(|t| t.keys().any(|key| key.eq_ignore_ascii_case("mac-lock"))) {
+                config.commands.insert("mac-lock".into(), command.split_whitespace().map(str::to_owned).collect());
+            }
+        }
+    }
+    let commands = &config.commands;
+    let diagnostics = &mut config.diagnostics;
+    config.keybindings.retain(|(combo, action)| {
+        let Action::Run(name) = action else {
+            return true;
+        };
+        if commands.contains_key(name) {
+            return true;
+        }
+        refuse!(
+            *diagnostics,
+            "config: binding {combo:?} runs {name:?}, which is not in [commands] (known: {:?}), dropping the binding",
+            commands.keys().collect::<Vec<_>>()
+        );
+        false
+    });
+    if config.interaction.mac_keyboard() {
+        config.bindings.retain(|binding| config.keybindings.iter().any(|(combo,action)| *combo == binding.combo && *action == binding.action));
+    }
+    Ok(config)
+}
+
+/// A command line from the file, as argv.
+///
+/// Two spellings, because they answer different needs and neither one
+/// alone is enough. A bare string is what a user reaches for and is
+/// split on whitespace, exactly as `lock_command` is. An array is the
+/// escape hatch for the case that split cannot express — an argument
+/// with a space in it — and is taken verbatim, so
+/// `["notify-send", "hello world"]` sends one argument, not two.
+///
+/// `Err` is why the value is not a command line, phrased to follow the
+/// key's name in the caller's refusal, so one bad entry is one line
+/// that says both what was wrong and what it cost. An empty result is
+/// also `Err`: a string of only spaces and an empty array both describe
+/// no program to run, and every caller would otherwise have to guard
+/// against spawning "".
+fn argv_from_value(value: &toml::Value) -> Result<Vec<String>, String> {
+    let argv: Vec<String> = match value {
+        toml::Value::String(line) => line.split_whitespace().map(str::to_string).collect(),
+        toml::Value::Array(items) => {
+            let mut argv = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    toml::Value::String(arg) => argv.push(arg.clone()),
+                    other => {
+                        return Err(format!(
+                            "has a command argument that is not a string (got {})",
+                            shown(other)
+                        ))
+                    }
+                }
+            }
+            argv
+        }
+        other => {
+            return Err(format!(
+                "must be a command-line string or an array of arguments (got {})",
+                shown(other)
+            ))
+        }
+    };
+    if argv.is_empty() {
+        return Err("is an empty command line".into());
+    }
+    Ok(argv)
+}
+
+/// A TOML array of strings, trimmed and lowercased for the
+/// case-insensitive prefix matching every identity list here does.
+/// Non-string entries are skipped individually rather than voiding the
+/// whole list — one typo'd entry should cost one entry.
+fn string_list(value: &toml::Value, what: &str, diagnostics: &mut Vec<String>) -> Vec<String> {
+    let toml::Value::Array(items) = value else {
+        refuse!(*diagnostics, "config: {what} must be an array of strings, ignoring it (got {})", shown(value));
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|v| match v {
+            toml::Value::String(name) => Some(name.trim().to_ascii_lowercase()),
+            other => {
+                refuse!(*diagnostics, "config: {what} entries must be strings, skipping one (got {})", shown(other));
+                None
+            }
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Parses `drag_modifier`. The outer `Option` is "was this a valid
+/// name"; the inner one is the setting itself, where `None` is the
+/// explicit `"none"` that turns the gesture off.
+fn drag_modifier_from_name(name: &str) -> Option<Option<Modifiers>> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "alt" | "mod1" => Some(Some(Modifiers::ALT)),
+        "super" | "mod4" | "win" => Some(Some(Modifiers::SUPER)),
+        "control" | "ctrl" => Some(Some(Modifiers::CONTROL)),
+        "none" | "off" => Some(None),
+        _ => None,
+    }
+}
+
+/// Where the config file lives: `$XDG_CONFIG_HOME/chonkstep/config.toml`
+/// with the standard `~/.config` fallback. Per the XDG basedir spec, a
+/// relative (or empty) `$XDG_CONFIG_HOME` is treated as unset rather
+/// than resolved against some accidental working directory. `None`
+/// only when `$HOME` is also missing — at which point there is nowhere
+/// sane to look and the defaults are the right answer.
+pub fn config_path() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() && PathBuf::from(&dir).is_absolute() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(base.join("chonkstep").join("config.toml"))
+}
+
+/// Loads the user's config, never failing: this runs on the WM startup
+/// path, and any outcome other than "the session starts" is worse than
+/// any misreading of the config could be.
+///
+/// - No config file (or no `$HOME` to find one under): the defaults,
+///   silently — an absent file is the normal case, not a problem.
+/// - File unreadable or not valid TOML: `tracing::warn!` with the
+///   error, then the defaults.
+/// - File fine but individual entries bad: [`parse`] refuses and skips
+///   those entries, keeping the rest and listing them in
+///   [`Config::diagnostics`].
+pub fn inspect(path: Option<&Path>) -> Result<Config, String> {
+    inspect_in_session(path, None)
+}
+
+/// [`inspect`] for a live reload: `running` is the session's current
+/// interaction settings, which a refused `interaction_mode` or
+/// `keyboard_mode` keeps instead of the default (see
+/// [`parse_in_session`]).
+pub fn inspect_in_session(
+    path: Option<&Path>,
+    running: Option<&wm_core::InteractionConfig>,
+) -> Result<Config, String> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => match config_path() {
+            Some(path) => path,
+            None => return Ok(Config::default_config()),
+        },
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default_config());
+        }
+        Err(err) => return Err(format!("{}: {err}", path.display())),
+    };
+    parse_in_session(&text, &hyprland::load, running)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Stable, line-oriented effective configuration with the last writer
+/// beside every setting. Intended for `--print-config`, not as a second
+/// configuration format.
+pub fn effective_config_report(config: &Config) -> String {
+    let mut out = String::new();
+    let mut line = |key: &str, value: String| {
+        let source = config
+            .provenance
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("resolved");
+        out.push_str(&format!("{key} = {value}\t# {source}\n"));
+    };
+    line("desktop", config.desktop.id().into());
+    line("keymap", if config.interaction.mac_keyboard() { "mac" } else { config.keymap.id() }.into());
+    line("interaction_mode", config.interaction.mode.id().into());
+    line("keyboard_mode", config.interaction.keyboard_mode().id().into());
+    line(
+        "focus_follows_mouse",
+        config.focus_follows_mouse.to_string(),
+    );
+    line("scale", format!("{:?}", config.scale));
+    line("theme", format!("{:?}", config.theme));
+    line("appearance", format!("{:?}", config.appearance));
+    line("decoration_style", format!("{:?}", config.decoration_style.name()));
+    line("overview_style", format!("{:?}", config.overview_style.name()));
+    line("placement", format!("{:?}", config.placement));
+    line("edge_resistance", config.edge_resistance.to_string());
+    line("terminal_font_px", config.terminal_font_px.to_string());
+    line("drag_modifier", format!("{:?}", config.drag_modifier));
+    line("allow_shortcut_inhibit", config.allow_shortcut_inhibit.to_string());
+    line("shortcuts_inhibit_escape", format!("{:?}", config.shortcuts_inhibit_escape));
+    line("restore_session", config.restore_session.to_string());
+    line("omarchy_bar", format!("{:?}", config.omarchy_bar));
+    line("input", format!("{:?}", config.input));
+    line("motion", format!("{:?}", config.motion));
+    line("monitor_rules", config.monitor_rules.len().to_string());
+    line("default_layout", format!("{:?}", config.default_layout));
+    line("workspace_layouts", config.workspace_layouts.len().to_string());
+    line("keybindings", config.keybindings.len().to_string());
+    line("commands", config.commands.len().to_string());
+    line("autostart", config.autostart.len().to_string());
+    if config.interaction.spaces_mode() {
+        line("spaces.separate_displays", config.interaction.separate_spaces.to_string());
+        line("spaces.fullscreen", "true".into());
+        line("clipboard_persistence", config.interaction.clipboard_persistence.to_string());
+    }
+    if config.interaction.mac_keyboard() {
+        line("mac.clipboard_persistence", config.interaction.clipboard_persistence.to_string());
+        line("mac.separate_spaces", config.interaction.separate_spaces.to_string());
+        line("mac.applications", format!("{:?}", config.interaction.applications));
+        out.push_str("\n# Mac system shortcuts after overrides (client editing is app-aware)\n");
+        for (chord, _) in preset::MAC_BINDINGS {
+            let combo = parse_key(chord).expect("built-in Mac shortcut");
+            match config.keybindings.iter().find(|(key,_)| *key == combo) {
+                Some((_,action)) => out.push_str(&format!("{chord} = {action:?}\n")),
+                None => out.push_str(&format!("{chord} = disabled\n")),
+            }
+        }
+    }
+    out
+}
+
+pub fn load() -> Config {
+    match inspect(None) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(%err, "config: using defaults");
+            let mut config = Config::default_config();
+            config.diagnostics.push(err);
+            config
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test-side lookup: the action currently bound to `spec`, if any.
+    fn action_for(config: &Config, spec: &str) -> Option<Action> {
+        let combo = parse_key(spec).expect("test spec must parse");
+        config
+            .keybindings
+            .iter()
+            .find(|(existing, _)| *existing == combo)
+            .map(|(_, action)| action.clone())
+    }
+
+    #[test]
+    fn an_explicit_chonkstep_keymap_survives_an_omarchy_live_read() {
+        let live = || {
+            let combo = parse_key("super+w").unwrap();
+            let binding = Binding {
+                combo,
+                action: Action::Close,
+                description: Some("Close".into()),
+                locked: true,
+                repeating: false,
+                release: false,
+            };
+            let mut reading = hyprland::Reading::default();
+            reading.keybindings.push((combo, Action::Close));
+            reading.bindings.push(binding.clone());
+            reading
+                .layer_bindings
+                .insert("fake-bar".into(), vec![binding]);
+            reading
+                .commands
+                .insert("live-command".into(), vec!["false".into()]);
+            reading
+                .env
+                .push(("OMARCHY_TEST".into(), "still-integrated".into()));
+            Some(reading)
+        };
+
+        let config = parse_with("desktop = \"omarchy\"\nkeymap = \"chonkstep\"", &live).unwrap();
+
+        assert_eq!(config.keybindings, Config::default_config().keybindings);
+        assert!(
+            config.bindings.is_empty(),
+            "live binding flags must not leak around the chosen keymap"
+        );
+        assert!(
+            config.layer_bindings.is_empty(),
+            "layer-scoped live bindings are part of that keymap too"
+        );
+        assert_eq!(
+            config.commands, Config::default_config().commands,
+            "commands owned only by the rejected live bindings go with them"
+        );
+        assert_eq!(
+            config.session_env,
+            [("OMARCHY_TEST".into(), "still-integrated".into())]
+        );
+    }
+
+    fn combo(keysym: u32, modifiers: Modifiers) -> KeyCombo {
+        KeyCombo { keysym, modifiers }
+    }
+
+    // ---- parse_key: acceptance ----------------------------------------
+
+    #[test]
+    fn every_letter_and_digit_parses_to_its_ascii_keysym() {
+        for c in ('a'..='z').chain('0'..='9') {
+            let spec = c.to_string();
+            assert_eq!(
+                parse_key(&spec),
+                Some(combo(c as u32, Modifiers::empty())),
+                "spec {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_named_key_parses_to_its_dictated_keysym() {
+        let named: &[(&str, u32)] = &[
+            ("return", 0xff0d),
+            ("enter", 0xff0d),
+            ("tab", 0xff09),
+            ("space", 0x20),
+            ("escape", 0xff1b),
+            ("left", 0xff51),
+            ("up", 0xff52),
+            ("right", 0xff53),
+            ("down", 0xff54),
+            ("home", 0xff50),
+            ("end", 0xff57),
+            ("pageup", 0xff55),
+            ("pagedown", 0xff56),
+            ("minus", 0x2d),
+            ("equal", 0x3d),
+            ("comma", 0x2c),
+            ("period", 0x2e),
+        ];
+        for (name, keysym) in named {
+            assert_eq!(
+                parse_key(name),
+                Some(combo(*keysym, Modifiers::empty())),
+                "spec {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_keys_f1_through_f12_parse_contiguously() {
+        for n in 1u32..=12 {
+            let spec = format!("f{n}");
+            assert_eq!(
+                parse_key(&spec),
+                Some(combo(0xffbe + n - 1, Modifiers::empty())),
+                "spec {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_modifier_and_alias_maps_to_its_flag() {
+        let cases: &[(&str, Modifiers)] = &[
+            ("alt+a", Modifiers::ALT),
+            ("shift+a", Modifiers::SHIFT),
+            ("ctrl+a", Modifiers::CONTROL),
+            ("control+a", Modifiers::CONTROL),
+            ("super+a", Modifiers::SUPER),
+            ("mod4+a", Modifiers::SUPER),
+            ("win+a", Modifiers::SUPER),
+        ];
+        for (spec, modifiers) in cases {
+            assert_eq!(
+                parse_key(spec),
+                Some(combo(0x61, *modifiers)),
+                "spec {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_four_modifiers_combine() {
+        assert_eq!(
+            parse_key("alt+shift+ctrl+super+z"),
+            Some(combo(
+                0x7a,
+                Modifiers::ALT | Modifiers::SHIFT | Modifiers::CONTROL | Modifiers::SUPER
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_key_is_case_insensitive() {
+        let lower = parse_key("alt+shift+return");
+        assert_eq!(parse_key("ALT+SHIFT+RETURN"), lower);
+        assert_eq!(parse_key("Alt+Shift+Return"), lower);
+        assert_eq!(parse_key("CTRL+F5"), parse_key("ctrl+f5"));
+    }
+
+    #[test]
+    fn parse_key_tolerates_whitespace_around_tokens() {
+        assert_eq!(parse_key(" alt + shift + a "), parse_key("alt+shift+a"));
+    }
+
+    #[test]
+    fn bare_key_without_modifiers_is_valid() {
+        assert_eq!(parse_key("f5"), Some(combo(0xffc2, Modifiers::empty())));
+        assert_eq!(parse_key("space"), Some(combo(0x20, Modifiers::empty())));
+    }
+
+    // ---- parse_key: rejection -----------------------------------------
+
+    #[test]
+    fn rejects_empty_and_whitespace_and_bare_separator_specs() {
+        for spec in ["", "   ", "+", "alt+", "+a", "alt++a"] {
+            assert_eq!(parse_key(spec), None, "spec {spec:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_modifier_only_specs() {
+        for spec in [
+            "alt",
+            "shift",
+            "ctrl",
+            "super",
+            "alt+shift",
+            "alt+ctrl+shift",
+        ] {
+            assert_eq!(parse_key(spec), None, "spec {spec:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_tokens() {
+        for spec in [
+            "banana", "alt+foo", "hyper+a", "alt+esc", "alt+f0", "alt+f13", "alt+f01",
+        ] {
+            assert_eq!(parse_key(spec), None, "spec {spec:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_uppercase_only_single_chars_that_are_not_keys() {
+        // Case-insensitivity lowercases first, so "A" is fine — but a
+        // genuinely non-key single char is not.
+        assert!(parse_key("A").is_some());
+        assert_eq!(parse_key("-"), None);
+        assert_eq!(parse_key("="), None);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_multiple_key_tokens() {
+        for spec in ["a+a", "alt+a+b", "return+return", "alt+space+space"] {
+            assert_eq!(parse_key(spec), None, "spec {spec:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_anything_after_the_key_token() {
+        for spec in ["return+alt", "alt+a+shift", "a+"] {
+            assert_eq!(parse_key(spec), None, "spec {spec:?}");
+        }
+    }
+
+    // ---- default_config -----------------------------------------------
+
+    #[test]
+    fn default_config_contains_exactly_the_dictated_bindings_in_order() {
+        let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
+        let alt_ctrl = Modifiers::ALT | Modifiers::CONTROL;
+        // Expected combos written out with literal keysyms (not via
+        // parse_key) so this test cannot be fooled by a parser bug.
+        let expected = vec![
+            (combo(0x74, Modifiers::SUPER), Action::Floating(None)),
+            (combo(0x6c, Modifiers::SUPER), Action::ToggleLayout),
+            (
+                combo(0x6c, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Layout(wm_core::LayoutMode::Freeform),
+            ),
+            (
+                combo(0xff51, Modifiers::SUPER | Modifiers::CONTROL),
+                Action::Focus(FocusDirection::Left),
+            ),
+            (
+                combo(0xff53, Modifiers::SUPER | Modifiers::CONTROL),
+                Action::Focus(FocusDirection::Right),
+            ),
+            (
+                combo(0xff52, Modifiers::SUPER | Modifiers::CONTROL),
+                Action::Focus(FocusDirection::Up),
+            ),
+            (
+                combo(0xff54, Modifiers::SUPER | Modifiers::CONTROL),
+                Action::Focus(FocusDirection::Down),
+            ),
+            (
+                combo(0xff51, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Move(FocusDirection::Left),
+            ),
+            (
+                combo(0xff53, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Move(FocusDirection::Right),
+            ),
+            (
+                combo(0xff52, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Move(FocusDirection::Up),
+            ),
+            (
+                combo(0xff54, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Move(FocusDirection::Down),
+            ),
+            (
+                combo(0x3d, Modifiers::SUPER),
+                Action::Resize(wm_core::Point::new(25, 0)),
+            ),
+            (
+                combo(0x2d, Modifiers::SUPER),
+                Action::Resize(wm_core::Point::new(-25, 0)),
+            ),
+            (
+                combo(0x3d, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Resize(wm_core::Point::new(0, 25)),
+            ),
+            (
+                combo(0x2d, Modifiers::SUPER | Modifiers::SHIFT),
+                Action::Resize(wm_core::Point::new(0, -25)),
+            ),
+            (combo(0xff0d, alt_shift), Action::SpawnTerminal),
+            (combo(0x20, Modifiers::SUPER), Action::Run("omarchy-menu".into())),
+            (combo(0x71, alt_shift), Action::Close),
+            (combo(0x78, alt_shift), Action::ToggleMaximize),
+            (combo(0x73, alt_shift), Action::ToggleShade),
+            (combo(0x6d, alt_shift), Action::Miniaturize),
+            (combo(0x66, alt_shift), Action::ToggleFullscreen),
+            (combo(0xff53, alt_ctrl), Action::WorkspaceNext),
+            (combo(0xff51, alt_ctrl), Action::WorkspacePrev),
+            (combo(0xff53, alt_shift), Action::WorkspaceCarryNext),
+            (combo(0xff51, alt_shift), Action::WorkspaceCarryPrev),
+            (combo(0xff52, Modifiers::SUPER), Action::Overview),
+            (combo(0x33, Modifiers::SUPER | Modifiers::SHIFT), Action::Capture(CaptureMode::Screen)),
+            (combo(0x34, Modifiers::SUPER | Modifiers::SHIFT), Action::Capture(CaptureMode::Area)),
+            (combo(0x35, Modifiers::SUPER | Modifiers::SHIFT), Action::Capture(CaptureMode::Toolbar)),
+            (combo(0xff1b, Modifiers::SUPER | Modifiers::CONTROL), Action::Capture(CaptureMode::Stop)),
+            (combo(0xff1b, Modifiers::CONTROL), Action::WindowMenu),
+        ];
+        let config = Config::default_config();
+        assert_eq!(config.keybindings, expected);
+        assert!(!config.focus_follows_mouse);
+        assert_eq!(config.scale, None);
+        assert_eq!(config.theme, None);
+        assert_eq!(config.placement, PlacementPolicy::Smart);
+        assert_eq!(config.edge_resistance, 10);
+        assert_eq!(config.terminal_font_px, 12.0);
+        assert_eq!(config.commands["omarchy-menu"], ["omarchy-menu", "toggle"]);
+        // The decoration policy ships no per-application list at all:
+        // the compositor concludes the negotiation for every client
+        // observed, and an entry here is a correction, not the
+        // mechanism.
+        assert_eq!(config.decorations, DecorationRules::default());
+        assert_eq!(
+            config
+                .decorations
+                .decision_for(Some("org.omarchy.terminal")),
+            None
+        );
+        assert_eq!(config.drag_modifier, Some(DEFAULT_DRAG_MODIFIER));
+    }
+
+    /// The gesture that makes an undecorated window usable at all, and
+    /// the one the old policy's comments claimed already existed.
+    #[test]
+    fn the_drag_modifier_is_configurable_and_can_be_turned_off() {
+        assert_eq!(
+            parse("drag_modifier = \"super\"\n").unwrap().drag_modifier,
+            Some(Modifiers::SUPER)
+        );
+        assert_eq!(
+            parse("drag_modifier = \"MOD1\"\n").unwrap().drag_modifier,
+            Some(Modifiers::ALT)
+        );
+        assert_eq!(
+            parse("drag_modifier = \"none\"\n").unwrap().drag_modifier,
+            None
+        );
+        // A typo keeps the default rather than silently disabling the
+        // only way to move a window that has no titlebar.
+        assert_eq!(
+            parse("drag_modifier = \"hyper\"\n").unwrap().drag_modifier,
+            Some(DEFAULT_DRAG_MODIFIER)
+        );
+    }
+
+    /// Both directions, matched as a case-insensitive prefix, with the
+    /// rescue direction winning a contradiction.
+    #[test]
+    fn decoration_rules_override_in_both_directions() {
+        let config = parse(
+            "[decorations]\nserver_side = [\"Alacritty\"]\nclient_side = [\"google-chrome\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.decorations.decision_for(Some("alacritty")),
+            Some(true)
+        );
+        assert_eq!(
+            config.decorations.decision_for(Some("google-chrome")),
+            Some(false)
+        );
+        // Prefix, so one entry covers a family's per-profile ids.
+        assert_eq!(
+            config.decorations.decision_for(Some("GOOGLE-CHROME-beta")),
+            Some(false)
+        );
+        // Unmatched clients are left to their own negotiation, which is
+        // the whole point: the lists are exceptions, not the policy.
+        assert_eq!(config.decorations.decision_for(Some("foot")), None);
+        assert_eq!(config.decorations.decision_for(None), None);
+    }
+
+    /// The one decoration setting that is not a list. Off unless it is
+    /// exactly a boolean: a typo read as "on" would put a second titlebar
+    /// on every header-bar application at once.
+    #[test]
+    fn frame_client_drawn_is_a_boolean_that_defaults_off() {
+        assert!(!parse("").unwrap().decorations.frame_client_drawn);
+        let on = parse("[decorations]\nframe_client_drawn = true\n").unwrap();
+        assert!(on.decorations.frame_client_drawn);
+        assert!(!on.decorations.is_empty(), "it counts as an override");
+        assert!(on.decorations.server_side.is_empty() && on.decorations.client_side.is_empty());
+        for rejected in ["\"true\"", "1", "\"yes\"", "[true]"] {
+            let config = parse(&format!("[decorations]\nframe_client_drawn = {rejected}\n")).unwrap();
+            assert!(!config.decorations.frame_client_drawn, "{rejected} is warned about and ignored");
+        }
+        // Beside the lists, in any order, without disturbing them.
+        let both = parse(
+            "[decorations]\nclient_side = [\"kiosk\"]\nframe_client_drawn = true\nserver_side = [\"bare\"]\n",
+        )
+        .unwrap();
+        assert!(both.decorations.frame_client_drawn);
+        assert_eq!(both.decorations.decision_for(Some("kiosk")), Some(false));
+        assert_eq!(both.decorations.decision_for(Some("bare-app")), Some(true));
+        // A reload is a fresh parse of the edited file: it has to read
+        // back the same way however many times it is flipped.
+        for expected in [false, true, false] {
+            let config = parse(&format!("[decorations]\nframe_client_drawn = {expected}\n")).unwrap();
+            assert_eq!(config.decorations.frame_client_drawn, expected);
+        }
+    }
+
+    #[test]
+    fn native_input_table_overrides_imported_pointer_defaults() {
+        let config = parse(
+            r#"
+[input]
+sensitivity = -0.35
+accel_profile = "FLAT"
+left_handed = true
+disable_while_typing = true
+
+[input.touchpad]
+natural_scroll = true
+tap_to_click = true
+disable_while_typing = false
+clickfinger_behavior = true
+scroll_factor = 0.4
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.input.sensitivity, Some(-0.35));
+        assert_eq!(config.input.accel_profile.as_deref(), Some("flat"));
+        assert_eq!(config.input.left_handed, Some(true));
+        assert_eq!(config.input.touchpad_natural_scroll, Some(true));
+        assert_eq!(config.input.natural_scroll, None, "a touchpad setting must not reach mice");
+        assert_eq!(config.input.tap_to_click, Some(true));
+        assert_eq!(config.input.disable_while_typing, Some(false));
+        assert_eq!(config.input.clickfinger_behavior, Some(true));
+        assert_eq!(config.input.touchpad_scroll_factor, Some(0.4));
+        assert_eq!(config.input.scroll_factor, None);
+        assert_eq!(
+            config.provenance.get("input").map(String::as_str),
+            Some("config file")
+        );
+    }
+
+    #[test]
+    fn native_input_tables_carry_num_lock_tapping_and_the_scroll_method_by_class() {
+        let config = parse(
+            r#"
+[input]
+numlock_by_default = true
+scroll_method = "on_button_down"
+scroll_button = 274
+middle_button_emulation = true
+
+[input.touchpad]
+scroll_method = "edge"
+middle_button_emulation = false
+tap_and_drag = false
+drag_lock = true
+tap_button_map = "lmr"
+drag_3fg = 1
+numlock_by_default = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.input.numlock_by_default, Some(true), "Num Lock is a keyboard setting, not a touchpad's");
+        assert_eq!(config.input.scroll_method, Some(wm_core::ScrollMethod::OnButtonDown));
+        assert_eq!(config.input.scroll_button, Some(274));
+        assert_eq!(config.input.middle_button_emulation, Some(true));
+        assert_eq!(config.input.touchpad_scroll_method, Some(wm_core::ScrollMethod::Edge));
+        assert_eq!(config.input.touchpad_scroll_button, None);
+        assert_eq!(config.input.touchpad_middle_button_emulation, Some(false));
+        assert_eq!(config.input.tap_and_drag, Some(false));
+        assert_eq!(config.input.drag_lock, Some(true));
+        assert_eq!(config.input.tap_button_map, Some(wm_core::TapButtonMap::LeftMiddleRight));
+        assert_eq!(config.input.drag_3fg, Some(wm_core::MultiFingerDrag::ThreeFingers));
+
+        let refused = parse(
+            "[input]\nscroll_method = \"sideways\"\nscroll_button = 301\ndrag_3fg = 3\ntap_button_map = 1\ndrag_lock = 2\n",
+        )
+        .unwrap();
+        assert_eq!(refused.input.scroll_method, None);
+        assert_eq!(refused.input.scroll_button, None);
+        assert_eq!(refused.input.drag_3fg, None);
+        assert_eq!(refused.input.tap_button_map, None);
+        assert_eq!(refused.input.drag_lock, None);
+    }
+
+    #[test]
+    fn mouse_and_touchpad_scroll_settings_stay_apart() {
+        let config = parse(
+            "[input]\nnatural_scroll = false\nscroll_factor = 2.0\n[input.touchpad]\nnatural_scroll = true\nscroll_factor = 0.4\n",
+        )
+        .unwrap();
+        assert_eq!(config.input.natural_scroll, Some(false));
+        assert_eq!(config.input.scroll_factor, Some(2.0));
+        assert_eq!(config.input.touchpad_natural_scroll, Some(true));
+        assert_eq!(config.input.touchpad_scroll_factor, Some(0.4));
+    }
+
+    #[test]
+    fn a_cursor_table_sets_when_the_pointer_hides_and_refuses_bad_values() {
+        let config = parse("[cursor]\nhide_on_key_press = true\nhide_on_touch = false\ninactive_timeout = 5\n").unwrap();
+        assert_eq!(
+            config.input.cursor,
+            wm_core::CursorBehaviour {
+                hide_on_key_press: Some(true),
+                hide_on_touch: Some(false),
+                inactive_timeout: Some(5.0),
+            }
+        );
+        let config = parse("[cursor]\nhide_on_key_press = 'yes'\ninactive_timeout = -1\n").unwrap();
+        assert_eq!(config.input.cursor, wm_core::CursorBehaviour::default());
+        let config = parse("[cursor]\ninactive_timeout = 0\n").unwrap();
+        assert_eq!(config.input.cursor.inactive_timeout, Some(0.0), "zero is a valid never");
+    }
+
+    #[test]
+    fn a_cursor_table_overrides_the_live_hyprland_reading() {
+        let live = || {
+            Some(hyprland::Reading {
+                input: InputConfig {
+                    cursor: wm_core::CursorBehaviour { hide_on_key_press: Some(true), ..Default::default() },
+                    ..InputConfig::default()
+                },
+                ..hyprland::Reading::default()
+            })
+        };
+        let text = "desktop = \"omarchy\"\n[cursor]\nhide_on_key_press = false\n";
+        let config = parse_with(text, &live).unwrap();
+        assert_eq!(config.input.cursor.hide_on_key_press, Some(false));
+    }
+
+    /// `config_name` is the parser's inverse, name for name, so a label
+    /// reported from it names exactly the action the binding runs.
+    #[test]
+    fn every_action_name_round_trips_through_config_name() {
+        for name in [
+            "application-next", "application-prev", "application-window-next", "application-window-prev",
+            "quit-application", "force-quit-applications", "application-overview", "hide-application",
+            "hide-other-applications", "miniaturize-application", "show-desktop", "spawn-terminal", "close",
+            "layout-freeform", "layout-mosaic", "layout-flow", "toggle-layout", "grow-width", "shrink-width",
+            "grow-height", "shrink-height", "layout-noop", "toggle-floating", "move-left", "move-right",
+            "move-up", "move-down", "toggle-maximize", "toggle-shade", "miniaturize", "toggle-fullscreen",
+            "focus-left", "focus-right", "focus-up", "focus-down", "workspace-next", "workspace-prev",
+            "workspace-carry-next", "workspace-carry-prev", "capture-screen-clipboard", "capture-area-clipboard",
+            "capture-window-clipboard", "capture-screen", "capture-area", "capture-window", "capture",
+            "capture-stop", "overview", "root-menu", "help", "window-menu", "reload", "restart", "toggle-opaque",
+            "workspace 4", "workspace-send 10", "workspace-carry 1", "global-shortcut org.example:toggle",
+            "run lock",
+        ] {
+            let action = action_from_name(name).unwrap_or_else(|| panic!("{name} parses"));
+            assert_eq!(action.config_name().as_deref(), Some(name), "{action:?}");
+        }
+        assert_eq!(Action::Resize(wm_core::Point::new(100, 0)).config_name(), None);
+        assert_eq!(Action::Floating(Some(true)).config_name(), None);
+    }
+
+    #[test]
+    fn typing_suppression_requires_a_boolean() {
+        for input in ["true", "false"] {
+            let config = parse(&format!("[input]\ndisable_while_typing = {input}")).unwrap();
+            assert_eq!(config.input.disable_while_typing, Some(input == "true"));
+        }
+        let config = parse("[input.touchpad]\ndisable_while_typing = 'false'").unwrap();
+        assert_eq!(config.input.disable_while_typing, None);
+    }
+
+    #[test]
+    fn native_desktop_gestures_validate_and_keep_independent_scroll_settings() {
+        let config = parse("[input.gestures]\nenabled = false\nfingers = 4\ndistance = 125\n[input.touchpad]\nnatural_scroll = false\n").unwrap();
+        assert_eq!(
+            config.input.gestures,
+            wm_core::GestureConfig {
+                enabled: false,
+                fingers: 4,
+                distance: 125.0
+            }
+        );
+        assert_eq!(config.input.touchpad_natural_scroll, Some(false));
+        for value in [
+            "distance = nan",
+            "distance = inf",
+            "distance = -1",
+            "distance = 0",
+            "distance = 1001",
+            "fingers = 2",
+            "enabled = 1",
+        ] {
+            let config = parse(&format!("[input.gestures]\n{value}\n")).unwrap();
+            assert_eq!(config.input.gestures, wm_core::GestureConfig::default());
+        }
+    }
+
+    #[test]
+    fn the_motion_table_is_read_key_by_key_and_its_speed_is_clamped() {
+        let config = parse("[motion]\nenabled = false\nlayout = false\noverview = false\ngesture_settle = false\nspeed = 2.5\n").unwrap();
+        assert_eq!(
+            config.motion,
+            wm_core::MotionPolicy { enabled: false, layout: false, overview: false, gesture_settle: false, speed: 2.5 }
+        );
+        assert_eq!(config.provenance.get("motion").map(String::as_str), Some("config file"));
+        assert_eq!(parse("").unwrap().motion, wm_core::MotionPolicy::default());
+        assert_eq!(parse("").unwrap().provenance.get("motion").map(String::as_str), Some("built-in"));
+        // One bad line keeps its own inherited value and nothing else's.
+        let config = parse("[motion]\nlayout = false\nenabled = 0\nspeed = 'fast'\n").unwrap();
+        assert_eq!(config.motion, wm_core::MotionPolicy { layout: false, ..Default::default() });
+        for value in ["speed = nan", "speed = inf", "speed = -1", "speed = 0", "speed = 0.2", "speed = 4.5", "speed = 1e300"] {
+            let config = parse(&format!("[motion]\n{value}\n")).unwrap();
+            assert_eq!(config.motion.speed, 1.0, "{value}");
+        }
+        assert_eq!(parse("[motion]\nspeed = 4\n").unwrap().motion.speed, 4.0);
+        assert_eq!(parse("motion = 'off'\n").unwrap().motion, wm_core::MotionPolicy::default());
+    }
+
+    #[test]
+    fn a_client_in_both_lists_keeps_its_chrome() {
+        let rules = DecorationRules {
+            server_side: vec!["contested".to_string()],
+            client_side: vec!["contested".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            rules.decision_for(Some("contested")),
+            Some(true),
+            "the usable window wins the tie"
+        );
+    }
+
+    /// An existing config file must not lose the override it was
+    /// written for just because the key was renamed.
+    #[test]
+    fn the_old_one_directional_key_still_reads_as_client_side() {
+        let config = parse("self_decorating_apps = [\"zenity\"]\n").unwrap();
+        assert_eq!(config.decorations.client_side, vec!["zenity".to_string()]);
+        assert!(config.decorations.server_side.is_empty());
+    }
+
+    /// An empty entry must never become a prefix that matches every
+    /// window on the desk.
+    #[test]
+    fn an_empty_entry_matches_nothing() {
+        let rules = DecorationRules {
+            server_side: vec![String::new()],
+            client_side: Vec::new(),
+            ..Default::default()
+        };
+        assert_eq!(rules.decision_for(Some("anything")), None);
+    }
+
+    // ---- parse: whole-file behavior -----------------------------------
+
+    #[test]
+    fn empty_text_yields_the_defaults() {
+        let config = parse("").expect("empty text is valid TOML");
+        let defaults = Config::default_config();
+        assert_eq!(config.focus_follows_mouse, defaults.focus_follows_mouse);
+        assert_eq!(config.scale, defaults.scale);
+        assert_eq!(config.theme, defaults.theme);
+        assert_eq!(config.placement, defaults.placement);
+        assert_eq!(config.edge_resistance, defaults.edge_resistance);
+        assert_eq!(config.keybindings, defaults.keybindings);
+    }
+
+    #[test]
+    fn minimized_windows_have_visible_restore_tiles_unless_explicitly_disabled() {
+        for config in ["", "desktop = 'omarchy'", "theme = 'washi'", "interaction_mode = 'mac'"] {
+            assert!(parse(config).unwrap().minimized_previews, "{config}");
+        }
+        assert!(!parse("minimized_previews = false").unwrap().minimized_previews);
+    }
+
+    #[test]
+    fn autoraise_defaults_on_and_can_be_turned_off() {
+        // Every earlier release behaved as `true`, so the default is
+        // what keeps a session that sets nothing bit-identical.
+        assert!(parse("").unwrap().autoraise);
+        assert!(!parse("autoraise = false").unwrap().autoraise);
+        assert!(parse("autoraise = true").unwrap().autoraise);
+        // Wrong type keeps the default rather than breaking startup,
+        // the same contract `focus_follows_mouse` has.
+        assert!(parse("autoraise = \"no\"").unwrap().autoraise);
+    }
+
+    /// The inhibit policy: granted by default with a way back on the
+    /// keyboard, each half independently settable, and a spec that
+    /// does not parse keeps the default rather than unbinding the one
+    /// chord that works while every other is inhibited.
+    #[test]
+    fn shortcut_inhibit_policy_defaults_and_overrides() {
+        let config = parse("").unwrap();
+        assert!(config.allow_shortcut_inhibit);
+        assert_eq!(config.shortcuts_inhibit_escape, parse_key(DEFAULT_SHORTCUTS_INHIBIT_ESCAPE));
+        assert!(config.shortcuts_inhibit_escape.is_some(), "the default escape chord must parse");
+
+        assert!(!parse("allow_shortcut_inhibit = false").unwrap().allow_shortcut_inhibit);
+        assert!(parse("allow_shortcut_inhibit = \"no\"").unwrap().allow_shortcut_inhibit, "wrong type keeps the default");
+
+        let rebound = parse("shortcuts_inhibit_escape = \"super+alt+backspace\"").unwrap();
+        assert_eq!(rebound.shortcuts_inhibit_escape, parse_key("super+alt+backspace"));
+        assert_eq!(rebound.provenance.get("shortcuts_inhibit_escape").map(String::as_str), Some("config file"));
+        assert_eq!(parse("shortcuts_inhibit_escape = \"none\"").unwrap().shortcuts_inhibit_escape, None);
+        assert_eq!(parse("shortcuts_inhibit_escape = \"NONE\"").unwrap().shortcuts_inhibit_escape, None);
+        let typo = parse("shortcuts_inhibit_escape = \"super+nosuchkey\"").unwrap();
+        assert_eq!(typo.shortcuts_inhibit_escape, parse_key(DEFAULT_SHORTCUTS_INHIBIT_ESCAPE));
+        assert_eq!(typo.provenance.get("shortcuts_inhibit_escape").map(String::as_str), Some("built-in"));
+        assert_eq!(parse("shortcuts_inhibit_escape = 7").unwrap().shortcuts_inhibit_escape, parse_key(DEFAULT_SHORTCUTS_INHIBIT_ESCAPE));
+
+        let report = effective_config_report(&parse("allow_shortcut_inhibit = false").unwrap());
+        assert!(report.contains("allow_shortcut_inhibit = false\t# config file"), "{report}");
+        assert!(report.contains("shortcuts_inhibit_escape = Some("), "{report}");
+    }
+
+    #[test]
+    fn invalid_toml_is_a_hard_error_with_a_message() {
+        let err = parse("this = = is not toml").unwrap_err();
+        assert!(err.contains("invalid TOML"), "message was: {err}");
+        assert!(parse("[keybindings").is_err());
+    }
+
+    #[test]
+    fn realistic_full_config_round_trips() {
+        let text = r#"
+            focus_follows_mouse = true
+            scale = 1.5
+            theme = "nextstep-classic"
+            placement = "cascade"
+            edge_resistance = 4
+
+            [keybindings]
+            "alt+shift+return" = "spawn-terminal"
+            "super+t" = "spawn-terminal"
+            "alt+shift+q" = "none"
+            "alt+ctrl+right" = "workspace-next"
+            "super+f11" = "toggle-fullscreen"
+        "#;
+        let config = parse(text).unwrap();
+        assert!(config.focus_follows_mouse);
+        assert_eq!(config.scale, Some(1.5));
+        assert_eq!(config.theme.as_deref(), Some("nextstep-classic"));
+        assert_eq!(config.placement, PlacementPolicy::Cascade);
+        assert_eq!(config.edge_resistance, 4);
+        // Restating a default is harmless; a new binding is added; the
+        // unbound default is gone; everything unlisted survives.
+        assert_eq!(
+            action_for(&config, "alt+shift+return"),
+            Some(Action::SpawnTerminal)
+        );
+        assert_eq!(action_for(&config, "super+t"), Some(Action::SpawnTerminal));
+        assert_eq!(action_for(&config, "alt+shift+q"), None);
+        assert_eq!(
+            action_for(&config, "alt+ctrl+right"),
+            Some(Action::WorkspaceNext)
+        );
+        assert_eq!(
+            action_for(&config, "super+f11"),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            action_for(&config, "alt+shift+x"),
+            Some(Action::ToggleMaximize)
+        );
+        assert_eq!(
+            action_for(&config, "alt+shift+left"),
+            Some(Action::WorkspaceCarryPrev)
+        );
+        assert_eq!(
+            config.keybindings.len(),
+            Config::default_config().keybindings.len()
+        );
+    }
+
+    /// The one conversion between the two workspace vocabularies, in
+    /// both directions and at both ends of the range. The file counts
+    /// from 1 (as Omarchy, Hyprland and the window menu's `Move To`
+    /// submenu do) and the window manager counts from 0, and if these
+    /// ever meet anywhere but here the desk goes to the wrong
+    /// workspace on every press.
+    #[test]
+    fn a_workspace_binding_counts_from_one_and_arrives_counting_from_zero() {
+        let config = parse(
+            r#"
+            [keybindings]
+            "super+1" = "workspace 1"
+            "super+9" = "workspace 9"
+            "super+0" = "workspace 10"
+            "super+shift+1" = "workspace-carry 1"
+            "super+shift+9" = "workspace-carry 9"
+            "super+shift+alt+9" = "workspace-send 9"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            action_for(&config, "super+1"),
+            Some(Action::Workspace(0)),
+            "the first workspace is index 0"
+        );
+        assert_eq!(action_for(&config, "super+9"), Some(Action::Workspace(8)));
+        assert_eq!(
+            action_for(&config, "super+0"),
+            Some(Action::Workspace(9)),
+            "Omarchy's tenth, on the zero key"
+        );
+        assert_eq!(
+            action_for(&config, "super+shift+1"),
+            Some(Action::WorkspaceCarry(0))
+        );
+        assert_eq!(
+            action_for(&config, "super+shift+9"),
+            Some(Action::WorkspaceCarry(8))
+        );
+        assert_eq!(
+            action_for(&config, "super+shift+alt+9"),
+            Some(Action::WorkspaceSend(8))
+        );
+    }
+
+    /// The argument is read the way every other name in this file is:
+    /// case-insensitively, with the ends trimmed. `workspace-next` and
+    /// `workspace-carry-next` are still their own literal names and
+    /// must not be swallowed by the parameterised arm.
+    #[test]
+    fn a_workspace_number_is_read_like_every_other_name_in_the_file() {
+        let config = parse(
+            r#"
+            [keybindings]
+            "super+a" = "WORKSPACE 3"
+            "super+b" = "  workspace   3  "
+            "super+c" = "Workspace-Carry 3"
+            "super+d" = "workspace-next"
+            "super+e" = "workspace-carry-next"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(action_for(&config, "super+a"), Some(Action::Workspace(2)));
+        assert_eq!(action_for(&config, "super+b"), Some(Action::Workspace(2)));
+        assert_eq!(
+            action_for(&config, "super+c"),
+            Some(Action::WorkspaceCarry(2))
+        );
+        assert_eq!(
+            action_for(&config, "super+d"),
+            Some(Action::WorkspaceNext),
+            "the relative verbs keep their names"
+        );
+        assert_eq!(
+            action_for(&config, "super+e"),
+            Some(Action::WorkspaceCarryNext)
+        );
+    }
+
+    /// A number this file cannot honour is dropped with the same
+    /// warning any unknown action gets — never clamped, and never
+    /// quietly read as workspace 1. Clamping `workspace 0` to the
+    /// first workspace would hide an off-by-one in a generated file
+    /// for as long as the file existed.
+    #[test]
+    fn a_workspace_number_that_is_not_one_is_skipped_rather_than_clamped() {
+        for bad in [
+            "workspace 0",
+            "workspace -1",
+            "workspace 100",
+            "workspace",
+            "workspace x",
+            "workspace 3 4",
+            "workspace-carry 0",
+            "workspace-carry 100",
+        ] {
+            let text = format!("[keybindings]\n\"super+a\" = \"{bad}\"\n");
+            let config = parse(&text).unwrap();
+            assert_eq!(
+                action_for(&config, "super+a"),
+                None,
+                "{bad:?} must not bind"
+            );
+        }
+        // ...and, exactly like an unknown action name, a bad number
+        // leaves any existing binding for that combo alone rather than
+        // unbinding it. `"none"` is the way to unbind, and only that.
+        let config = parse("[keybindings]\n\"alt+ctrl+right\" = \"workspace 0\"").unwrap();
+        assert_eq!(
+            action_for(&config, "alt+ctrl+right"),
+            Some(Action::WorkspaceNext),
+            "a rejected entry must not cost the user the default binding for that combo"
+        );
+    }
+
+    /// The ceiling is a real ceiling and the number just under it is
+    /// really accepted — an off-by-one here is a binding that works
+    /// everywhere except the last workspace.
+    #[test]
+    fn the_workspace_ceiling_is_inclusive() {
+        let text = format!("[keybindings]\n\"super+a\" = \"workspace {MAX_WORKSPACE}\"\n");
+        let config = parse(&text).unwrap();
+        assert_eq!(
+            action_for(&config, "super+a"),
+            Some(Action::Workspace(MAX_WORKSPACE - 1))
+        );
+        assert_eq!(workspace_index("1"), Some(0));
+        assert_eq!(
+            workspace_index(&MAX_WORKSPACE.to_string()),
+            Some(MAX_WORKSPACE - 1)
+        );
+        assert_eq!(workspace_index(&(MAX_WORKSPACE + 1).to_string()), None);
+    }
+
+    /// The verbs Omarchy's monitor and workspace chords land on, by the
+    /// names `[keybindings]` spells them, round-tripping through
+    /// `config_name`. An output name keeps its case: `eDP-1` is not
+    /// `edp-1` to the compositor.
+    #[test]
+    fn monitor_and_occupied_workspace_verbs_parse_and_name_themselves() {
+        use wm_core::OutputTarget;
+        let names: &[(&str, Action)] = &[
+            ("workspace-next-occupied", Action::WorkspaceNextOccupied),
+            ("workspace-prev-occupied", Action::WorkspacePrevOccupied),
+            ("workspace-previous", Action::WorkspacePrevious),
+            ("focus-monitor +1", Action::FocusMonitor(OutputTarget::Relative(1))),
+            ("focus-monitor -1", Action::FocusMonitor(OutputTarget::Relative(-1))),
+            ("focus-monitor left", Action::FocusMonitor(OutputTarget::Direction(FocusDirection::Left))),
+            ("focus-monitor eDP-1", Action::FocusMonitor(OutputTarget::Name("eDP-1".into()))),
+            ("move-workspace-to-monitor right", Action::MoveWorkspaceToMonitor(OutputTarget::Direction(FocusDirection::Right))),
+            ("move-workspace-to-monitor up", Action::MoveWorkspaceToMonitor(OutputTarget::Direction(FocusDirection::Up))),
+            ("move-workspace-to-monitor down", Action::MoveWorkspaceToMonitor(OutputTarget::Direction(FocusDirection::Down))),
+            ("move-workspace-to-monitor HDMI-A-1", Action::MoveWorkspaceToMonitor(OutputTarget::Name("HDMI-A-1".into()))),
+        ];
+        let spec_for = |n: usize| format!("super+{}", (b'a' + n as u8) as char);
+        let mut text = String::from("[keybindings]\n");
+        for (n, (name, _)) in names.iter().enumerate() {
+            text.push_str(&format!("\"{}\" = \"{}\"\n", spec_for(n), name));
+        }
+        let config = parse(&text).unwrap();
+        for (n, (name, action)) in names.iter().enumerate() {
+            assert_eq!(action_for(&config, &spec_for(n)).as_ref(), Some(action), "{name}");
+            assert_eq!(action.config_name().as_deref(), Some(*name), "{name} names itself");
+        }
+        for bad in ["focus-monitor", "focus-monitor +", "focus-monitor +999", "move-workspace-to-monitor", "focus-monitor a\tb"] {
+            let config = parse(&format!("[keybindings]\n\"super+a\" = \"{bad}\"")).unwrap();
+            assert_eq!(action_for(&config, "super+a"), None, "{bad:?} must not bind");
+        }
+    }
+
+    #[test]
+    fn every_action_name_maps_to_its_variant() {
+        let names: &[(&str, Action)] = &[
+            ("spawn-terminal", Action::SpawnTerminal),
+            ("close", Action::Close),
+            ("toggle-maximize", Action::ToggleMaximize),
+            ("toggle-shade", Action::ToggleShade),
+            ("miniaturize", Action::Miniaturize),
+            ("toggle-fullscreen", Action::ToggleFullscreen),
+            (
+                "toggle-tiled-fullscreen",
+                Action::FullscreenState {
+                    internal: wm_core::FullscreenMode::None,
+                    client: wm_core::FullscreenMode::Fullscreen,
+                },
+            ),
+            ("focus-left", Action::Focus(FocusDirection::Left)),
+            ("focus-right", Action::Focus(FocusDirection::Right)),
+            ("focus-up", Action::Focus(FocusDirection::Up)),
+            ("focus-down", Action::Focus(FocusDirection::Down)),
+            ("workspace-next", Action::WorkspaceNext),
+            ("workspace-prev", Action::WorkspacePrev),
+            ("workspace-carry-next", Action::WorkspaceCarryNext),
+            ("workspace-carry-prev", Action::WorkspaceCarryPrev),
+            // The parameterised actions, one number each: the argument is
+            // covered exhaustively below, this pins the names.
+            ("workspace 4", Action::Workspace(3)),
+            ("workspace-send 4", Action::WorkspaceSend(3)),
+            ("workspace-carry 4", Action::WorkspaceCarry(3)),
+            ("overview", Action::Overview),
+            ("root-menu", Action::RootMenu),
+            ("window-menu", Action::WindowMenu),
+            (
+                "global-shortcut org.example.App:mute",
+                Action::GlobalShortcut("org.example.App:mute".into()),
+            ),
+            ("reload", Action::Reload),
+            ("restart", Action::Restart),
+        ];
+        // One letter per action rather than one function key: the list
+        // outgrew F12 when the window-menu verb was added, and a test
+        // that silently stops covering the tail is worse than useless.
+        let spec_for = |n: usize| format!("super+{}", (b'a' + n as u8) as char);
+        assert!(names.len() <= 26, "one binding per letter");
+        let mut text = String::from("[keybindings]\n");
+        for (n, (name, _)) in names.iter().enumerate() {
+            text.push_str(&format!("\"{}\" = \"{}\"\n", spec_for(n), name));
+        }
+        let config = parse(&text).unwrap();
+        for (n, (name, action)) in names.iter().enumerate() {
+            assert_eq!(
+                action_for(&config, &spec_for(n)).as_ref(),
+                Some(action),
+                "action {name:?}"
+            );
+        }
+    }
+
+    /// The special-workspace verbs carry a name, bounded by the core's
+    /// own rule, and a bare toggle means the default special.
+    #[test]
+    fn special_workspace_action_names_carry_their_name() {
+        let text = "[keybindings]\n\"super+a\" = \"toggle-special scratchpad\"\n\"super+b\" = \"special-send scratchpad\"\n\"super+c\" = \"special-carry notes\"\n\"super+d\" = \"toggle-special\"\n\"super+e\" = \"toggle-special special:magic\"\n";
+        let config = parse(text).unwrap();
+        assert_eq!(action_for(&config, "super+a"), Some(Action::ToggleSpecial("scratchpad".into())));
+        assert_eq!(
+            action_for(&config, "super+b"),
+            Some(Action::SendToSpecial { name: "scratchpad".into(), follow: false })
+        );
+        assert_eq!(action_for(&config, "super+c"), Some(Action::SendToSpecial { name: "notes".into(), follow: true }));
+        assert_eq!(action_for(&config, "super+d"), Some(Action::ToggleSpecial(wm_core::DEFAULT_SPECIAL_NAME.into())));
+        assert_eq!(action_for(&config, "super+e"), Some(Action::ToggleSpecial("magic".into())));
+        for (name, action) in [
+            ("toggle-special scratchpad", Action::ToggleSpecial("scratchpad".into())),
+            ("special-send scratchpad", Action::SendToSpecial { name: "scratchpad".into(), follow: false }),
+            ("special-carry scratchpad", Action::SendToSpecial { name: "scratchpad".into(), follow: true }),
+        ] {
+            assert_eq!(action.config_name().as_deref(), Some(name), "{name} round-trips");
+        }
+        let overlong = format!("[keybindings]\n\"super+a\" = \"toggle-special {}\"\n", "n".repeat(wm_core::MAX_SPECIAL_NAME + 1));
+        assert_eq!(action_for(&parse(&overlong).unwrap(), "super+a"), None, "an overlong name is dropped like an unknown verb");
+    }
+
+    #[test]
+    fn action_names_are_case_insensitive() {
+        let text = "[keybindings]\n\"super+a\" = \"CLOSE\"\n\"super+b\" = \"Spawn-Terminal\"\n";
+        let config = parse(text).unwrap();
+        assert_eq!(action_for(&config, "super+a"), Some(Action::Close));
+        assert_eq!(action_for(&config, "super+b"), Some(Action::SpawnTerminal));
+    }
+
+    #[test]
+    fn inspection_retains_hyprland_refusals_and_reports_provenance() {
+        let config = parse_with(
+            "hyprland_config = true\nfocus_follows_mouse = true\n",
+            &|| {
+                let mut reading = hyprland::Reading::default();
+                reading.skipped.push(hyprland::Skipped {
+                    kind: "bind".into(),
+                    what: "SUPER J".into(),
+                    why: "tiling-only".into(),
+                });
+                Some(reading)
+            },
+        )
+        .unwrap();
+        assert_eq!(config.diagnostics, vec!["bind: SUPER J — tiling-only"]);
+        let report = effective_config_report(&config);
+        assert!(report.contains("focus_follows_mouse = true\t# config file"));
+        assert!(report.contains(&format!(
+            "keybindings = {}\t# live Hyprland config",
+            Config::default_config().keybindings.len()
+        )));
+    }
+
+    #[test]
+    fn inspection_rejects_fatally_invalid_toml_with_the_path() {
+        let path = std::env::temp_dir().join(format!(
+            "chonkstep-config-{}-invalid.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[broken").unwrap();
+        let error = inspect(Some(&path)).unwrap_err();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("invalid TOML"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- parse: merge semantics ---------------------------------------
+
+    #[test]
+    fn user_entry_overrides_only_that_combo() {
+        let config = parse("[keybindings]\n\"alt+shift+x\" = \"close\"\n").unwrap();
+        assert_eq!(action_for(&config, "alt+shift+x"), Some(Action::Close));
+        // Every other default is untouched, and no entry was duplicated.
+        assert_eq!(action_for(&config, "alt+shift+q"), Some(Action::Close));
+        assert_eq!(config.keybindings.len(), Config::default_config().keybindings.len());
+    }
+
+    #[test]
+    fn none_unbinds_a_default() {
+        let config = parse("[keybindings]\n\"alt+shift+q\" = \"none\"\n").unwrap();
+        assert_eq!(action_for(&config, "alt+shift+q"), None);
+        assert_eq!(config.keybindings.len(), Config::default_config().keybindings.len() - 1);
+        assert!(!config.keybindings.iter().any(|(_, a)| *a == Action::Close));
+    }
+
+    #[test]
+    fn none_spelled_differently_still_unbinds() {
+        // The combo is matched semantically, not textually: unbinding
+        // through an alias/case variant of the default's spelling works.
+        let config = parse("[keybindings]\n\"ALT+CONTROL+RIGHT\" = \"None\"\n").unwrap();
+        assert_eq!(action_for(&config, "alt+ctrl+right"), None);
+        assert_eq!(config.keybindings.len(), Config::default_config().keybindings.len() - 1);
+    }
+
+    #[test]
+    fn none_on_an_unbound_combo_is_a_harmless_noop() {
+        let config = parse("[keybindings]\n\"super+z\" = \"none\"\n").unwrap();
+        assert_eq!(config.keybindings, Config::default_config().keybindings);
+    }
+
+    #[test]
+    fn last_occurrence_of_a_combo_in_the_file_wins() {
+        // TOML forbids literally identical duplicate keys, but the same
+        // combo can appear under different spellings; document order
+        // decides.
+        let unbind_then_bind = "[keybindings]\n\
+            \"alt+ctrl+right\" = \"none\"\n\
+            \"alt+control+right\" = \"spawn-terminal\"\n";
+        let config = parse(unbind_then_bind).unwrap();
+        assert_eq!(
+            action_for(&config, "alt+ctrl+right"),
+            Some(Action::SpawnTerminal)
+        );
+
+        let bind_then_unbind = "[keybindings]\n\
+            \"alt+control+right\" = \"spawn-terminal\"\n\
+            \"ALT+CTRL+RIGHT\" = \"none\"\n";
+        let config = parse(bind_then_unbind).unwrap();
+        assert_eq!(action_for(&config, "alt+ctrl+right"), None);
+    }
+
+    #[test]
+    fn merged_bindings_keep_one_entry_per_combo() {
+        let text = "[keybindings]\n\
+            \"alt+shift+q\" = \"restart\"\n\
+            \"ALT+SHIFT+Q\" = \"miniaturize\"\n";
+        let config = parse(text).unwrap();
+        let q = parse_key("alt+shift+q").unwrap();
+        let entries: Vec<_> = config.keybindings.iter().filter(|(c, _)| *c == q).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, Action::Miniaturize);
+    }
+
+    // ---- parse: per-entry graceful degradation ------------------------
+
+    #[test]
+    fn one_bad_entry_does_not_discard_the_good_ones() {
+        let text = r#"
+            [keybindings]
+            "alt+shift+banana" = "close"
+            "super+t" = "spawn-terminal"
+            "super+u" = "launch-missiles"
+            "super+v" = 17
+            "alt+shift+q" = "none"
+        "#;
+        let config = parse(text).unwrap();
+        // The good entries applied...
+        assert_eq!(action_for(&config, "super+t"), Some(Action::SpawnTerminal));
+        assert_eq!(action_for(&config, "alt+shift+q"), None);
+        // ...the bad ones were skipped without binding anything...
+        assert_eq!(action_for(&config, "super+u"), None);
+        assert_eq!(action_for(&config, "super+v"), None);
+        // ...and the untouched defaults survived: one removed, one added.
+        assert_eq!(
+            config.keybindings.len(),
+            Config::default_config().keybindings.len() - 1
+        );
+        assert_eq!(
+            action_for(&config, "alt+shift+x"),
+            Some(Action::ToggleMaximize)
+        );
+    }
+
+    #[test]
+    fn unknown_action_name_keeps_that_combos_default() {
+        // A typo'd action on a default combo must not unbind the default.
+        let config = parse("[keybindings]\n\"alt+shift+q\" = \"cloes\"\n").unwrap();
+        assert_eq!(action_for(&config, "alt+shift+q"), Some(Action::Close));
+    }
+
+    #[test]
+    fn wrongly_typed_top_level_fields_keep_their_defaults() {
+        let text = r#"
+            focus_follows_mouse = "yes"
+            scale = "big"
+            theme = 3
+            placement = 7
+            edge_resistance = "sticky"
+        "#;
+        let config = parse(text).unwrap();
+        assert!(!config.focus_follows_mouse);
+        assert_eq!(config.scale, None);
+        assert_eq!(config.theme, None);
+        assert_eq!(config.placement, PlacementPolicy::Smart);
+        assert_eq!(config.edge_resistance, 10);
+        assert_eq!(config.keybindings.len(), Config::default_config().keybindings.len());
+    }
+
+    #[test]
+    fn nonsensical_scale_values_are_ignored() {
+        for text in ["scale = 0.0", "scale = -1.5", "scale = -2", "scale = nan"] {
+            let config = parse(text).unwrap();
+            assert_eq!(config.scale, None, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn integer_scale_is_accepted() {
+        assert_eq!(parse("scale = 2").unwrap().scale, Some(2.0));
+    }
+
+    // ---- parse: placement ---------------------------------------------
+
+    #[test]
+    fn every_placement_name_maps_to_its_policy() {
+        let cases: &[(&str, PlacementPolicy)] = &[
+            ("smart", PlacementPolicy::Smart),
+            ("cascade", PlacementPolicy::Cascade),
+            ("center", PlacementPolicy::Center),
+        ];
+        for (name, policy) in cases {
+            let config = parse(&format!("placement = \"{name}\"")).unwrap();
+            assert_eq!(config.placement, *policy, "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn placement_is_case_insensitive_and_trimmed() {
+        for text in [
+            "placement = \"Cascade\"",
+            "placement = \"CASCADE\"",
+            "placement = \"cAsCaDe\"",
+            "placement = \" cascade \"",
+        ] {
+            let config = parse(text).unwrap();
+            assert_eq!(config.placement, PlacementPolicy::Cascade, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_wrongly_typed_placement_keeps_the_default() {
+        for text in [
+            // Unknown names: no prefix matching, no guessing.
+            "placement = \"random\"",
+            "placement = \"smartest\"",
+            "placement = \"\"",
+            // Wrong types entirely.
+            "placement = 3",
+            "placement = true",
+            "placement = [\"smart\"]",
+        ] {
+            let config = parse(text).unwrap();
+            assert_eq!(config.placement, PlacementPolicy::Smart, "text {text:?}");
+        }
+    }
+
+    // ---- parse: edge_resistance ---------------------------------------
+
+    #[test]
+    fn edge_resistance_accepts_any_non_negative_integer() {
+        let cases: &[(&str, u32)] = &[
+            // Zero is valid, not a degenerate case: it is the documented
+            // way to turn move-drag edge snapping off.
+            ("edge_resistance = 0", 0),
+            ("edge_resistance = 1", 1),
+            ("edge_resistance = 32", 32),
+            ("edge_resistance = 4294967295", u32::MAX),
+        ];
+        for (text, expected) in cases {
+            let config = parse(text).unwrap();
+            assert_eq!(config.edge_resistance, *expected, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_edge_resistance_keeps_the_default() {
+        for text in [
+            "edge_resistance = -1",
+            "edge_resistance = -10",
+            // One past u32::MAX: out of range, not silently clamped.
+            "edge_resistance = 4294967296",
+            // Fractional pixels are a unit misunderstanding, and even a
+            // whole-valued float is the wrong type — rejecting both
+            // keeps "integer" an honest description of the setting.
+            "edge_resistance = 1.5",
+            "edge_resistance = 10.0",
+            "edge_resistance = \"10\"",
+            "edge_resistance = true",
+        ] {
+            let config = parse(text).unwrap();
+            assert_eq!(config.edge_resistance, 10, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn bad_placement_and_edge_resistance_do_not_cost_the_rest_of_the_file() {
+        // Both new settings bad, everything else good: the per-entry
+        // fallback must be surgical, exactly like [keybindings]'.
+        let text = r#"
+            placement = "diagonal"
+            edge_resistance = -3
+            focus_follows_mouse = true
+            theme = "graphite"
+
+            [keybindings]
+            "super+t" = "spawn-terminal"
+        "#;
+        let config = parse(text).unwrap();
+        assert_eq!(config.placement, PlacementPolicy::Smart);
+        assert_eq!(config.edge_resistance, 10);
+        assert!(config.focus_follows_mouse);
+        assert_eq!(config.theme.as_deref(), Some("graphite"));
+        assert_eq!(action_for(&config, "super+t"), Some(Action::SpawnTerminal));
+    }
+
+    #[test]
+    fn keybindings_of_the_wrong_type_keeps_the_defaults() {
+        let config = parse("keybindings = \"oops\"").unwrap();
+        assert_eq!(config.keybindings, Config::default_config().keybindings);
+    }
+
+    #[test]
+    fn unknown_top_level_keys_are_ignored_not_fatal() {
+        let text = "focus_follow_mouse = true\ntheme = \"nextstep-classic\"\n";
+        let config = parse(text).unwrap();
+        // The typo'd key changed nothing; the valid key still applied.
+        assert!(!config.focus_follows_mouse);
+        assert_eq!(config.theme.as_deref(), Some("nextstep-classic"));
+    }
+
+    #[test]
+    fn overview_defaults_to_classic_independently_of_theme_and_keyboard() {
+        for theme in ["obsidian", "washi", "relay", "omarchy", "nextstep-classic"] {
+            for mode in ["desktop", "spaces", "mac"] {
+                let config = parse(&format!("theme = {theme:?}\ninteraction_mode = {mode:?}")).unwrap();
+                assert_eq!(config.overview_style, OverviewStyle::Classic);
+                assert_eq!(config.provenance["overview_style"], "built-in");
+            }
+        }
+        let config = parse("overview_style = 'cards'").unwrap();
+        assert_eq!(config.overview_style, OverviewStyle::Cards);
+        assert!(effective_config_report(&config).contains("overview_style = \"cards\""));
+        assert_eq!(config.provenance["overview_style"], "config file");
+        for value in ["'typo'", "true", "42"] {
+            let config = parse(&format!("overview_style = {value}\nscale = 1.5")).unwrap();
+            assert_eq!(config.overview_style, OverviewStyle::Classic);
+            assert_eq!(config.scale, Some(1.5));
+            assert_eq!(config.provenance["overview_style"], "built-in");
+            assert!(config.diagnostics.iter().any(|d| d.contains("overview_style")));
+        }
+    }
+
+    #[test]
+    fn decoration_style_is_config_only_defaults_and_reports_its_effective_value() {
+        use wm_theme_api::DecorationStyle;
+        for text in ["", "theme = \"omarchy\""] {
+            assert_eq!(parse(text).unwrap().decoration_style, DecorationStyle::Auto);
+        }
+        for style in [DecorationStyle::WindowMaker, DecorationStyle::System7, DecorationStyle::BeOS, DecorationStyle::OS2Warp] {
+            let config = parse(&format!("decoration_style = {:?}", style.name())).unwrap();
+            assert_eq!(config.decoration_style, style);
+            assert!(config.diagnostics.is_empty());
+            assert!(effective_config_report(&config).contains(
+                &format!("decoration_style = {:?}", style.name())));
+            assert_ne!(config.provenance["decoration_style"], "default");
+        }
+    }
+
+    #[test]
+    fn invalid_decoration_style_warns_without_discarding_any_other_setting() {
+        use wm_theme_api::DecorationStyle;
+        for value in ["42", "true", "[]", "{}", "\"typo\"", "\"\"", "\"System7\""] {
+            let config = parse(&format!(
+                "decoration_style = {value}\nfocus_follows_mouse = true\ntheme = \"omarchy\"\n[keybindings]\n\"super+t\" = \"spawn-terminal\""
+            )).unwrap();
+            assert_eq!(config.decoration_style, DecorationStyle::Auto);
+            assert!(config.focus_follows_mouse);
+            assert_eq!(config.theme.as_deref(), Some("omarchy"));
+            assert_eq!(action_for(&config, "super+t"), Some(Action::SpawnTerminal));
+            assert_eq!(config.diagnostics.len(), 1);
+            assert!(config.diagnostics[0].contains("decoration_style"));
+            assert!(config.diagnostics[0].contains("windowmaker"));
+            assert!(config.diagnostics[0].contains("system7"));
+        }
+    }
+
+    // ---- parse: appearance --------------------------------------------
+
+    #[test]
+    fn appearance_defaults_unset_and_parses_both_moods() {
+        assert_eq!(Config::default_config().appearance, None);
+        assert_eq!(parse("").unwrap().appearance, None);
+        assert_eq!(
+            parse("appearance = \"dark\"")
+                .unwrap()
+                .appearance
+                .as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            parse("appearance = \"light\"")
+                .unwrap()
+                .appearance
+                .as_deref(),
+            Some("light")
+        );
+    }
+
+    #[test]
+    fn appearance_is_trimmed_and_case_insensitive_and_normalized() {
+        for text in [
+            "appearance = \"Dark\"",
+            "appearance = \"DARK\"",
+            "appearance = \" dark \"",
+        ] {
+            assert_eq!(
+                parse(text).unwrap().appearance.as_deref(),
+                Some("dark"),
+                "text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_wrongly_typed_appearance_stays_unset() {
+        for text in [
+            "appearance = \"dusk\"",
+            "appearance = \"auto\"",
+            "appearance = \"\"",
+            "appearance = 1",
+            "appearance = true",
+        ] {
+            assert_eq!(parse(text).unwrap().appearance, None, "text {text:?}");
+        }
+    }
+
+    // ---- parse: restore_session and lock_command ----------------------
+
+    #[test]
+    fn restore_session_defaults_off_and_parses_as_a_boolean() {
+        // Off by default: relaunching applications the user did not
+        // just ask for must be an explicit opt-in.
+        assert!(!Config::default_config().restore_session);
+        assert!(parse("restore_session = true").unwrap().restore_session);
+        assert!(!parse("restore_session = false").unwrap().restore_session);
+    }
+
+    #[test]
+    fn wrongly_typed_restore_session_keeps_the_default() {
+        for text in ["restore_session = \"yes\"", "restore_session = 1"] {
+            assert!(!parse(text).unwrap().restore_session, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn omarchy_menu_defaults_on_and_parses_as_a_boolean() {
+        // On by default: the submenu is invisible without Omarchy, so
+        // the default costs nothing on a machine that lacks it.
+        assert!(Config::default_config().omarchy_menu);
+        assert!(!parse("omarchy_menu = false").unwrap().omarchy_menu);
+        assert!(parse("omarchy_menu = true").unwrap().omarchy_menu);
+    }
+
+    #[test]
+    fn wrongly_typed_omarchy_menu_keeps_the_default() {
+        for text in ["omarchy_menu = \"off\"", "omarchy_menu = 0"] {
+            assert!(parse(text).unwrap().omarchy_menu, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn omarchy_shell_defaults_on_and_parses_as_a_boolean() {
+        // On by default for the same reason the menu is: without
+        // Omarchy's shell installed there is nothing to launch, so the
+        // default costs a machine without Omarchy nothing.
+        assert!(Config::default_config().omarchy_shell);
+        assert!(!parse("omarchy_shell = false").unwrap().omarchy_shell);
+        assert!(parse("omarchy_shell = true").unwrap().omarchy_shell);
+        // The two keys are independent: a desktop can carry the menu
+        // and leave the shell to something else, or the reverse.
+        let config = parse("omarchy_menu = false\nomarchy_shell = true").unwrap();
+        assert!(!config.omarchy_menu && config.omarchy_shell);
+    }
+    #[test]
+fn wrongly_typed_omarchy_shell_keeps_the_default() {
+        for text in ["omarchy_shell = \"off\"", "omarchy_shell = 1"] {
+            assert!(parse(text).unwrap().omarchy_shell, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn lock_command_defaults_unset_and_parses_as_a_string() {
+        assert_eq!(Config::default_config().lock_command, None);
+        assert_eq!(
+            parse("lock_command = \"swaylock -f -c 000000\"")
+                .unwrap()
+                .lock_command
+                .as_deref(),
+            Some("swaylock -f -c 000000")
+        );
+    }
+
+    #[test]
+    fn empty_or_wrongly_typed_lock_command_stays_unset() {
+        // An empty command is indistinguishable in effect from no key,
+        // and normalizing it here means no consumer ever spawns "".
+        for text in [
+            "lock_command = \"\"",
+            "lock_command = \"   \"",
+            "lock_command = 3",
+            "lock_command = true",
+        ] {
+            assert_eq!(parse(text).unwrap().lock_command, None, "text {text:?}");
+        }
+    }
+
+    // ---- load ---------------------------------------------------------
+
+    /// One test covers every load() path because they all mutate
+    /// process-global environment variables; splitting them into
+    /// parallel test threads would race.
+    #[test]
+    fn load_reads_the_xdg_path_and_never_fails() {
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let saved_home = std::env::var_os("HOME");
+        let scratch =
+            std::env::temp_dir().join(format!("wm-config-load-test-{}", std::process::id()));
+        let config_dir = scratch.join("chonkstep");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("config.toml");
+
+        // Missing file: silent defaults.
+        std::env::set_var("XDG_CONFIG_HOME", &scratch);
+        assert_eq!(load().keybindings, Config::default_config().keybindings);
+
+        // Valid file: its contents win.
+        std::fs::write(&config_file, "theme = \"test-theme\"\nscale = 2.0\n").unwrap();
+        let config = load();
+        assert_eq!(config.theme.as_deref(), Some("test-theme"));
+        assert_eq!(config.scale, Some(2.0));
+
+        // Garbage file: warn (unobserved here) and fall back to defaults.
+        std::fs::write(&config_file, "!!! not toml at all [[[").unwrap();
+        let config = load();
+        assert_eq!(config.theme, None);
+        assert_eq!(config.keybindings, Config::default_config().keybindings);
+
+        // HOME fallback: with XDG_CONFIG_HOME unset, ~/.config is used.
+        let home = scratch.join("home");
+        let home_config_dir = home.join(".config").join("chonkstep");
+        std::fs::create_dir_all(&home_config_dir).unwrap();
+        std::fs::write(
+            home_config_dir.join("config.toml"),
+            "theme = \"from-home\"\n",
+        )
+        .unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        assert_eq!(load().theme.as_deref(), Some("from-home"));
+
+        // A relative XDG_CONFIG_HOME is invalid per the basedir spec and
+        // must fall back to ~/.config rather than resolve against cwd.
+        std::env::set_var("XDG_CONFIG_HOME", "relative/config");
+        assert_eq!(load().theme.as_deref(), Some("from-home"));
+
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    fn action_for(config: &Config, spec: &str) -> Option<Action> {
+        let combo = parse_key(spec).expect("test spec must parse");
+        config
+            .keybindings
+            .iter()
+            .find(|(existing, _)| *existing == combo)
+            .map(|(_, action)| action.clone())
+    }
+
+    /// The whole point of the seam: a key reaches a named command, and
+    /// the name — not the command line — is what the binding carries.
+    #[test]
+    fn a_binding_runs_a_named_command() {
+        let config = parse(
+            r#"
+            [commands]
+            omarchy-menu = "omarchy-shell shell toggle omarchy.menu"
+
+            [keybindings]
+            "super+space" = "run omarchy-menu"
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(
+            action_for(&config, "super+space"),
+            Some(Action::Run("omarchy-menu".into()))
+        );
+        assert_eq!(
+            config.commands.get("omarchy-menu").map(Vec::as_slice),
+            Some(
+                ["omarchy-shell", "shell", "toggle", "omarchy.menu"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+    }
+
+    /// Declaring the table *after* the binding that uses it must work.
+    /// TOML hands us keys in an order the user does not control, so
+    /// validating during the walk would make a correct config fail on
+    /// section order alone. This is the regression test for that.
+    #[test]
+    fn command_table_may_come_after_the_binding_that_names_it() {
+        let config = parse(
+            r#"
+            [keybindings]
+            "super+space" = "run menu"
+
+            [commands]
+            menu = "omarchy-menu"
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(
+            action_for(&config, "super+space"),
+            Some(Action::Run("menu".into()))
+        );
+    }
+
+    /// A binding naming a command nobody declared is dropped at parse
+    /// time rather than kept and failed at press time.
+    #[test]
+    fn a_binding_naming_an_unknown_command_is_dropped() {
+        let config = parse(
+            r#"
+            [commands]
+            menu = "omarchy-menu"
+
+            [keybindings]
+            "super+f12" = "run typo"
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(action_for(&config, "super+f12"), None);
+    }
+
+    /// An unknown `run` must not take the *default* binding for that
+    /// combo down with it — the same contract every other unparsable
+    /// entry honors.
+    #[test]
+    fn a_dropped_run_binding_leaves_other_bindings_alone() {
+        let config = parse(
+            r#"
+            [keybindings]
+            "super+f12" = "run nope"
+            "#,
+        )
+        .expect("valid config");
+        let defaults = Config::default_config();
+        assert_eq!(config.keybindings.len(), defaults.keybindings.len());
+        assert_eq!(
+            action_for(&config, "alt+shift+return"),
+            Some(Action::SpawnTerminal)
+        );
+    }
+
+    /// Command names fold case on both sides, so capitalization can
+    /// never be the silent reason a key does nothing.
+    #[test]
+    fn command_names_are_case_insensitive_on_both_sides() {
+        let config = parse(
+            r#"
+            [commands]
+            Lock = "omarchy-system-lock"
+
+            [keybindings]
+            "super+l" = "run LOCK"
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(
+            action_for(&config, "super+l"),
+            Some(Action::Run("lock".into()))
+        );
+        assert!(config.commands.contains_key("lock"));
+    }
+
+    /// An array is the escape hatch a whitespace split cannot express:
+    /// one argument that contains a space stays one argument.
+    #[test]
+    fn an_array_command_keeps_arguments_with_spaces_whole() {
+        let config = parse(
+            r#"
+            [commands]
+            greet = ["notify-send", "hello world"]
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(
+            config.commands.get("greet").map(Vec::as_slice),
+            Some(["notify-send", "hello world"].map(String::from).as_slice())
+        );
+    }
+
+    /// Empty command lines describe no program to run, in either
+    /// spelling, and must never reach a caller that would spawn "".
+    #[test]
+    fn empty_command_lines_are_rejected_in_both_spellings() {
+        let config = parse(
+            r#"
+            [commands]
+            blank = "   "
+            nothing = []
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(config.commands, Config::default_config().commands);
+    }
+
+    /// `run` with no name is not an action. It must not become a
+    /// lookup for the empty string.
+    #[test]
+    fn run_without_a_name_is_not_an_action() {
+        assert_eq!(action_from_name("run"), None);
+        assert_eq!(action_from_name("run   "), None);
+    }
+
+    /// Autostart is a list because its order is meaningful, and the
+    /// file's order is the one that survives.
+    #[test]
+    fn autostart_keeps_file_order() {
+        let config = parse(
+            r#"
+            autostart = ["first --a", ["second", "--b"]]
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(
+            config.autostart,
+            vec![
+                vec!["first".to_string(), "--a".to_string()],
+                vec!["second".to_string(), "--b".to_string()],
+            ]
+        );
+    }
+
+    /// The media keys exist now. Before this they were not merely
+    /// unbound — there was no name for them, so a laptop's volume keys
+    /// could not be bound at all.
+    #[test]
+    fn media_keys_parse() {
+        for (spec, keysym) in [
+            ("volumeup", 0x1008ff13),
+            ("volumedown", 0x1008ff11),
+            ("mute", 0x1008ff12),
+            ("brightnessup", 0x1008ff02),
+            ("playpause", 0x1008ff14),
+        ] {
+            let combo = parse_key(spec).unwrap_or_else(|| panic!("{spec} must parse"));
+            assert_eq!(combo.keysym, keysym, "{spec}");
+        }
+    }
+
+    /// A configured terminal is argv, in both spellings.
+    #[test]
+    fn terminal_accepts_a_string_or_an_array() {
+        let from_string = parse(r#"terminal = "alacritty --class term""#).expect("valid");
+        assert_eq!(
+            from_string.terminal.as_deref(),
+            Some(
+                ["alacritty", "--class", "term"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        let from_array = parse(r#"terminal = ["ghostty"]"#).expect("valid");
+        assert_eq!(
+            from_array.terminal.as_deref(),
+            Some(["ghostty".to_string()].as_slice())
+        );
+    }
+
+    /// Nothing configured means the built-in terminal, and that has to
+    /// stay distinguishable from "the user chose something".
+    #[test]
+    fn no_terminal_key_leaves_the_builtin_selected() {
+        assert!(parse("").expect("valid").terminal.is_none());
+        assert!(Config::default_config().terminal.is_none());
+    }
+
+    #[test]
+    fn mac_launcher_follows_desktop_and_preserves_user_overrides() {
+        let standalone = parse("interaction_mode = 'mac'").unwrap();
+        assert_eq!(action_for(&standalone, "cmd+space"), Some(Action::RootMenu));
+
+        let roots = hyprland::Roots::under(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/hyprland/machine"),
+        );
+        for import_hyprland in [false, true] {
+            let resolve = |overrides: &str| {
+                parse_with(
+                    &format!("desktop = 'omarchy'\ninteraction_mode = 'mac'\n{overrides}"),
+                    &|| import_hyprland.then(|| hyprland::read(&roots)),
+                )
+                .unwrap()
+            };
+            let config = resolve("");
+            assert_eq!(
+                action_for(&config, "cmd+space"),
+                Some(Action::Run("omarchy-menu".into())),
+            );
+            assert_eq!(
+                config.commands["omarchy-menu"],
+                ["omarchy-menu", "toggle"],
+            );
+            assert_eq!(action_for(&config, "cmd+q"), Some(Action::QuitApplication));
+
+            let custom_command = resolve("[commands]\nomarchy-menu = ['my-launcher']");
+            assert_eq!(custom_command.commands["omarchy-menu"], ["my-launcher"]);
+            let custom_binding = resolve("[keybindings]\n'cmd+space' = 'root-menu'");
+            assert_eq!(action_for(&custom_binding, "cmd+space"), Some(Action::RootMenu));
+            let unbound = resolve("[keybindings]\n'cmd+space' = 'none'");
+            assert_eq!(action_for(&unbound, "cmd+space"), None);
+        }
+    }
+
+    #[test]
+    fn spaces_keep_omarchy_keys_without_mac_translation() {
+        let config = parse("interaction_mode = 'spaces'\ndesktop = 'omarchy'\nkeyboard_mode = 'desktop'\nhyprland_config = false\ndrag_modifier = 'super'\n").unwrap();
+        assert!(config.interaction.spaces_mode());
+        assert!(!config.interaction.mac_keyboard());
+        assert!(config.interaction.separate_spaces);
+        assert!(config.interaction.clipboard_persistence);
+        assert_eq!(config.drag_modifier, Some(Modifiers::SUPER));
+        assert_eq!(action_for(&config, "super+w"), Some(Action::Close));
+        assert_eq!(action_for(&config, "super+tab"), Some(Action::WorkspaceNextOccupied));
+        assert_eq!(action_for(&config, "super+f"), Some(Action::ToggleFullscreen));
+        assert_eq!(action_for(&config, "super+l"), Some(Action::ToggleLayout));
+        assert_eq!(action_for(&config, "super+c"), None);
+        let report = effective_config_report(&config);
+        for expected in ["interaction_mode = spaces", "keyboard_mode = desktop", "keymap = omarchy", "spaces.separate_displays = true", "spaces.fullscreen = true"] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
+        assert!(!report.contains("# Mac system shortcuts"));
+    }
+
+    #[test]
+    fn keyboard_selection_is_independent_and_legacy_mac_config_still_works() {
+        let spaces = parse("interaction_mode = 'spaces'").unwrap();
+        assert!(!spaces.interaction.mac_keyboard());
+        let old = parse("interaction_mode = 'mac'").unwrap();
+        assert!(old.interaction.mac_keyboard());
+        let keys_off = parse("interaction_mode = 'mac'\nkeyboard_mode = 'desktop'\nkeymap = 'omarchy'\nhyprland_config = false").unwrap();
+        assert!(keys_off.interaction.spaces_mode());
+        assert!(!keys_off.interaction.mac_keyboard());
+        assert_eq!(action_for(&keys_off, "super+w"), Some(Action::Close));
+        let keys_on = parse("interaction_mode = 'spaces'\nkeyboard_mode = 'mac'").unwrap();
+        assert!(keys_on.interaction.spaces_mode() && keys_on.interaction.mac_keyboard());
+        assert_eq!(action_for(&keys_on, "cmd+q"), Some(Action::QuitApplication));
+        // A bad keyboard_mode costs that key and not the file: the
+        // keyboard follows the mode as if the key were absent, and the
+        // refusal is recorded for `configerrors`.
+        for text in ["keyboard_mode = 'spaces'", "keyboard_mode = false"] {
+            let config = parse(text).unwrap();
+            assert_eq!(config.interaction.keyboard_mode, None, "{text}");
+            assert_eq!(config.diagnostics.len(), 1, "{text}: {:?}", config.diagnostics);
+            assert!(config.diagnostics[0].contains("keyboard_mode must be"), "{text}");
+        }
+        // The Mac profile owns its keymap: an explicit keymap is the
+        // one setting lost, and the profile still applies.
+        let owned = parse("keyboard_mode = 'mac'\nkeymap = 'omarchy'").unwrap();
+        assert!(owned.interaction.mac_keyboard());
+        assert_eq!(action_for(&owned, "cmd+q"), Some(Action::QuitApplication));
+        assert_eq!(owned.diagnostics.len(), 1, "{:?}", owned.diagnostics);
+        assert!(owned.diagnostics[0].contains("owns its keymap"));
+    }
+
+    #[test]
+    fn mac_profile_is_validated_and_preserves_desktop_services_without_legacy_shortcuts() {
+        let mac = parse("interaction_mode = 'mac'\nhyprland_config = false\n[mac.applications]\n'foot' = 'native'\n").unwrap();
+        assert_eq!(mac.interaction.mode, wm_core::InteractionMode::Mac);
+        assert_eq!(mac.interaction.profile("foot"), wm_core::AppProfile::Native);
+        assert_eq!(mac.drag_modifier, None);
+        assert!(mac.interaction.separate_spaces);
+        assert!(!parse("interaction_mode = 'mac'\n[mac]\nseparate_spaces = false\n").unwrap().interaction.separate_spaces);
+        let linked = parse("interaction_mode = 'mac'\n[mac]\nseparate_spaces = 'linked'\n").unwrap();
+        assert!(linked.interaction.separate_spaces, "a refused value keeps the default");
+        assert_eq!(linked.diagnostics.len(), 1, "{:?}", linked.diagnostics);
+        assert!(linked.diagnostics[0].contains("mac.separate_spaces must be a boolean"));
+        assert_eq!(mac.keybindings.iter().find(|(key,_)| Some(*key)==parse_key("command+shift+3")).map(|(_,a)| a), Some(&Action::Capture(CaptureMode::Screen)));
+        assert_eq!(mac.keybindings.iter().find(|(key,_)| Some(*key)==parse_key("command+control+shift+3")).map(|(_,a)| a), Some(&Action::Capture(CaptureMode::ScreenClipboard)));
+        let typo = parse("interaction_mode = 'typo'").unwrap();
+        assert_eq!(typo.interaction.mode, wm_core::InteractionMode::Desktop);
+        assert_eq!(typo.diagnostics.len(), 1, "{:?}", typo.diagnostics);
+        let owned = parse("interaction_mode = 'mac'\nkeymap = 'omarchy'").unwrap();
+        assert!(owned.interaction.mac_keyboard());
+        assert_eq!(owned.diagnostics.len(), 1, "{:?}", owned.diagnostics);
+        let profile = parse("interaction_mode = 'mac'\n[mac.applications]\nfoot = 'typo'").unwrap();
+        assert!(profile.interaction.applications.is_empty());
+        assert_eq!(profile.diagnostics.len(), 1, "{:?}", profile.diagnostics);
+        assert!(effective_config_report(&mac).contains("keymap = mac"));
+        let mut combos = std::collections::HashSet::new();
+        for (key, _) in &mac.keybindings { assert!(combos.insert(*key), "duplicate Mac shortcut {key:?}"); }
+    }
+
+    /// The keys that used to throw the whole file away — and with it
+    /// `desktop = "omarchy"`, so one typo reverted an Omarchy desktop
+    /// to stock chonkstep — now cost exactly the value they name.
+    #[test]
+    fn a_bad_mode_mac_or_preview_value_costs_that_key_and_not_the_file() {
+        let cases: &[(&str, &str)] = &[
+            ("minimized_previews = 1", "minimized_previews must be a boolean"),
+            ("interaction_mode = \"tiling\"", "interaction_mode must be"),
+            ("keyboard_mode = \"dvorak\"", "keyboard_mode must be"),
+            ("[mac]\nseparate_spaces = \"linked\"", "mac.separate_spaces must be a boolean"),
+            ("[mac]\nspaces = true", "unknown Mac setting spaces"),
+            ("[mac.applications]\nfoot = \"typo\"", "invalid Mac profile for foot"),
+            ("interaction_mode = \"mac\"\nkeymap = \"omarchy\"", "owns its keymap"),
+        ];
+        for (bad, expected) in cases {
+            let text = format!("desktop = \"omarchy\"\nhyprland_config = false\n{bad}\n");
+            let config = parse(&text).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(config.desktop, preset::Desktop::Omarchy, "{bad}: the posture must survive");
+            assert_eq!(config.omarchy_bar, Some(true), "{bad}: the posture must survive");
+            assert_eq!(config.diagnostics.len(), 1, "{bad}: {:?}", config.diagnostics);
+            assert!(config.diagnostics[0].contains(expected), "{bad}: {:?}", config.diagnostics);
+            assert!(config.minimized_previews, "{bad}: a refused value keeps the default");
+        }
+        // One bad profile costs that profile, not its neighbours.
+        let config = parse(
+            "interaction_mode = 'mac'\nhyprland_config = false\n[mac.applications]\nfoot = 'native'\nkitty = 'typo'\nfirefox = 'browser'\n",
+        )
+        .unwrap();
+        assert_eq!(config.interaction.profile("foot"), wm_core::AppProfile::Native);
+        assert_eq!(config.interaction.profile("firefox"), wm_core::AppProfile::Browser);
+        assert_eq!(config.interaction.applications.len(), 2);
+        assert_eq!(config.diagnostics.len(), 1, "{:?}", config.diagnostics);
+    }
+
+    /// Every refusal in the walk is recorded, not only logged: one bad
+    /// value per documented key yields exactly one diagnostic, which is
+    /// what makes `configerrors` and `--check-config` complete rather
+    /// than a subset of the log.
+    #[test]
+    fn every_refusal_in_the_walk_is_recorded_once() {
+        let cases: &[(&str, &str)] = &[
+            ("focus_follows_mouse = 1", "focus_follows_mouse must be a boolean"),
+            ("autoraise = 1", "autoraise must be a boolean"),
+            ("window_opacity = 1", "window_opacity must be a boolean"),
+            ("scale = \"big\"", "scale must be a positive number"),
+            ("theme = 1", "theme must be a string"),
+            ("appearance = \"drak\"", "appearance must be"),
+            ("decoration_style = \"x\"", "decoration_style must be"),
+            ("overview_style = \"x\"", "overview_style must be"),
+            ("placement = \"x\"", "placement must be"),
+            ("edge_resistance = -1", "edge_resistance must be"),
+            ("edge_resistance = 7.5", "edge_resistance must be"),
+            ("terminal_font_px = 2000", "terminal_font_px must be"),
+            ("restore_session = 1", "restore_session must be a boolean"),
+            ("omarchy_menu = 1", "omarchy_menu must be a boolean"),
+            ("omarchy_shell = 1", "omarchy_shell must be a boolean"),
+            ("omarchy_bar = 1", "omarchy_bar must be a boolean"),
+            ("minimized_previews = 1", "minimized_previews must be a boolean"),
+            ("lock_command = 1", "lock_command must be"),
+            ("lock_command = \"  \"", "lock_command is empty"),
+            ("self_decorating_apps = [\"x\"]", "self_decorating_apps is now"),
+            ("self_decorating_apps = 1", "self_decorating_apps must be"),
+            ("drag_modifier = \"hyper\"", "drag_modifier must be"),
+            ("drag_modifier = 1", "drag_modifier must be a string"),
+            ("allow_shortcut_inhibit = 1", "allow_shortcut_inhibit must be"),
+            ("shortcuts_inhibit_escape = \"not a key\"", "shortcuts_inhibit_escape must be"),
+            ("shortcuts_inhibit_escape = 1", "shortcuts_inhibit_escape must be a string"),
+            ("decorations = 1", "[decorations] must be a table"),
+            ("[decorations]\nframe_client_drawn = 1", "frame_client_drawn must be"),
+            ("[decorations]\nbogus = 1", "unknown key bogus in [decorations]"),
+            ("[decorations]\nserver_side = 1", "decorations.server_side must be an array"),
+            ("[decorations]\nclient_side = [1]", "decorations.client_side entries must be strings"),
+            ("input = 1", "[input] must be a table"),
+            ("[input]\nsensitivity = 5", "input sensitivity must be a number"),
+            ("[input]\ntap_to_click = 1", "input tap_to_click must be a boolean"),
+            ("[input]\nnumlock_by_default = 1", "input numlock_by_default must be a boolean"),
+            ("[input]\nscroll_factor = -1", "input scroll_factor must be"),
+            ("[input]\naccel_profile = \"x\"", "input accel_profile must be"),
+            ("[input]\nscroll_method = \"x\"", "input scroll_method must be"),
+            ("[input]\nscroll_button = 999", "input scroll_button must be"),
+            ("[input]\ndrag_lock = 1", "input drag_lock must be"),
+            ("[input]\ntap_button_map = \"x\"", "input tap_button_map must be"),
+            ("[input]\ndrag_3fg = 7", "input drag_3fg must be"),
+            ("[input]\nbogus = 1", "unknown input setting bogus"),
+            ("[input]\ntouchpad = 1", "[input.touchpad] must be a table"),
+            ("[input.touchpad]\nnatural_scroll = 1", "input touchpad.natural_scroll must be a boolean"),
+            ("[input]\ngestures = 1", "[input.gestures] must be a table"),
+            ("[input.gestures]\nfingers = 2", "invalid gesture setting fingers"),
+            ("motion = 1", "[motion] must be a table"),
+            ("[motion]\nspeed = 99", "invalid [motion] setting speed"),
+            ("cursor = 1", "[cursor] must be a table"),
+            ("[cursor]\nhide_on_key_press = 1", "[cursor] hide_on_key_press must be a boolean"),
+            ("[cursor]\ninactive_timeout = -1", "inactive_timeout must be"),
+            ("[cursor]\nbogus = 1", "unknown [cursor] setting bogus"),
+            ("commands = 1", "[commands] must be a table"),
+            ("[commands]\n\" \" = \"x\"", "[commands] entry with an empty name"),
+            ("[commands]\nfoo = 1", "[commands] entry foo must be a command-line string"),
+            ("[commands]\nfoo = [\"x\", 1]", "[commands] entry foo has a command argument that is not a string"),
+            ("[commands]\nfoo = \"  \"", "[commands] entry foo is an empty command line"),
+            ("terminal = 1", "terminal must be a command-line string"),
+            ("terminal = []", "terminal is an empty command line"),
+            ("autostart = 1", "autostart must be an array"),
+            ("autostart = [1]", "autostart entry must be a command-line string"),
+            ("keybindings = 1", "[keybindings] must be a table"),
+            ("[keybindings]\n\"nokey+\" = \"close\"", "unparsable key spec"),
+            ("[keybindings]\n\"super+a\" = 1", "must be an action name string"),
+            ("[keybindings]\n\"super+a\" = \"bogus\"", "unknown action name"),
+            ("[keybindings]\n\"super+a\" = \"run nothing-here\"", "not in [commands]"),
+            ("bogus = 1", "unknown top-level key bogus"),
+            ("interaction_mode = \"x\"", "interaction_mode must be"),
+            ("keyboard_mode = \"x\"", "keyboard_mode must be"),
+            ("keyboard_mode = \"mac\"\nkeymap = \"omarchy\"", "owns its keymap"),
+            ("mac = 1", "[mac] must be a table"),
+            ("[mac]\nseparate_spaces = 1", "mac.separate_spaces must be"),
+            ("[mac]\nclipboard_persistence = 1", "mac.clipboard_persistence must be"),
+            ("[mac]\nbogus = 1", "unknown Mac setting bogus"),
+            ("[mac]\napplications = 1", "[mac.applications] must be a table"),
+            ("[mac.applications]\nfoot = \"x\"", "invalid Mac profile for foot"),
+            ("hyprland_config = 1", "hyprland_config must be a boolean"),
+            ("desktop = \"x\"", "unknown desktop preset name"),
+            ("desktop = 1", "desktop preset must be a name string"),
+            ("keymap = \"x\"", "unknown keymap preset name"),
+        ];
+        for (text, expected) in cases {
+            let config = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(config.diagnostics.len(), 1, "{text}: {:?}", config.diagnostics);
+            assert!(config.diagnostics[0].contains(expected), "{text}: {:?}", config.diagnostics);
+            assert!(config.diagnostics[0].starts_with("config: "), "{text}: {:?}", config.diagnostics);
+        }
+        let bad_argument = parse("[commands]\nfoo = [\"x\", 1]").unwrap();
+        assert!(!bad_argument.commands.contains_key("foo"));
+    }
+
+    /// On a live reload the running mode is the fallback for a refused
+    /// mode key — a Spaces session stays a Spaces session, keymap and
+    /// all — while at startup the default is. The rest of the file
+    /// applies in both cases.
+    #[test]
+    fn a_refused_mode_key_keeps_the_running_mode_on_reload_and_the_default_at_startup() {
+        let text = "interaction_mode = 'tiling'\ntheme = 'washi'\n";
+        let startup = parse_in_session(text, &|| None, None).unwrap();
+        assert_eq!(startup.interaction.mode, wm_core::InteractionMode::Desktop);
+        assert_eq!(startup.theme.as_deref(), Some("washi"));
+        assert!(startup.diagnostics[0].contains("keeping desktop"), "{:?}", startup.diagnostics);
+
+        let spaces = wm_core::InteractionConfig { mode: wm_core::InteractionMode::Spaces, ..Default::default() };
+        let reload = parse_in_session(text, &|| None, Some(&spaces)).unwrap();
+        assert_eq!(reload.interaction.mode, wm_core::InteractionMode::Spaces);
+        assert!(reload.interaction.spaces_mode());
+        assert_eq!(reload.theme.as_deref(), Some("washi"));
+        assert_eq!(reload.diagnostics.len(), 1, "{:?}", reload.diagnostics);
+        assert!(reload.diagnostics[0].contains("keeping spaces"), "{:?}", reload.diagnostics);
+        assert_eq!(reload.provenance.get("interaction_mode"), None, "a refused key did not write the setting");
+
+        // The keyboard follows the same rule, and the keymap follows
+        // the keyboard: a Mac-keyboard session whose keyboard_mode is
+        // typo'd keeps Mac keys, not a Mac keyboard over desktop keys.
+        let mac_keys = wm_core::InteractionConfig {
+            mode: wm_core::InteractionMode::Spaces,
+            keyboard_mode: Some(wm_core::KeyboardMode::Mac),
+            ..Default::default()
+        };
+        let text = "interaction_mode = 'spaces'\nkeyboard_mode = 'mca'\nhyprland_config = false\n";
+        let reload = parse_in_session(text, &|| None, Some(&mac_keys)).unwrap();
+        assert!(reload.interaction.mac_keyboard());
+        assert_eq!(action_for(&reload, "cmd+q"), Some(Action::QuitApplication));
+        assert_eq!(reload.diagnostics.len(), 1, "{:?}", reload.diagnostics);
+        assert!(reload.diagnostics[0].contains("keeping mac"), "{:?}", reload.diagnostics);
+        let startup = parse_in_session(text, &|| None, None).unwrap();
+        assert!(!startup.interaction.mac_keyboard());
+        assert_eq!(action_for(&startup, "cmd+q"), None);
+
+        // Mac interaction mode implies Mac keys even without an
+        // explicit keyboard_mode. Changing the interaction mode must
+        // not reinterpret the fallback for an invalid keyboard key.
+        let implicit_mac = wm_core::InteractionConfig {
+            mode: wm_core::InteractionMode::Mac, ..Default::default()
+        };
+        let reload = parse_in_session(text, &|| None, Some(&implicit_mac)).unwrap();
+        assert_eq!(reload.interaction.mode, wm_core::InteractionMode::Spaces);
+        assert!(reload.interaction.mac_keyboard());
+        assert_eq!(action_for(&reload, "cmd+q"), Some(Action::QuitApplication));
+    }
+
+    #[test]
+    fn the_system_keyboard_is_read_the_way_omarchy_reads_vconsole_conf() {
+        let text = "# Written by systemd-localed(8)\n\
+                    KEYMAP=de-latin1\n\
+                    XKBLAYOUT=\"de\"\n\
+                    XKBVARIANT = 'nodeadkeys' # the one without dead keys\n\
+                    XKBMODEL=\n\
+                    XKBOPTIONS=\"compose:ralt,terminate:ctrl_alt_bksp\"\n\
+                    not a setting\n\
+                    #XKBMODEL=pc105\n";
+        assert_eq!(
+            system_keyboard(text),
+            SystemKeyboard {
+                layout: Some("de".into()),
+                model: None,
+                variant: Some("nodeadkeys".into()),
+                options: Some("compose:ralt,terminate:ctrl_alt_bksp".into()),
+            }
+        );
+        // A missing or malformed file is no values, never an error.
+        assert_eq!(system_keyboard(""), SystemKeyboard::default());
+        assert_eq!(system_keyboard("\0\u{fffd}==\n=\nXKBLAYOUT\nXKBLAYOUT=\"\"\n"), SystemKeyboard::default());
+        // The last setting of a key wins, as it does in Omarchy's table.
+        assert_eq!(system_keyboard("XKBLAYOUT=us\nXKBLAYOUT=fr\n").layout.as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn the_system_keyboard_fills_only_what_the_configuration_left_unset() {
+        let system = system_keyboard("XKBLAYOUT=de\nXKBVARIANT=nodeadkeys\nXKBMODEL=pc105\nXKBOPTIONS=grp:alts_toggle\n");
+        let mut input = InputConfig {
+            layout: Some("fr".into()),
+            model: Some(String::new()),
+            ..InputConfig::default()
+        };
+        assert_eq!(input.fill_keyboard_from(&system), ["kb_variant", "kb_options"]);
+        assert_eq!(input.layout.as_deref(), Some("fr"), "the configuration's own layout wins");
+        assert_eq!(input.model.as_deref(), Some(""), "an explicitly empty value is still a value");
+        assert_eq!(input.variant.as_deref(), Some("nodeadkeys"));
+        assert_eq!(input.options.as_deref(), Some("grp:alts_toggle"));
+        assert!(input.fill_keyboard_from(&SystemKeyboard::default()).is_empty());
+        assert_eq!(input.rules, None, "vconsole.conf carries no rules");
+    }
+
+}

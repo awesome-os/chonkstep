@@ -1,0 +1,70 @@
+//! Registry-level acceptance test for the standard desktop protocols.
+//!
+//! `wayland-info` is a real generic client: it binds every advertised
+//! global at the announced version and walks its objects. That catches
+//! both a missing registration and a dispatch/delegation mismatch that
+//! a unit test over a state constructor cannot see.
+
+use std::time::Duration;
+
+use chonk_testkit::{poll_until, Session, SessionOptions};
+
+#[test]
+#[ignore = "needs a live Wayland session and wayland-info"]
+fn ordinary_desktop_globals_bind_successfully() {
+    if !chonk_testkit::require_client("wayland-info") {
+        return;
+    }
+    let mut session = Session::boot("wayland-globals", SessionOptions::default()).unwrap();
+    session
+        .launch("wayland-info", &[])
+        .expect("wayland-info launches");
+    let report = poll_until(
+        Duration::from_secs(10),
+        "wayland-info to enumerate the registry",
+        || {
+            let report = session.client_log("wayland-info");
+            report
+                .contains("interface: 'xdg_wm_base'")
+                .then_some(report)
+        },
+    )
+    .expect("wayland-info reaches the end of the registry walk");
+
+    for interface in [
+        "xdg_activation_v1",
+        "wp_cursor_shape_manager_v1",
+        "wp_single_pixel_buffer_manager_v1",
+        "wp_presentation",
+        "zwp_relative_pointer_manager_v1",
+        "zwp_pointer_constraints_v1",
+        "zwp_pointer_gestures_v1",
+        "zwp_tablet_manager_v2",
+        "zxdg_exporter_v2",
+        "zxdg_importer_v2",
+        "zwp_keyboard_shortcuts_inhibit_manager_v1",
+        "zwp_text_input_manager_v3",
+        "zwp_input_method_manager_v2",
+        "xdg_wm_dialog_v1",
+        "xdg_system_bell_v1",
+        "xdg_toplevel_tag_manager_v1",
+        "zxdg_output_manager_v1",
+        "ext_foreign_toplevel_list_v1",
+        "ext_image_copy_capture_manager_v1",
+        "ext_output_image_capture_source_manager_v1",
+        "ext_foreign_toplevel_image_capture_source_manager_v1",
+        "hyprland_toplevel_mapping_manager_v1",
+        "hyprland_focus_grab_manager_v1",
+        "hyprland_global_shortcuts_manager_v1",
+        "zwlr_virtual_pointer_manager_v1",
+    ] {
+        assert!(
+            report.contains(&format!("interface: '{interface}'")),
+            "missing {interface}\n{report}"
+        );
+    }
+    assert!(
+        session.compositor_alive(),
+        "binding and walking every global must not terminate the compositor"
+    );
+}

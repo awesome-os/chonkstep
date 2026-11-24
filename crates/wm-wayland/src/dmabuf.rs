@@ -1,0 +1,712 @@
+//! Hardware buffers: the `zwp_linux_dmabuf_v1` global, which is how a
+//! GPU-accelerated client (Chromium, Firefox, mpv, anything drawing
+//! through GBM/EGL) hands us a *handle* to video memory instead of a
+//! CPU copy of it. Without this global those clients fall back to
+//! `wl_shm` — a full-frame readback and re-upload every frame, which
+//! is exactly what makes a compositor feel slow under video — and a
+//! few refuse outright, because their EGL platform code reads "no
+//! linux-dmabuf global" as "this compositor has no GPU".
+//!
+//! # Integration contract
+//!
+//! One call and one field, both in `state.rs`. Nothing else in the
+//! crate needs to know this module exists — the protocol side is
+//! entirely `delegate_dmabuf!` plus the [`DmabufHandler`] impl below,
+//! and the *render* side already works: `GlesRenderer` implements
+//! `ImportAll`, so a dmabuf-backed `wl_buffer` is imported by the
+//! ordinary `WaylandSurfaceRenderElement` path in `renderer.rs`
+//! without a line of special-casing.
+//!
+//! 1. In `run`, make the graphics binding mutable
+//!    (`let (mut graphics, output, output_size) = ...`) and add one
+//!    line directly after that `if nested { ... } else { ... }` block —
+//!    it must land *before* the `ListeningSocketSource` is inserted,
+//!    since a global that does not exist when a client binds might as
+//!    well not exist at all:
+//!
+//!    ```ignore
+//!    let dmabuf = crate::dmabuf::init_for_graphics(&display_handle, &mut graphics);
+//!    ```
+//!
+//! 2. `Compositor` gains one field, moved in from that local:
+//!
+//!    ```ignore
+//!    /// linux-dmabuf: the format set we advertise and the protocol
+//!    /// state behind it. Always present; "this renderer cannot do
+//!    /// dmabuf" is represented inside, not by an `Option`.
+//!    pub(crate) dmabuf: crate::dmabuf::DmabufSupport,
+//!    ```
+//!
+//! [`init_for_graphics`] never fails: a renderer with no dmabuf
+//! support yields a [`DmabufSupport`] that registered no global, so
+//! [`DmabufHandler::dmabuf_state`] can hand back a real `&mut` with no
+//! `expect` in the path. That is why the field is not an `Option` —
+//! an unreachable panic in a login session's protocol dispatch is a
+//! black screen with no console to read it on.
+//!
+//! # Where the format list comes from
+//!
+//! `renderer.dmabuf_formats()` — which for `GlesRenderer` is the EGL
+//! display's `dmabuf_texture_formats`, i.e. the (fourcc, modifier)
+//! pairs the driver will actually turn into an `EGLImage`. Advertising
+//! anything else would be a lie the client discovers at the worst
+//! moment: modern clients allocate against the advertised set and use
+//! `create_immed`, and a compositor that then rejects the buffer kills
+//! them (see [`ImportNotifier::failed`]'s two behaviours, and the
+//! comment on [`DmabufHandler::dmabuf_imported`] below).
+//!
+//! Both backends reach this the same way, because both own a
+//! `GlesRenderer` — the winit backend's behind `renderer()`, the DRM
+//! session's in `SessionGraphics::renderer`. So one code path serves
+//! both, and a hardware session advertises whatever its actual GPU can
+//! import rather than a curated guess.
+//!
+//! # Feedback (protocol version 4)
+//!
+//! Advertised whenever the render node can be identified. The global's main
+//! tranche contains the formats GLES can import. Per-surface feedback adds a
+//! scanout preference for that surface's actual primary output, selected from
+//! clipped scene membership and rendered visibility. Output capability tables
+//! are cached and refreshed on hotplug or live scanout-policy changes. Nested
+//! sessions have no KMS planes and advertise only the rendering tranche.
+//!
+//! A DRM session asks EGL first, because the renderer can live on a
+//! different device from the display-only KMS controller (`kmsro` on
+//! split hardware). If EGL's optional device-query extension is absent,
+//! it may fall back to a render node paired with the KMS fd—but never to
+//! the primary node itself. That retains virtio/TCG support where a real
+//! paired render node exists without lying on split devices.
+//!
+//! When neither the session nor EGL can identify a render node, or when the
+//! feedback's sealed format-table memfd cannot be created, the compositor
+//! advertises no linux-dmabuf global. A version-3 format list would be legal,
+//! but xdg-desktop-portal-wlr 0.8.2 incorrectly installs feedback listeners
+//! against it and segfaults when the version-4-only events never arrive.
+//! Declining the optional protocol makes that degraded path slower or
+//! unavailable, but it cannot kill a critical session service. Hardware
+//! login sessions do not take this path.
+
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::Buffer;
+use smithay::backend::drm::{DrmNode, NodeType};
+use smithay::backend::egl::EGLDevice;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::ImportDma;
+use smithay::delegate_dmabuf;
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::wayland::dmabuf::{
+    DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+};
+
+use crate::state::{Compositor, Graphics};
+
+/// Import capabilities and cached allocation feedback. The global describes
+/// rendering; an output-specific scanout preference is sent only to surfaces
+/// whose scene membership and presentation owner identify that output.
+pub(crate) struct DmabufSupport {
+    state: DmabufState,
+    /// Exactly what was advertised to clients, kept for the import
+    /// check in [`DmabufHandler::dmabuf_imported`]. Empty means no
+    /// global was registered and no client can ever reach that check.
+    formats: FormatSet,
+    render_node: Option<DrmNode>,
+    default: Option<DmabufFeedback>,
+    outputs: Vec<(smithay::output::Output, DmabufFeedback)>,
+    policy: Option<u32>,
+}
+
+impl DmabufSupport {
+    /// The no-hardware-buffers state: protocol machinery allocated (so
+    /// the handler always has something to return) but no global
+    /// registered, so no client ever sees the protocol.
+    fn disabled() -> Self {
+        DmabufSupport { state: DmabufState::new(), formats: FormatSet::default(), render_node: None, default: None, outputs: Vec::new(), policy: None }
+    }
+}
+
+impl DmabufSupport {
+    pub fn invalidate(&mut self) { self.policy = None; }
+
+    pub fn default_feedback(&self) -> Option<&DmabufFeedback> { self.default.as_ref() }
+
+    pub fn feedback_for<'a>(
+        &'a self, output: &smithay::output::Output,
+        id: &smithay::backend::renderer::element::Id,
+        states: &smithay::backend::renderer::element::RenderElementStates,
+    ) -> Option<&'a DmabufFeedback> {
+        let default = self.default.as_ref()?;
+        let scanout = self.outputs.iter().find(|(entry, _)| entry == output).map(|(_, feedback)| feedback).unwrap_or(default);
+        Some(smithay::backend::renderer::element::utils::select_dmabuf_feedback(id.clone(), states, default, scanout))
+    }
+
+    /// Capability queries and sealed format tables are rebuilt only on policy
+    /// changes or hotplug, never once per surface or once per frame.
+    pub fn refresh(&mut self, graphics: &Graphics, outputs: &[crate::state::OutputEntry]) -> bool {
+        let policy = crate::session::frame_flags().bits();
+        if self.policy == Some(policy) { return false; }
+        self.policy = Some(policy);
+        self.outputs.clear();
+        let (Some(node), Graphics::Session(session)) = (self.render_node, graphics) else { return true; };
+        let scanout_device = session.scanout_node().unwrap_or(node);
+        for (index, output) in outputs.iter().enumerate() {
+            let scanout: FormatSet = session.output_scanout_formats(index).indexset().iter()
+                .filter(|format| self.formats.contains(format)).copied().collect();
+            if scanout.indexset().is_empty() { continue; }
+            match DmabufFeedbackBuilder::new(node.dev_id(), self.formats.clone())
+                .add_preference_tranche(scanout_device.dev_id(), Some(TrancheFlags::Scanout), scanout).build() {
+                Ok(feedback) => self.outputs.push((output.output.clone(), feedback)),
+                Err(error) => tracing::warn!(?error, output = %output.output.name(), "could not build output dmabuf feedback"),
+            }
+        }
+        true
+    }
+}
+
+/// The one call `run` makes — see the module docs. Picks the renderer
+/// out of whichever graphics stack this session ended up with and
+/// defers to [`init`].
+pub(crate) fn init_for_graphics(display_handle: &DisplayHandle, graphics: &mut Graphics) -> DmabufSupport {
+    let session_render_node = match graphics {
+        Graphics::Session(session) => session.render_node(),
+        Graphics::Winit(_) => None,
+    };
+    init(display_handle, graphics_renderer(graphics), session_render_node, FormatSet::default())
+}
+
+/// Registers the linux-dmabuf global for `renderer`'s formats.
+///
+/// Split out from [`init_for_graphics`] so the renderer, not the
+/// graphics enum, is the dependency: `session::init` builds its
+/// renderer before any `Graphics` exists, and can call this directly
+/// if it ever needs the global up earlier than `run` puts it up.
+///
+/// Never fails: a renderer that cannot import dmabufs at all gets a
+/// state with no global rather than an error, because "this GPU stack
+/// is software-only" is a degraded session, not a broken one — the
+/// same call every other optional piece of this compositor makes
+/// (XWayland missing, a theme that will not load).
+pub(crate) fn init(
+    display_handle: &DisplayHandle,
+    renderer: &mut GlesRenderer,
+    session_render_node: Option<DrmNode>,
+    scanout_formats: FormatSet,
+) -> DmabufSupport {
+    let formats = renderer.dmabuf_formats();
+    if formats.indexset().is_empty() {
+        // llvmpipe without the dmabuf import extensions, or an EGL
+        // display that came up without `EGL_EXT_image_dma_buf_import`.
+        // Advertising an empty global is worse than advertising none:
+        // clients that see it negotiate, find nothing, and have to
+        // discover the dead end themselves.
+        tracing::warn!("the renderer reports no dmabuf formats; not advertising linux-dmabuf");
+        return DmabufSupport::disabled();
+    }
+
+    let mut state = DmabufState::new();
+    // Direct scanout must always be able to fall back to GLES when an
+    // atomic test rejects a plane assignment. Keep only formats both
+    // the selected swapchains and the renderer understand.
+    let scanout_formats: FormatSet = scanout_formats
+        .indexset()
+        .iter()
+        .filter(|format| formats.indexset().contains(*format))
+        .copied()
+        .collect();
+    let render_node = session_render_node.and_then(actual_render_node).or_else(|| render_node_for_renderer(renderer));
+    let default = match default_feedback(renderer, &formats, render_node, &scanout_formats) {
+        Some(feedback) => {
+            // Unset guard: the original unfiltered global. See client_mesa.rs.
+            let _global = match crate::client_mesa::ClientMesaGuard::from_env() {
+                None => state.create_global_with_default_feedback::<Compositor>(display_handle, &feedback),
+                Some(guard) => state.create_global_with_filter_and_default_feedback::<Compositor, _>(
+                    display_handle,
+                    &feedback,
+                    move |client| guard.allows(client),
+                ),
+            };
+            tracing::info!(
+                formats = formats.indexset().len(),
+                scanout_formats = scanout_formats.indexset().len(),
+                "linux-dmabuf with default feedback advertised"
+            );
+            feedback
+        }
+        None => {
+            tracing::warn!(
+                formats = formats.indexset().len(),
+                "linux-dmabuf feedback is unavailable; not advertising the global"
+            );
+            return DmabufSupport::disabled();
+        }
+    };
+    DmabufSupport { state, formats, render_node, default: Some(default), outputs: Vec::new(), policy: None }
+}
+
+/// Builds default feedback, or `None` to decline the global.
+///
+/// Feedback is keyed by the render node's `dev_t`. A DRM login session
+/// supplies the renderer node resolved during graphics initialization;
+/// nested sessions query EGL here. Missing device-query support, a KMS
+/// device with no safe paired render-node fallback, or a `build()` that
+/// cannot create the sealed memfd carrying the format table is degraded
+/// but not fatal.
+fn default_feedback(
+    renderer: &GlesRenderer,
+    formats: &FormatSet,
+    session_render_node: Option<DrmNode>,
+    scanout_formats: &FormatSet,
+) -> Option<DmabufFeedback> {
+    let node = session_render_node
+        .and_then(actual_render_node)
+        .or_else(|| render_node_for_renderer(renderer))?;
+
+    let mut builder = DmabufFeedbackBuilder::new(node.dev_id(), formats.clone());
+    if !scanout_formats.indexset().is_empty() {
+        builder = builder.add_preference_tranche(
+            node.dev_id(),
+            Some(TrancheFlags::Scanout),
+            scanout_formats.clone(),
+        );
+    }
+    match builder.build() {
+        Ok(feedback) => Some(feedback),
+        Err(error) => {
+            tracing::warn!(?error, "could not build dmabuf feedback; linux-dmabuf is unavailable");
+            None
+        }
+    }
+}
+
+/// Returns the renderer's actual DRM render node, never a primary node.
+///
+/// Smithay's convenience query intentionally falls back to the DRM
+/// primary returned by `EGL_EXT_device_drm` when that device has no
+/// render node. That is useful to callers which merely need *a* DRM
+/// identity, but linux-dmabuf feedback specifically promises a device
+/// clients can open for rendering. Filter the fallback here so the wire
+/// never carries a display-only `dev_t`.
+pub(crate) fn render_node_for_renderer(renderer: &GlesRenderer) -> Option<DrmNode> {
+    match EGLDevice::device_for_display(renderer.egl_context().display())
+        .and_then(|device| device.try_get_render_node())
+    {
+        Ok(Some(node)) => match actual_render_node(node) {
+            Some(node) => Some(node),
+            None => {
+                tracing::warn!(
+                    drm_node = %node,
+                    "EGL identified a DRM primary with no render node; refusing it for linux-dmabuf feedback"
+                );
+                None
+            }
+        },
+        Ok(None) => {
+            tracing::debug!("EGL reports no DRM render node");
+            None
+        }
+        Err(error) => {
+            tracing::debug!(?error, "could not query the EGL renderer device");
+            None
+        }
+    }
+}
+
+/// Accepts only a node clients can actually open for rendering.
+/// Kept pure so the split-device regression needs no `/dev/dri` fixture.
+fn actual_render_node(node: DrmNode) -> Option<DrmNode> {
+    is_render_node_type(node.ty()).then_some(node)
+}
+
+fn is_render_node_type(node_type: NodeType) -> bool {
+    node_type == NodeType::Render
+}
+
+/// The session's `GlesRenderer`, whichever graphics stack is running —
+/// there is always exactly one, which is the whole reason a single
+/// dmabuf implementation covers both backends.
+///
+/// `capture.rs` carries the same three lines for the same reason;
+/// neither module owns the other's file, and a shared helper belongs
+/// on `Graphics` itself (in `state.rs`) if anyone ever consolidates.
+fn graphics_renderer(graphics: &mut Graphics) -> &mut GlesRenderer {
+    match graphics {
+        Graphics::Winit(backend) => backend.renderer(),
+        Graphics::Session(session) => session.renderer(),
+    }
+}
+
+impl DmabufHandler for Compositor {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf.state
+    }
+
+    /// Smithay's contract: decide whether this buffer can become a
+    /// texture, and say so through `notifier` exactly once.
+    ///
+    /// The asymmetry that shapes this is [`ImportNotifier::failed`]:
+    /// for a buffer created with `create` it sends a `failed` event
+    /// the client recovers from, but for `create_immed` — what
+    /// Mesa/GBM clients use in the common path — it posts a protocol
+    /// error and *kills the client*. So a false rejection is far more
+    /// expensive than a false acceptance, whose worst case is one
+    /// surface that renders empty because `ImportAll` declines it
+    /// later in `renderer.rs`.
+    ///
+    /// Hence: reject up front only what we never advertised (a client
+    /// that invented a format/modifier pair is already outside the
+    /// negotiation, and gets a log line naming it rather than an
+    /// opaque EGL error), then let the renderer's own import be the
+    /// judge. That import is not just a test — `GlesRenderer` caches
+    /// the resulting texture against the dmabuf, so the first frame
+    /// that uses this buffer costs nothing extra.
+    ///
+    /// The pre-check is safe against legacy clients because smithay's
+    /// EGL format query inserts a `Modifier::Invalid` entry for every
+    /// fourcc it finds, so implicit-modifier (version 3) buffers are
+    /// always inside the advertised set.
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        if !self.dmabuf.formats.contains(&dmabuf.format()) {
+            tracing::debug!(format = ?dmabuf.format(), "rejecting a dmabuf in an unadvertised format");
+            notifier.failed();
+            return;
+        }
+
+        match graphics_renderer(&mut self.graphics).import_dmabuf(&dmabuf, None) {
+            Ok(_texture) => {
+                // linux-dmabuf carries no allocation-device identity. Smithay
+                // leaves these buffers untagged, and the GBM framebuffer
+                // exporter rejects every untagged client before trying KMS.
+                // Record the renderer which just proved it can import this
+                // buffer, matching MultiRenderer's successful-import policy.
+                // This is an import hint, not proof of allocation origin or
+                // scanout support: GBM export and the atomic test still decide.
+                if dmabuf.node().is_none() {
+                    dmabuf.set_node(self.dmabuf.render_node);
+                }
+                let _ = notifier.successful::<Compositor>();
+            }
+            Err(error) => {
+                tracing::debug!(?error, format = ?dmabuf.format(), "renderer refused a dmabuf import");
+                notifier.failed();
+            }
+        }
+    }
+
+    fn new_surface_feedback(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        _global: &DmabufGlobal,
+    ) -> Option<DmabufFeedback> {
+        self.surface_outputs.feedback_for(surface).or_else(|| self.dmabuf.default.clone())
+    }
+
+}
+
+delegate_dmabuf!(Compositor);
+
+// -- buffer readiness (explicit and implicit sync) -----------------------
+//
+// A dmabuf handed over on commit is a handle to memory the client's GPU
+// may still be writing. Sampling it anyway shows whatever half-drawn
+// state the write has reached — on screen as flicker and stale garbage
+// that scales with how fast the client redraws, which is why the report
+// that led here read "typing in Edge's URL bar flickers; loading a site
+// really kicks it off". Two mechanisms close the gap, and both work by
+// *blocking the commit* (smithay's transaction blockers) rather than
+// stalling the render thread:
+//
+// * Explicit sync (`wp_linux_drm_syncobj_v1`): the client attaches an
+//   acquire timeline point to the commit and the compositor waits for
+//   it. This is the only mechanism that works on NVIDIA's driver,
+//   which never supported implicit dmabuf fencing — precisely the
+//   hardware the live desktop runs (two GA102s), and precisely why the
+//   flicker shipped. Advertised only when the DRM device supports
+//   `syncobj_eventfd` (the wait primitive), which is the same gate
+//   Mutter and cosmic-comp apply.
+//
+// * Implicit sync fallback: for a client that speaks no syncobj, the
+//   dmabuf's own fd is pollable and becomes readable when the
+//   producer's implicit fence signals. `Dmabuf::generate_blocker`
+//   returns `AlreadyReady` for an idle buffer, so the steady state —
+//   a client that finished drawing before committing — costs nothing.
+//   Know its limit: on NVIDIA the driver attaches no implicit fences
+//   to the dmabuf at all, so the fd polls readable instantly and the
+//   fallback is a no-op — a non-syncobj dmabuf client on that driver
+//   is still sampled on trust, and no compositor-side wait can invent
+//   a fence the driver never exported. See docs/nvidia-sync.md.
+//
+// Both mechanisms above are the ACQUIRE half — "do not read before the
+// client finished writing". The RELEASE half — "do not tell the client
+// we finished reading before the GPU actually has" — lives in
+// `session.rs` (`SessionOutput::pending_scene`, `scanout_scene`, and
+// `strict_release_configured`), because only the page-flip machinery
+// knows when composition retired or a directly scanned buffer stopped
+// being the crtc's current source.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use smithay::delegate_drm_syncobj;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::Interest;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource as _;
+use smithay::wayland::compositor::CompositorHandler as _;
+use smithay::wayland::compositor::{
+    add_blocker, add_pre_commit_hook, with_states, Blocker, BlockerState, BufferAssignment, SurfaceAttributes,
+};
+use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::drm_syncobj::{
+    supports_syncobj_eventfd, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
+};
+
+impl DrmSyncobjHandler for Compositor {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.syncobj.as_mut()
+    }
+}
+
+delegate_drm_syncobj!(Compositor);
+
+/// Registers the `wp_linux_drm_syncobj_v1` global when the session's
+/// DRM device can wait on syncobj timelines. The nested (winit)
+/// backend registers nothing: it owns no DRM device to import a
+/// timeline into, and the host compositor already syncs the buffers it
+/// passes on.
+pub(crate) fn init_syncobj(display: &DisplayHandle, graphics: &crate::state::Graphics) -> Option<DrmSyncobjState> {
+    let crate::state::Graphics::Session(session) = graphics else {
+        return None;
+    };
+    let device = session.drm_device_fd();
+    if !supports_syncobj_eventfd(&device) {
+        tracing::info!("DRM device lacks syncobj_eventfd; explicit sync not advertised");
+        return None;
+    }
+    tracing::info!("explicit sync (wp_linux_drm_syncobj_v1) advertised");
+    Some(DrmSyncobjState::new::<Compositor>(display, device))
+}
+
+/// How long a readiness blocker may hold a commit before the commit
+/// lands anyway. The invariant: **a blocker may delay a commit, never
+/// park it** — a fence that never signals (a hung client GPU context, a
+/// driver that drops a syncobj point on the floor, an fd whose producer
+/// died mid-frame) must not freeze the surface's transaction queue
+/// forever, because every later commit of that surface queues behind
+/// the blocked one and the window goes wholly non-responsive on
+/// screen while its client believes it is drawing. Past the deadline
+/// the frame degrades to the pre-explicit-sync behaviour (sample
+/// whatever the buffer holds — at worst one torn frame) instead.
+///
+/// One second is far beyond any fence a live frame legitimately waits
+/// on (a heavy game under full GPU load signals within a frame or
+/// three) and far below "the user assumes the window is dead".
+const BLOCKER_DEADLINE: Duration = Duration::from_secs(1);
+
+/// A readiness blocker with the deadline above built in: reports the
+/// inner blocker's state until [`BLOCKER_DEADLINE`] declares the wait
+/// over, then reports `Released` — the commit lands, the frame is
+/// sampled as-is. `Released` and not `Cancelled` on purpose:
+/// cancelling discards the client's pending state, which turns a late
+/// fence into a dropped frame *and* a desynced client; releasing keeps
+/// the protocol stream intact and costs at most one torn frame.
+struct BoundedBlocker<B> {
+    inner: B,
+    flags: Arc<BlockerFlags>,
+}
+
+/// Shared between a [`BoundedBlocker`] and its deadline timer.
+#[derive(Default)]
+struct BlockerFlags {
+    /// Set by the timer: the wait is over regardless of the fence.
+    expired: AtomicBool,
+    /// Set by the blocker the moment its inner state is seen to be
+    /// anything but `Pending` — how the timer knows a fence resolved
+    /// in time and its own firing is the routine no-op, not a stall.
+    settled: AtomicBool,
+}
+
+impl<B: Blocker> Blocker for BoundedBlocker<B> {
+    fn state(&self) -> BlockerState {
+        if self.flags.expired.load(Ordering::Relaxed) {
+            return BlockerState::Released;
+        }
+        let state = self.inner.state();
+        if !matches!(state, BlockerState::Pending) {
+            self.flags.settled.store(true, Ordering::Relaxed);
+        }
+        state
+    }
+}
+
+/// Installs the per-surface pre-commit hook that keeps a commit from
+/// landing before its buffer is finished. Called once per surface from
+/// `CompositorHandler::new_surface`; the hook then runs on every
+/// commit of that surface, before smithay merges pending state.
+///
+/// Every blocker armed here is wrapped in a [`BoundedBlocker`] and
+/// paired with a one-shot timer that re-runs the transaction check at
+/// the deadline — the event loop itself is never blocked by a
+/// transaction blocker (smithay queues the state and moves on), so the
+/// timer is the only thing guaranteed to come back for a fence that
+/// never signals.
+pub(crate) fn install_readiness_hook(surface: &WlSurface) {
+    add_pre_commit_hook::<Compositor, _>(surface, |state, _dh, surface| {
+        // Explicit first: an acquire point on the commit is the
+        // client's own statement of readiness and outranks any
+        // guess from the buffer fd.
+        let acquire = with_states(surface, |states| {
+            states.cached_state.get::<DrmSyncobjCachedState>().pending().acquire_point.clone()
+        });
+        if let Some(point) = acquire {
+            if let Ok((blocker, source)) = point.generate_blocker() {
+                let Some(client) = surface.client() else {
+                    return;
+                };
+                let timer_client = client.clone();
+                let inserted = state.loop_handle.insert_source(source, move |_, _, comp| {
+                    let handle = comp.display_handle.clone();
+                    let client_state = comp.client_compositor_state(&client);
+                    client_state.blocker_cleared(comp, &handle);
+                    Ok(())
+                });
+                if inserted.is_ok() {
+                    let flags = Arc::new(BlockerFlags::default());
+                    arm_blocker_deadline(state, timer_client, flags.clone());
+                    add_blocker(surface, BoundedBlocker { inner: blocker, flags });
+                }
+            }
+            // A blocker that could not be generated degrades to the
+            // pre-explicit-sync behaviour (sample and hope) instead of
+            // stalling the client forever; the eventfd support was
+            // probed at init, so this is a transient failure, not a
+            // capability gap.
+            return;
+        }
+        // Implicit fallback: block on the committed dmabuf's own
+        // readability. `AlreadyReady` — the overwhelmingly common
+        // case — adds nothing to the commit.
+        let committed_dmabuf = with_states(surface, |states| {
+            states.cached_state.get::<SurfaceAttributes>().pending().buffer.as_ref().and_then(|assignment| {
+                match assignment {
+                    BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
+                    _ => None,
+                }
+            })
+        });
+        if let Some(dmabuf) = committed_dmabuf {
+            if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                let Some(client) = surface.client() else {
+                    return;
+                };
+                let timer_client = client.clone();
+                let inserted = state.loop_handle.insert_source(source, move |_, _, comp| {
+                    let handle = comp.display_handle.clone();
+                    let client_state = comp.client_compositor_state(&client);
+                    client_state.blocker_cleared(comp, &handle);
+                    Ok(())
+                });
+                if inserted.is_ok() {
+                    let flags = Arc::new(BlockerFlags::default());
+                    arm_blocker_deadline(state, timer_client, flags.clone());
+                    add_blocker(surface, BoundedBlocker { inner: blocker, flags });
+                }
+            }
+        }
+    });
+}
+
+/// The deadline half of [`BoundedBlocker`]: a one-shot timer that
+/// flips the expiry flag and re-runs the client's transaction check,
+/// which now sees `Released` and lets the commit land. Firing after
+/// the fence already signalled is the common case and costs one no-op
+/// `blocker_cleared` pass; the flag flip is meaningless by then
+/// because the blocker it governed has already been consumed.
+fn arm_blocker_deadline(
+    state: &mut Compositor,
+    client: smithay::reexports::wayland_server::Client,
+    flags: Arc<BlockerFlags>,
+) {
+    let timer_flags = flags.clone();
+    let inserted = state.loop_handle.insert_source(Timer::from_duration(BLOCKER_DEADLINE), move |_, _, comp| {
+        // A fence that was ever seen resolved makes this firing
+        // the routine cleanup case: nothing to release, nothing to
+        // say. Only a blocker still pending at the deadline is a
+        // stall worth a log line.
+        if !timer_flags.settled.load(Ordering::Relaxed) && !timer_flags.expired.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "a commit readiness blocker overran its deadline; releasing the commit \
+                     (the frame degrades to sample-and-hope for this one buffer)"
+            );
+        }
+        let handle = comp.display_handle.clone();
+        let client_state = comp.client_compositor_state(&client);
+        client_state.blocker_cleared(comp, &handle);
+        TimeoutAction::Drop
+    });
+    if inserted.is_err() {
+        // No timer means no bounded escape: rather than arm a blocker
+        // that nothing is guaranteed to come back for, expire it now
+        // and fall back to the pre-explicit-sync behaviour outright.
+        flags.expired.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for #28: a primary node is a display/control endpoint,
+    /// never a valid linux-dmabuf `main_device`. Test the type gate
+    /// directly so this remains hermetic—no `/dev/dri` fixture needed.
+    #[test]
+    fn feedback_accepts_only_an_actual_render_node() {
+        assert!(!is_render_node_type(NodeType::Primary));
+        assert!(!is_render_node_type(NodeType::Control));
+        assert!(is_render_node_type(NodeType::Render));
+    }
+
+    /// A stand-in fence: answers whatever the test last set.
+    struct FakeBlocker(std::sync::Mutex<BlockerState>);
+
+    impl Blocker for FakeBlocker {
+        fn state(&self) -> BlockerState {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// The bounded escape's whole contract: pending stays pending
+    /// until the deadline flag flips, after which the commit is
+    /// released no matter what the fence says — and a fence seen
+    /// resolving marks itself settled so the timer knows its firing
+    /// was routine.
+    #[test]
+    fn a_blocker_past_its_deadline_releases_the_commit() {
+        let flags = Arc::new(BlockerFlags::default());
+        let bounded =
+            BoundedBlocker { inner: FakeBlocker(std::sync::Mutex::new(BlockerState::Pending)), flags: flags.clone() };
+        // In time: the fence's word stands.
+        assert!(matches!(bounded.state(), BlockerState::Pending));
+        assert!(!flags.settled.load(Ordering::Relaxed));
+        // Past the deadline: released, even though the fence never
+        // signalled — the invariant "a blocker may delay a commit,
+        // never park it".
+        flags.expired.store(true, Ordering::Relaxed);
+        assert!(matches!(bounded.state(), BlockerState::Released));
+
+        // The other life: a fence that resolves is observed settled.
+        let flags = Arc::new(BlockerFlags::default());
+        let bounded =
+            BoundedBlocker { inner: FakeBlocker(std::sync::Mutex::new(BlockerState::Released)), flags: flags.clone() };
+        assert!(matches!(bounded.state(), BlockerState::Released));
+        assert!(flags.settled.load(Ordering::Relaxed));
+        // A cancelled fence settles too — cancellation is smithay's
+        // own teardown path and must not be reported as a stall.
+        let flags = Arc::new(BlockerFlags::default());
+        let bounded =
+            BoundedBlocker { inner: FakeBlocker(std::sync::Mutex::new(BlockerState::Cancelled)), flags: flags.clone() };
+        assert!(matches!(bounded.state(), BlockerState::Cancelled));
+        assert!(flags.settled.load(Ordering::Relaxed));
+    }
+}

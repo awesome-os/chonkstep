@@ -1,0 +1,739 @@
+# chonkstep configuration
+#
+# Location: ~/.config/chonkstep/config.toml
+#           ($XDG_CONFIG_HOME/chonkstep/config.toml if that is set)
+#
+# Every setting here is optional, and the file itself is optional: with
+# no file at all, the defaults shown below apply. A broken file never
+# prevents the session from starting -- an unreadable or invalid file
+# logs a warning and falls back to the defaults, and an individually
+# bad line (a typo'd key spec, an unknown action name, a value of the
+# wrong type) is skipped while every other line still applies. Every
+# skipped line is listed by `chonkstep-wayland --check-config` and, in
+# a running session, by `hyprctl configerrors`.
+#
+# Changes apply to a live session without restarting anything: run
+# scripts/reload.sh, or bind the "reload" action to a key (see below).
+# A reload re-reads this file and applies all of it -- theme, scale,
+# focus, placement, edge resistance, terminal font size, and these
+# bindings -- keeping every window, client connection.
+#
+# scripts/restart.sh still exists and is a different thing: it re-execs
+# the on-disk binary, which is how you pick up a NEW BUILD. Use it after
+# rebuilding, not after editing this file. On the X11 session that costs
+# nothing visible (windows survive via the SaveSet); on the Wayland
+# session it costs you every client, because Wayland clients die with
+# the socket they were connected to.
+
+# ============================================================
+# SPACES AND KEYBOARD (chonkstep-wayland, including XWayland applications)
+# interaction_mode = "spaces"  # per-monitor Spaces and dedicated fullscreen
+# keyboard_mode = "desktop"   # ordinary keys; desktop="omarchy" supplies its bindings
+#
+# Only the keyboard_mode="mac" profile is experimental. It translates application
+# shortcuts and owns the keymap; remove any explicit keymap when enabling it.
+# Legacy interaction_mode="mac" defaults to Mac keys unless keyboard_mode is set.
+# Change keyboard_mode alone to keep Spaces and fullscreen desktops intact.
+# See docs/mac-mode.md and docs/mac-display-spaces.md.
+#
+# Clickable previews for minimized windows (160 logical px), enabled by default.
+# Set false to hide the tiles and restore minimized windows through Alt-Tab only.
+# minimized_previews = true
+#
+# PRESETS -- one line for a whole posture
+# ============================================================
+#
+# Which desktop this session IS. Two names:
+#
+#   "chonkstep" (the default) a whole chonkstep desktop: chonkstep's
+#               own themes, a hosted Omarchy bar kept off screen until
+#               asked for. This is what every config file without
+#               this key already means.
+#   "omarchy"   Omarchy's desktop, with chonkstep doing the window
+#               management. Omarchy's bar shown; Omarchy's
+#               theme followed; Omarchy's menu, pickers, panels,
+#               notifications and lock screen; and Omarchy's own
+#               keybinding vocabulary (see `keymap` below).
+#
+# This is a set of DEFAULTS, never a lock. The posture is applied to
+# the built-in defaults BEFORE the rest of this file is read, so any
+# key it sets is overridden simply by writing that key out -- the
+# ordinary TOML rule, with no precedence order to learn. What it sets:
+#
+#   keymap        = "omarchy"
+#   omarchy_bar  = true           omarchy_menu  = true
+#   theme        = "omarchy"      omarchy_shell = true
+#   lock_command = "omarchy-system-lock"
+#
+# ...and nothing else. Notably it does NOT touch `terminal`,
+# `autostart`, placement, focus policy, scale or the
+# decoration rules -- those are how chonkstep manages windows, which
+# is the half of the desktop the posture is keeping. See
+# docs/omarchy-mode.md for the whole story, including what the mode
+# deliberately leaves alone.
+#
+# NEITHER posture starts the Dock. Since 0.7 the NeXTSTEP Dock is its
+# own program, `chonk-dock`, and nothing launches it for you -- not
+# even `desktop = "chonkstep"`. If you want the Dock (and on a NeXT
+# style desktop you probably do), add "chonk-dock" to `autostart`
+# below. See dock/README.md.
+#
+# Case-insensitive. An unknown name is warned about and "chonkstep" is
+# kept.
+#desktop = "omarchy"
+
+# Which vocabulary of chords the session answers to. Two names:
+#
+#   "chonkstep" (the default) the NeXTSTEP-style alt+shift chords the
+#               rest of this desktop was designed around, listed in
+#               full under [keybindings] at the bottom of this file.
+#   "omarchy"   Omarchy's own bindings mapped onto chonkstep's
+#               actions: super+return for a terminal, super+w to
+#               close, super+space for Omarchy's menu, super+tab
+#               between workspaces, and the media, capture,
+#               notification and panel chords running Omarchy's own
+#               commands. 113 bindings; it also declares the 77
+#               [commands] entries they name, so you need none of your
+#               own for them. On a machine that HAS Omarchy on it this
+#               table is only the fallback -- your live ~/.config/hypr/
+#               is read instead; see `hyprland_config` below.
+#
+# A keymap REPLACES the other; the two are never merged. A desk
+# answering to both would close a window on alt+shift+q AND on
+# super+w with neither being the documented answer, and would leave a
+# chord one keymap deliberately kills alive because the other bound
+# it. Your own [keybindings] entries still merge over whichever is
+# active, so bringing one binding back from the other vocabulary is
+# one line.
+#
+# Omarchy chords that name a TILING action (window gaps, split ratios,
+# layout cycling, "toggle floating" on a desk where everything already
+# floats) are deliberately left UNBOUND rather than approximated, as
+# are the ones that command Hyprland itself. docs/keybindings.md lists
+# every one of them and why.
+#
+# `desktop = "omarchy"` above defaults this to "omarchy"; setting it
+# here wins either way, so `keymap = "chonkstep"` keeps the posture
+# and the NeXTSTEP chords together.
+#keymap = "omarchy"
+
+# ============================================================
+
+# Read the machine's LIVE Hyprland configuration - ~/.config/hypr/ and
+# Omarchy's shipped defaults - for keybindings, window rules,
+# `exec-once` autostart and `env` session environment. Both syntaxes
+# are read: Lua (Omarchy 4) and the classic `hyprland.conf`.
+#
+# This is what makes the swap invisible. Omarchy's own menu WRITES
+# those files: change a keybinding through their UI and it edits
+# Hyprland config. Without this, that menu would silently stop working
+# the day you switched window managers.
+#
+# It also replaces the keymap above with the live original rather than
+# the hand-transcribed copy of it, so an Omarchy release that moves a
+# chord moves yours too.
+#
+# Left unset, the POSTURE decides: on under `desktop = "omarchy"` or
+# `keymap = "omarchy"` (you have already asked for these bindings), off
+# otherwise (a plain chonkstep desk reads nobody else's files - a
+# stale ~/.config/hypr from an afternoon spent trying Hyprland must
+# never silently replace your keymap).
+#
+# Set it explicitly to override that either way. `false` is the escape
+# hatch; `true` turns it on for a chonkstep desk that wants it anyway.
+#
+# Your own settings in THIS file always win: a [keybindings] entry
+# beats any chord read from there, "none" still unbinds one, and a
+# [commands] entry of the same name replaces the one the read
+# declared. An edit to your Hyprland config takes effect within a
+# second, with no restart. See docs/hyprland-config.md for what is
+# read, what is ignored and why, and the precedence in full.
+#hyprland_config = false
+
+# ============================================================
+
+# Focus policy: false (the default) is click-to-focus, true is
+# focus-follows-mouse. The CHONKSTEP_FOCUS_FOLLOWS_MOUSE environment
+# variable, when set, wins over this value in both directions ("1"
+# forces it on, anything else forces it off).
+#focus_follows_mouse = false
+
+# Whether taking focus also brings the window to the front. This is a
+# separate axis from the focus policy above, not a third focus mode: a
+# click always raises what it lands on, so with click-to-focus this
+# changes nothing. It is focus-follows-mouse that needs it — with the
+# default `true`, the pointer raises every window it merely crosses on
+# its way somewhere else, burying whatever it started from. Set it to
+# false for sloppy focus that leaves the stack alone.
+#autoraise = true
+
+# Whether `opacity` window rules read from a Hyprland configuration
+# (Omarchy's 0.985 focused / 0.96 unfocused default, its opaque
+# browsers and video players) are drawn. A translucent window costs
+# something: everything beneath it is composited too, where an opaque
+# window hides it. Set this to false to draw every window opaque and
+# keep that occlusion; the rules are still read, `SUPER + BACKSPACE`'s
+# session toggle still answers, and `dim_inactive` still dims.
+#window_opacity = true
+
+# Pointer and touchpad hardware configuration. These values are applied to
+# each real libinput device when it appears and re-applied after a live config
+# reload. Unsupported settings are skipped per device instead of preventing
+# the remaining settings from taking effect.
+#
+# Sensitivity is -1.0 through 1.0. The acceleration profile is "adaptive" or
+# "flat". Scrolling is configured per device class: `natural_scroll` and
+# `scroll_factor` (a positive multiplier for smooth and wheel scrolling) under
+# `[input]` apply to mice, trackpoints and other non-touchpad devices, and under
+# `[input.touchpad]` apply to touchpads only. The remaining touchpad-oriented
+# controls may be written in either table; the nested one overrides the flat key.
+# disable_while_typing defaults to each device’s libinput preference. Active
+# pointer locks/confinement temporarily disable it so games can accept keyboard
+# and touchpad input together; releasing capture restores the preference.
+#
+# `scroll_method` ("2fg", "edge", "on_button_down" or "no_scroll"),
+# `scroll_button` (an evdev button code up to 300; 0 is the device's own) and
+# `middle_button_emulation` follow the same class split as `natural_scroll`.
+# The tapping settings reach touchpads only: `tap_and_drag`, `drag_lock`,
+# `tap_button_map` ("lrm" or "lmr") and `drag_3fg` (0 off, 1 three fingers,
+# 2 four fingers; needs libinput 1.27). Removing any of these restores each
+# device's default. `numlock_by_default` locks Num Lock when the keymap is
+# installed, not on every reload.
+#[input]
+#sensitivity = 0.0
+#accel_profile = "adaptive"
+#left_handed = false
+#numlock_by_default = true
+#scroll_method = "on_button_down"
+#scroll_button = 274
+#
+#[input.touchpad]
+#natural_scroll = true
+#tap_to_click = false
+#disable_while_typing = true
+#clickfinger_behavior = true
+#scroll_factor = 0.4
+#middle_button_emulation = true
+#tap_and_drag = true
+#drag_lock = false
+#tap_button_map = "lrm"
+#drag_3fg = 1
+
+# When the pointer gets out of the way on its own. `hide_on_key_press` hides it
+# while you type into a window (a bare modifier or a key bound to a desktop
+# action does not count); `hide_on_touch` hides it after a touchscreen tap; and
+# `inactive_timeout` hides it after that many seconds without pointer input
+# (0 never). The next pointer motion, click or scroll shows it again. This is
+# read after an Omarchy or Hyprland configuration, so it overrides its `cursor`
+# settings. The screensaver's own cursor hide is separate and unaffected.
+#[cursor]
+#hide_on_key_press = true
+#hide_on_touch = true
+#inactive_timeout = 0
+
+# UI scale factor for HiDPI displays: multiplies every pixel dimension
+# in the window chrome, cursors, and terminal font as one system.
+# The CHONKSTEP_SCALE environment variable, when set to a valid value,
+# wins over this. When neither is set, Wayland automatically selects a
+# per-output scale from physical DPI (and recognizes high-resolution internal
+# laptop panels even when their driver omits physical dimensions); X11
+# defaults to 1.0. Must be a finite number greater than zero; an invalid value
+# falls through to the next source rather than breaking startup.
+#
+# Applied by a reload, live. Two things do not follow, both because
+# they are read by other processes at the moment those processes start:
+# an application already running keeps the font size and the cursor
+# size it was launched with. Anything launched after the reload gets
+# the new scale. A theme-only reload retains the detected or live monitor
+# scale instead of replacing it with 1.0.
+#scale = 2.0
+
+# Theme to start in. One of the built-in theme ids:
+#   "nextstep-classic" (the flagship default)
+#   "amber-phosphor"
+#   "teal-blueprint"
+#   "graphite"
+#   "next-lavender"
+#   "jade-lacquer"
+#   "ivory-halftone"   (natively light; every theme has both moods)
+#   "indigo-filament"
+# or "omarchy", which is not a theme of its own but an instruction:
+# follow Omarchy. The desktop reads the palette Omarchy is currently
+# wearing (~/.local/state/omarchy/current/theme/colors.toml, the file
+# `omarchy-theme-set` maintains) and dresses in it -- chrome,
+# menus, terminal palette -- keeping chonkstep's own geometry. It keeps
+# watching that file, so `omarchy-theme-set catppuccin-latte` re-dresses
+# this desk within a second, light or dark as the palette says. With
+# Omarchy absent or its palette unreadable, the flagship stands in
+# (warned once) until one appears. The same entry appears in the Theme
+# submenu as "Omarchy (<theme>)" whenever there is a palette to follow.
+# A theme picked from the root menu's Theme submenu is persisted and
+# wins over this value on every later startup -- the menu is the more
+# recent gesture; this line is only the starting point. An unknown id
+# is warned about and ignored. Picking one from the menu applies it
+# immediately, in place: the chrome, the menus, the wallpaper
+# restyle without the session restarting. Terminals
+# already open keep the palette they were launched with.
+#theme = "nextstep-classic"
+
+# Which side of the light/dark axis the desktop starts on: "light" or
+# "dark". This is a separate axis from `theme` -- every built-in theme
+# has a deliberate rendition for each side (chrome, menus, tiles,
+# terminal palette, and the wallpaper artwork itself change mood; the
+# theme's identity and geometry do not) -- and it is session-wide: a
+# switch restyles the chrome, retints running terminals, and tells
+# GTK/portal applications to follow, live.
+#
+# Precedence mirrors `theme`'s spirit: the running desktop publishes
+# its current mode to $XDG_STATE_HOME/chonkstep/appearance and reads
+# that file back at startup, so this line only decides the very first
+# session (or a fresh state directory). With neither said, the selected
+# theme's own native mood applies -- dark for seven of the built-ins,
+# light for ivory-halftone -- so leaving this alone changes nothing.
+#
+# While following Omarchy (theme = "omarchy") the palette's own `mode`
+# decides, and this line -- and any request written to the file below --
+# is declined with a note in the log: an Omarchy palette has one mood,
+# and the way to change it is `omarchy-theme-set`.
+#
+# The live way to switch is not this file but the request file: write
+# "light", "dark" or "toggle" to
+# $XDG_STATE_HOME/chonkstep/appearance-request and the session applies
+# it within a tick. See docs/appearance.md for the whole chain,
+# including exactly which applications follow live and which wait for
+# their next launch. An unknown value is warned about and ignored.
+#appearance = "dark"
+
+# Frame geometry and glyphs, independent of the palette and Mac keyboard mode.
+# Exact spellings: "auto" (default), "windowmaker", "system7", or "modern".
+# Auto follows the theme's recipe; an explicit value overrides window frames.
+# Edit this line, then run /usr/lib/chonkstep/reload.sh. Both backends and XWayland update in place.
+# System 7 chrome is always light, including when appearance is dark.
+# See docs/decoration-styles.md for capture references and scaling policy.
+#decoration_style = "auto"
+
+# Overview arrangement is independent of themes and experimental Mac keyboard input.
+# "classic" (default): Mission Control-style desktop strip and large window previews.
+# "cards": numbered workspace cards with modern themes; classic fallback otherwise.
+# Changing this while Overview is open closes it; the next opening uses the new layout.
+#overview_style = "classic"
+
+# Where a newly mapped window goes when the application itself asked
+# for no particular position (an explicit position, like a terminal's
+# -geometry +x+y, is always honored instead). One of:
+#   "smart"    (the default) smart placement: scan the usable screen
+#              for the spot overlapping the least existing window
+#              area, preferring fully free space, biased toward the
+#              top-left so windows fill the screen in reading order
+#   "cascade"  the classic staircase -- each new window steps down and
+#              right by one titlebar, so every titlebar stays visible
+#   "center"   every new window dead-center in the usable screen
+# Case-insensitive. An unknown value is warned about and "smart" is
+# kept.
+#placement = "smart"
+
+# Edge resistance for interactive moves, in whole pixels: while a
+# window is being dragged, any frame edge that comes within this
+# distance of a screen edge or another window's edge snaps flush
+# against it, so windows line up without pixel-hunting. Larger values
+# grab from farther away; 0 disables snapping entirely. Must be a
+# non-negative integer -- anything else is warned about and the
+# default of 10 is kept.
+#edge_resistance = 10
+
+# Font size of the themed Foot terminal, in pixels at 1x scale.
+# The default 12 matches Omarchy's Foot setting of 9pt at 96 DPI.
+# On Wayland, Foot applies the output scale itself: a 2x display renders
+# 24px text. X11 applies the desktop's UI scale before launching Foot.
+#
+# Terminals open at 80 columns by 24 rows when that fits the workarea,
+# falling back to a fraction of the monitor for unusually large fonts.
+# Colors follow the active theme; the font size is the same in every
+# theme. A custom `terminal` command keeps its own font settings.
+#
+# Must be a number between 6 and 96 -- outside that it is warned about
+# and the default of 12 is kept.
+#terminal_font_px = 12
+
+# Session restore: when true, the desktop records every window's
+# application, geometry, workspace and shape (maximized / shaded /
+# miniaturized) as you work, and relaunches that layout the next time
+# the session starts -- after a logout, and after a crash the watchdog
+# recovered from. Windows you closed are forgotten the moment you
+# close them; restore never resurrects anything you deliberately
+# dismissed. Matching is by application window class, first mapped
+# window first, so an application that opens several windows gets them
+# back in recorded order. Off by default: a session that spawns
+# applications you did not just ask for is something to opt into.
+#restore_session = true
+
+# Keyboard-shortcut inhibition. A VM console or a remote-desktop viewer
+# can ask, through zwp_keyboard_shortcuts_inhibit_v1, to receive every
+# chord the desktop would otherwise take; while the grant is in force
+# every binding goes to that client. It is granted to the focused
+# client by default (never to a sandboxed one), and the escape chord
+# is the way back on the keyboard: it suspends the focused client's
+# inhibitor and swallows itself, and a second press resumes the grant.
+# Suspension belongs to the window, so destroying and recreating the
+# inhibitor, or a focus round trip, does not get the grant back. The
+# same chord releases an X11 client's XGrabKeyboard. Any key spec, or
+# "none" to have no way back but a VT switch. The default is bound by
+# no preset keymap, and a test keeps it that way.
+#
+# allow_shortcut_inhibit = false answers every request with no grant --
+# Hyprland's binds:disable_keybind_grabbing = true, which the live
+# Hyprland configuration also sets. See docs/keybindings.md.
+#allow_shortcut_inhibit = true
+#shortcuts_inhibit_escape = "super+shift+escape"
+
+# Omarchy's own command menu, hosted as the `Omarchy` submenu of the
+# root menu (right-click the desktop): Learn, Trigger, Style, Setup,
+# Install, Remove, Update, About, System -- every entry Omarchy's shell
+# offers under its Super+Alt+Space menu, read from Omarchy's own
+# definition (`$OMARCHY_PATH/default/omarchy/omarchy-menu.jsonc` plus
+# your `~/.config/omarchy/extensions/omarchy-menu.jsonc`) each time it
+# changes, so an Omarchy upgrade or an extension you write shows up
+# without chonkstep knowing anything about it. Entries run exactly as
+# Omarchy runs them (`bash -lc <action>`), and their `when`/`checked`/
+# `disabled` conditions are evaluated the way Omarchy evaluates them,
+# in the background, never on the desktop's own thread. Entries that
+# would command Hyprland (`hyprctl`, `omarchy-hyprland-*`) are left
+# out; Omarchy's launcher-backed submenus (Apps, Font) are too, since
+# the Applications submenu above is the same thing.
+#
+# On by default, and inert on a machine without Omarchy -- no
+# definition file, no submenu. Set it to false to keep the root menu
+# to chonkstep's own rows.
+#omarchy_menu = true
+
+# Whether a Wayland session starts Omarchy's shell -- the Quickshell
+# process behind Omarchy's bar, panels, notifications, on-screen
+# display, pickers and lock screen -- exactly as Omarchy's own Hyprland
+# configuration starts it (`omarchy-launch-shell`). Most of the Omarchy
+# menu is only half a feature without it: "Network speed test", "Style
+# > Theme", the volume keys, all end in a panel that shell draws.
+#
+# On by default, and inert without Omarchy's shell installed or on the
+# X11 stack, where Quickshell cannot run. Its Background plugin is the
+# one part chonkstep declines: the desktop keeps its own wallpaper and
+# root menu, so a right-click on the desk is still chonkstep's. Its bar
+# starts hidden and is switched on from the root menu's "Omarchy Bar"
+# row (the choice is remembered, in chonkstep's state, not Omarchy's).
+# Set this to false to run a plain chonkstep desk on an Omarchy
+# machine, or to start the shell yourself from `autostart`.
+#omarchy_shell = true
+
+# Whether that hosted bar starts ON SCREEN. Unset by default, which
+# means "hidden": a chonkstep desk already has its Dock in the corner
+# and does not want a second instrument strip unasked. Setting it true
+# is what `desktop = "omarchy"` does, because there the bar is the
+# desk's furniture rather than a guest's.
+#
+# Shown means shown AND accounted for: the bar reserves its strip at
+# the top and the Dock steps down below it. Hidden means the bar keeps
+# running -- keeps its clock, keeps its state -- and takes no space,
+# no clicks and no pixels.
+#
+# This is the starting point and not the last word:
+# the root menu's "Omarchy Bar" row remembers your choice in
+# chonkstep's own state (never in Omarchy's -- a preference about this
+# desk should not follow you into a Hyprland session), and a
+# remembered choice wins over this key. To go back to letting this key
+# decide, delete $XDG_STATE_HOME/chonkstep/omarchy-bar.
+#
+# Inert unless the session is actually hosting Omarchy's shell: with
+# `omarchy_shell = false`, or on X11, there is no bar for this to be
+# about.
+#omarchy_bar = true
+
+# The modifier for the move/resize drag gesture: hold it and drag with
+# the LEFT button anywhere on a window to move it, or with the RIGHT
+# button to resize it from whichever third of the window you grabbed
+# (a corner ninth pulls that corner; the middle pulls the bottom-right,
+# where the resize bar lives). One of "alt" (the default, and what
+# Window Maker has always used), "super", "control", or "none" to turn
+# the gesture off.
+#
+# This is not only a convenience. A window whose client draws its own
+# chrome has no titlebar of ours to drag and no resize bar to pull, and
+# if that client then draws nothing -- a terminal configured
+# `decorations = "None"` for a tiling desktop does exactly that -- this
+# gesture is the only way to move or resize it at all. Control+Escape
+# opens its window commands menu for the same reason.
+#
+# Set it to "super" if you use an application that wants Alt+drag for
+# itself (CAD programs, GIMP, Blender); KDE and labwc both moved to the
+# super key for that reason.
+#drag_modifier = "alt"
+
+# Screen locker for crash recovery, Wayland session only. When the
+# compositor crashes, scripts/wayland-session.sh restarts it; if this
+# names a locker (any ext-session-lock client, e.g. "swaylock", split
+# on whitespace for arguments), the recovered session comes back
+# LOCKED instead of exposing your desktop to whoever walks past while
+# you are away. `desktop = "omarchy"` supplies Omarchy's own
+# `omarchy-system-lock` entry point unless you override it, waiting for
+# the freshly relaunched shell's lock IPC to become ready. If no command
+# resolves, recovery fails closed and returns to the login boundary
+# rather than exposing the desktop. This never runs normally.
+#lock_command = "swaylock"
+
+# The terminal emulator "spawn-terminal" launches, and the one
+# Terminal=true desktop entries run inside. Unset means the built-in
+# terminal (foot), which is the only one this desktop can theme
+# end-to-end: the palette, font size and geometry are passed on foot's
+# command line. Name something else and it is launched exactly as
+# written -- it keeps its own colors and its own idea of how big it
+# should be, and a light/dark switch leaves it alone. That is the
+# trade, and it is worth it if you already have a terminal configured
+# the way you like it.
+#
+# A string is split on whitespace; an array is taken verbatim, which is
+# how you pass an argument that itself contains a space.
+#terminal = "alacritty"
+#terminal = ["ghostty", "--title", "my terminal"]
+
+# Commands to run once when the session starts, in the order written.
+# Nothing runs on a reload, and nothing runs on a hot restart -- these
+# start a session, they do not re-start one. Each entry is a command
+# line in the same two spellings as `terminal` above.
+#
+# The usual residents are the small daemons a desktop wants around it:
+# a clipboard manager, an automounter, a notification bridge -- and the
+# Dock. `chonk-dock` is never started automatically, whichever
+# `desktop` is chosen above; listing it here is how you get it at every
+# login. Omarchy's shell is NOT one of them -- `omarchy_shell = true`
+# above already starts it through Omarchy's own launcher, and listing
+# it here too would start it twice.
+#autostart = [
+#  "chonk-dock",
+#  "wl-paste --watch cliphist store",
+#  "udiskie --automount --no-notify --no-tray",
+#]
+
+# Named commands a keybinding can run, by name.
+#
+# Bindings name a command; they never contain one. That keeps the
+# binding vocabulary closed and checkable -- a name that is not
+# declared here is reported at startup, with the key and the name, and
+# the binding is dropped rather than left to fail silently when pressed.
+# It also gives each command one place to be spelled correctly.
+#
+# Same two spellings as `terminal` above: a string is split on
+# whitespace, an array is taken verbatim.
+# `omarchy-menu` is already declared by both keymaps for Super+Space;
+# an entry here can override its command.
+#[commands]
+#omarchy-menu = "omarchy-menu toggle"
+#volume-up    = "omarchy-audio-output-volume up"
+#volume-down  = "omarchy-audio-output-volume down"
+#lock         = "omarchy-system-lock"
+#notify       = ["notify-send", "hello world"]
+
+# Keybindings. Entries here merge OVER the defaults: listing a combo
+# overrides only that combo, and every unlisted default stays bound.
+# The special value "none" unbinds a combo outright.
+#
+# Key spec grammar: case-insensitive, "+"-separated modifier tokens
+# followed by exactly one key token, e.g. "alt+shift+return".
+#   Modifiers: alt, shift, ctrl (or control), super (or mod4, win)
+#   Keys: single letters and digits (a-z, 0-9), return (or enter), tab,
+#         space, escape, left, right, up, down, home, end, pageup,
+#         pagedown, minus, equal, comma, period, bracketleft,
+#         bracketright, print, f1 through f12
+#   Media keys (the ones with pictures on them rather than letters):
+#         volumeup, volumedown, volumemute (or mute), micmute,
+#         playpause (or audioplay), audiopause, audiostop, audionext,
+#         audioprev, brightnessup, brightnessdown, kbdbrightnessup,
+#         kbdbrightnessdown, kbdlightonoff, poweroff, calculator,
+#         eject, search
+#         These take modifiers like any other key, and are usually
+#         bound bare: "volumeup" = "run volume-up"
+#   Numeric keypad:
+#         kp0 through kp9, kpenter, kpadd, kpsubtract, kpmultiply,
+#         kpdivide, kpdecimal, kpseparator, kpequal
+#         kpenter is the keypad's own Enter, a different key from
+#         return. Each digit is also spellable by its NumLock-off
+#         name -- kp1/kpend, kp2/kpdown, kp3/kpnext, kp4/kpleft,
+#         kp5/kpbegin, kp6/kpright, kp7/kphome, kp8/kpup,
+#         kp9/kpprior, kp0/kpinsert, kpdecimal/kpdelete -- and the
+#         two spellings name the same key either way NumLock is set.
+#
+# Actions (kebab-case, a closed set):
+#   spawn-terminal, close, toggle-maximize, toggle-shade, miniaturize,
+#   toggle-fullscreen, focus-left, focus-right, focus-up, focus-down,
+#   workspace-next, workspace-prev,
+#   workspace-carry-next, workspace-carry-prev, overview, window-menu,
+#   reload, restart, none
+#
+# ...plus four actions that take an argument:
+#
+#   "workspace <n>"        go to workspace n
+#   "workspace-carry <n>"  take the focused window to workspace n, and
+#                          follow it there
+#   "workspace-send <n>"   send the focused window to workspace n, but
+#                          keep this workspace on screen
+#   "run <name>"           run the [commands] entry called <name>. The
+#                          argument is a name, never a command line --
+#                          see [commands] above for why.
+#
+# Workspaces are numbered from 1 here -- the way the window menu's
+# "Move To" submenu numbers them, and the way Hyprland, GNOME and every
+# bar that draws a workspace strip number them. 1 through 99 are
+# accepted; "workspace 0" is not an action and is skipped with a
+# warning, because a file that counts from zero is off by one on every
+# other line too.
+#
+# Naming a workspace that does not exist yet CREATES it, and any gap
+# before it: on a desk with three workspaces, "workspace 7" leaves you
+# on the seventh of seven. That is not a special case for this verb --
+# chonkstep's workspaces have always grown on demand and are never
+# destroyed, which is exactly what "workspace-next" does off the end of
+# the row. The Overview and Omarchy bar show whichever workspaces were added
+# to.
+#
+# "reload" re-reads this file and applies it in place; "restart"
+# re-execs the on-disk binary to pick up a new build. See the note at
+# the top of this file for which one you want.
+#
+#
+# Window-targeted actions (close, toggle-maximize, toggle-shade,
+# miniaturize, toggle-fullscreen, focus-left/right/up/down, window-menu)
+# act on the focused window and do nothing when no window is focused.
+# The Alt+Tab window switcher is part of the window manager's modal
+# machinery and is not rebindable here.
+[keybindings]
+# The full default set, spelled out -- this is the "chonkstep" keymap.
+# Since entries merge over the defaults, restating them changes
+# nothing -- edit or remove lines freely; unlisted combos keep their
+# default meaning. With `keymap = "omarchy"` above, these entries
+# merge over Omarchy's table instead, and every line below that you
+# have not edited is simply an extra binding on top of it.
+"alt+shift+return" = "spawn-terminal"       # launch the themed terminal
+"super+space" = "run omarchy-menu"          # open Omarchy's launcher (Command+Space on Mac)
+"alt+shift+q" = "close"                     # close the focused window
+"alt+shift+x" = "toggle-maximize"           # maximize / restore
+"alt+shift+s" = "toggle-shade"              # roll the window up into its titlebar
+"alt+shift+m" = "miniaturize"               # collapse to an icon tile
+"alt+shift+f" = "toggle-fullscreen"         # borderless fullscreen on / off
+"control+escape" = "window-menu"            # window commands menu, no titlebar needed
+"alt+ctrl+right" = "workspace-next"         # next workspace (grows on demand)
+"alt+ctrl+left" = "workspace-prev"          # previous workspace (stops at the first)
+"alt+shift+right" = "workspace-carry-next"  # carry the focused window along
+"alt+shift+left" = "workspace-carry-prev"   # carry the focused window back
+"super+up" = "overview"                     # the modal Overview (see below)
+"super+shift+3" = "capture-screen"          # Wayland: screen PNG + clipboard
+"super+shift+4" = "capture-area"            # drag an area; Space selects a window
+"super+shift+5" = "capture"                 # screenshot / recording toolbar
+"super+ctrl+escape" = "capture-stop"        # finish the active screen recording
+# Omarchy defaults add Ctrl to Shift+3/4/5, preserving desktop-carry bindings.
+# Omit the three numbered lines above to retain Omarchy's choices.
+
+# Workspaces by number are unbound in this keymap -- the defaults above
+# reach them by stepping -- but the verbs are there for the taking, and
+# `keymap = "omarchy"` binds all thirty of them on super+1..0,
+# super+shift+1..0 and super+shift+alt+1..0 for a user who arrives with
+# that muscle memory:
+#"alt+ctrl+1" = "workspace 1"                # go to the first workspace
+#"alt+shift+1" = "workspace-carry 1"         # ...and take this window along
+#"alt+ctrl+shift+1" = "workspace-send 1"     # ...or send it and stay here
+
+# "overview" opens a modal view of every window on the current desk as
+# large live previews, with a desktop strip across the top on Wayland
+# (the native X11 raster fallback keeps its strip at the bottom).
+# While it is open the keys are fixed modal machinery, like the Alt+Tab
+# switcher's: arrows move the selection, Return (or clicking a tile)
+# focuses and raises that window, clicking a workspace tile switches
+# desks, and Escape, a second press of this binding, or any other key
+# dismisses it.
+
+# Both are unbound by default. Give "reload" a key and this file
+# applies itself without you touching a terminal; give "restart" one
+# for after a rebuild:
+#"super+r" = "reload"
+#"super+shift+r" = "restart"
+
+# Unbinding: "none" makes a combo do nothing, without re-listing the
+# rest of the defaults. For example, to free alt+shift+q for some other
+# application:
+#"alt+shift+q" = "none"
+
+# Decoration overrides. You should not need these.
+#
+# Who draws a window's titlebar is settled on one of two protocols, and
+# the two mean different things by "client-side". The standard
+# xdg-decoration is a NEGOTIATION the compositor concludes, and this
+# desktop concludes every one of them the same way: server-side, its
+# own chrome. A client that asked for client-side hears "server-side"
+# back and, by the protocol it chose, draws no titlebar of its own.
+# That is what puts a frame on Omarchy's terminals -- alacritty
+# `decorations = "None"`, kitty `hide_window_decorations yes`, every
+# `org.omarchy.*` class Omarchy invents -- which ask for chrome they
+# would never draw. KDE's older org_kde_kwin_server_decoration, the only
+# decoration protocol GTK speaks, is a DECLARATION: a client saying
+# client-side there has already laid itself out around its own header
+# bar, and is believed. So is a GTK4 window that binds the protocol and
+# says nothing, which is how a libadwaita header bar declares itself.
+# Those windows get EDGE chrome: this desktop's borders and resize
+# handles around the client, and no titlebar or buttons of ours, so
+# there is still exactly one titlebar and the window still resizes. An
+# X11 or XWayland client declining decoration through _MOTIF_WM_HINTS (a
+# game, usually) gets no chrome at all. A client that speaks neither
+# protocol is framed.
+#
+# The lists correct the ways that can still come out wrong, and each
+# entry is a case-insensitive PREFIX of the application's app_id
+# (Wayland) or its WM_CLASS (X11 and XWayland), so one entry covers a
+# family. Whichever session you log into, the same entry means the same
+# thing. The name to write is in the session log, on the line that
+# reports how the window was mapped -- "mapped and decorated window",
+# "mapped window with edge chrome" or "mapped window undecorated", each
+# followed by `app=<the name>`.
+#
+# Strongest first: server_side, then client_side, then what the client
+# declared, then frame_client_drawn.
+#
+#[decorations]
+# Never draw chrome for these, not even edges; the client's own is the
+# only one. For a client whose bare surface is the point -- a borderless
+# game, a kiosk -- and for a client that speaks neither protocol and
+# really does draw its own titlebar.
+#client_side = ["borderless-game"]
+#
+# Draw this desktop's whole frame, titlebar included, whatever the
+# client says. Only matters where the client's word is otherwise final:
+# a KDE-protocol client that declares its own chrome and then draws none
+# gets only edges, an X11 client that declines decoration is a bare
+# rectangle, and one line here gives either a titlebar. (A window
+# with no chrome from either side is still movable and resizable -- see
+# drag_modifier above -- just bare.) An xdg client never needs this; it
+# is framed already.
+#server_side = ["bare.kde.app"]
+#
+# Give every window that silently draws its own titlebar (a GTK4 or
+# libadwaita header bar) this desktop's full frame instead of edges: our
+# titlebar and buttons above its header bar. A client that declared its
+# chrome outright keeps its edges, and the lists above outrank this.
+# Header bars show minimize and maximize either way: the session
+# publishes the GNOME button layout "appmenu:minimize,maximize,close"
+# unless you have set a layout of your own.
+#frame_client_drawn = false
+# Native Wayland desktop swipes (left/right workspaces, up/down Overview).
+# See gestures.md. This table is independent of two-finger scrolling.
+#[input.gestures]
+#enabled = true
+#fingers = 0       # both three and four fingers; or choose 3 or 4
+#distance = 80     # logical touchpad travel, accepted range 24..1000
+
+# Whether, and how fast, the transitions the compositor starts on its own
+# move: spatial-layout reflows, keyboard Overview open/close, and the
+# settle after a released swipe. Fingers on a touchpad move the desktop
+# 1:1 regardless. Wins over Omarchy's `animations.enabled` and
+# `hl.animation` switches (see hyprland-config.md); a reload applies it
+# to transitions already in flight.
+#[motion]
+#enabled = true          # false: every such transition completes in one frame
+#layout = true           # spatial-layout reflow motion
+#overview = true         # keyboard and pointer Overview open/close
+#gesture_settle = true   # the spring after a released swipe
+#speed = 1.0             # multiplies the spring's stiffness; 0.25..=4

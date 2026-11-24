@@ -1,0 +1,188 @@
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Point {
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Size {
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Size {
+    pub const fn new(w: u32, h: u32) -> Self {
+        Self { w, h }
+    }
+}
+
+/// Absolute ceiling for one client window dimension in physical
+/// pixels. The effective limit is normally the desktop's own extent
+/// (see [`client_size_limit`]); this second guard keeps a malformed
+/// multi-output layout or an unattached protocol surface from turning
+/// a client-controlled size into a multi-gigabyte decoration buffer.
+pub const MAX_CLIENT_WINDOW_DIMENSION: u32 = 8192;
+
+/// Largest useful client size on this desktop.
+///
+/// A managed window cannot expose pixels beyond the union of the
+/// outputs, so accepting a larger content rectangle only increases
+/// allocations and protocol work. Each axis is independently bounded
+/// by the real desktop and by [`MAX_CLIENT_WINDOW_DIMENSION`]. A
+/// temporarily empty output layout still permits a 1x1 safe fallback.
+pub const fn client_size_limit(screen: Size) -> Size {
+    Size::new(
+        if screen.w == 0 {
+            1
+        } else if screen.w > MAX_CLIENT_WINDOW_DIMENSION {
+            MAX_CLIENT_WINDOW_DIMENSION
+        } else {
+            screen.w
+        },
+        if screen.h == 0 {
+            1
+        } else if screen.h > MAX_CLIENT_WINDOW_DIMENSION {
+            MAX_CLIENT_WINDOW_DIMENSION
+        } else {
+            screen.h
+        },
+    )
+}
+
+pub const MAX_SUBSURFACE_DEPTH: u32 = 64;
+
+/// Whether attaching a child to a parent would push some root-to-leaf
+/// path past [`MAX_SUBSURFACE_DEPTH`].
+///
+/// `parent_depth` is how many links already separate the parent from
+/// its own root; `child_height` is how many already separate the child
+/// from the deepest leaf *below* it. Both halves are needed, and the
+/// second is the one that is easy to miss: `wl_subcompositor` lets a
+/// client build its chain leaf-first — attach S1 under S2, then S2
+/// under S3 — and every one of those calls presents a parent that has
+/// no parent of its own. A bound that counted only the distance to the
+/// root would read zero on every link of that construction and never
+/// fire.
+///
+/// The sum is the length of the longest path through the new link, and
+/// it is the same number for the parent and for every ancestor above
+/// it, which is why one check at one link is enough to keep the whole
+/// tree bounded. Saturating, because both halves are client-driven.
+pub const fn subsurface_link_exceeds_depth(parent_depth: u32, child_height: u32) -> bool {
+    parent_depth.saturating_add(1).saturating_add(child_height) > MAX_SUBSURFACE_DEPTH
+}
+
+/// Bounds an untrusted client size before it can reach layout or
+/// raster allocation. Zero is preserved because protocol-specific
+/// callers use it to mean "unspecified"; positive dimensions are
+/// capped to the useful desktop limit.
+pub const fn clamp_client_size(size: Size, screen: Size) -> Size {
+    let limit = client_size_limit(screen);
+    Size::new(
+        if size.w > limit.w { limit.w } else { size.w },
+        if size.h > limit.h { limit.h } else { size.h },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Rect {
+    pub pos: Point,
+    pub size: Size,
+}
+
+impl Rect {
+    pub const fn new(pos: Point, size: Size) -> Self {
+        Self { pos, size }
+    }
+
+    /// Whether `p` (in the same coordinate space as this rect) falls
+    /// within it. Half-open: the far edge is excluded.
+    pub fn contains(&self, p: Point) -> bool {
+        p.x >= self.pos.x
+            && p.y >= self.pos.y
+            && (p.x as i64) < self.pos.x as i64 + self.size.w as i64
+            && (p.y as i64) < self.pos.y as i64 + self.size.h as i64
+    }
+
+    /// Half-open intersection, including rectangles crossing the signed
+    /// coordinate limit. Empty rectangles never contribute visible pixels.
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.pos.x.max(other.pos.x);
+        let y = self.pos.y.max(other.pos.y);
+        let right = (self.pos.x as i64 + self.size.w as i64)
+            .min(other.pos.x as i64 + other.size.w as i64);
+        let bottom = (self.pos.y as i64 + self.size.h as i64)
+            .min(other.pos.y as i64 + other.size.h as i64);
+        (right > x as i64 && bottom > y as i64).then(|| {
+            Self::new(Point::new(x, y), Size::new((right - x as i64) as u32, (bottom - y as i64) as u32))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rect_contains_is_half_open() {
+        let r = Rect::new(Point::new(10, 10), Size::new(5, 5));
+        assert!(r.contains(Point::new(10, 10)));
+        assert!(r.contains(Point::new(14, 14)));
+        assert!(!r.contains(Point::new(15, 15)));
+        assert!(!r.contains(Point::new(9, 10)));
+    }
+
+    #[test]
+    fn rectangles_handle_extreme_coordinates_and_empty_intersections() {
+        let rect = Rect::new(Point::new(i32::MAX - 10, i32::MIN), Size::new(100, u32::MAX));
+        assert!(rect.contains(Point::new(i32::MAX, 0)));
+        assert!(!rect.contains(Point::new(i32::MAX - 11, 0)));
+        let part = Rect::new(Point::new(i32::MAX, 0), Size::new(1, 1));
+        assert_eq!(rect.intersection(part), Some(part));
+        assert_eq!(part.intersection(rect), Some(part));
+        assert_eq!(rect.intersection(Rect::new(rect.pos, Size::default())), None);
+        let adjacent = Rect::new(Point::new(10, 0), Size::new(5, 5));
+        assert_eq!(adjacent.intersection(Rect::new(Point::new(0, 0), Size::new(10, 5))), None);
+    }
+
+    #[test]
+    fn client_size_is_bounded_by_the_desktop_and_absolute_ceiling() {
+        assert_eq!(
+            clamp_client_size(Size::new(u32::MAX, 100_000), Size::new(2560, 1600)),
+            Size::new(2560, 1600)
+        );
+        assert_eq!(
+            client_size_limit(Size::new(20_000, 10_000)),
+            Size::new(MAX_CLIENT_WINDOW_DIMENSION, MAX_CLIENT_WINDOW_DIMENSION)
+        );
+        assert_eq!(
+            clamp_client_size(Size::new(640, 480), Size::new(2560, 1600)),
+            Size::new(640, 480)
+        );
+    }
+
+    #[test]
+    fn subsurface_depth_counts_both_sides_of_a_new_link() {
+        // A toolkit's real tree: two links under a toplevel.
+        assert!(!subsurface_link_exceeds_depth(2, 0));
+        // The last link that fits, and the first that does not.
+        assert!(!subsurface_link_exceeds_depth(MAX_SUBSURFACE_DEPTH - 1, 0));
+        assert!(subsurface_link_exceeds_depth(MAX_SUBSURFACE_DEPTH, 0));
+        // The leaf-first construction: the parent is a fresh root every
+        // time, and the whole chain hangs below the child. A bound that
+        // read only `parent_depth` would pass every one of these.
+        assert!(!subsurface_link_exceeds_depth(0, MAX_SUBSURFACE_DEPTH - 1));
+        assert!(subsurface_link_exceeds_depth(0, MAX_SUBSURFACE_DEPTH));
+        // Meeting in the middle is the same arithmetic.
+        assert!(!subsurface_link_exceeds_depth(31, 32));
+        assert!(subsurface_link_exceeds_depth(32, 32));
+        // Neither client-supplied half can wrap the sum past the bound.
+        assert!(subsurface_link_exceeds_depth(u32::MAX, u32::MAX));
+    }
+}

@@ -1,0 +1,1151 @@
+
+use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::time::{Duration, Instant};
+
+use wm_core::{LayoutMode, MonitorInfo};
+use wm_theme_api::{Point, Rect, Size};
+
+use crate::apps::{match_window_class, AppEntry};
+
+/// How long a changed layout must hold still before it is written.
+/// Long enough that a drag writes once at its end rather than along
+/// its path, short enough that the window between "the user arranged
+/// something" and "a crash would keep it" stays negligible.
+pub const DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// How long after startup a pending record may wait for its window.
+/// Generous because a cold application launch on a busy disk is slow;
+/// bounded because a record that outlived its grace would otherwise
+/// claim whatever same-class window the user opens next week.
+pub const RESTORE_GRACE: Duration = Duration::from_secs(30);
+
+// Restore is a bounded startup operation, including damaged files. These are
+// generous file/record limits, not user-facing window-management settings.
+const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RECORD_BYTES: usize = 64 * 1024;
+const MAX_RECORDS: usize = 4096;
+
+/// One remembered window: everything restore needs to relaunch its
+/// application and re-place its window, and nothing more.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowRecord {
+    pub spatial: Option<SpatialRecord>,
+    /// The window's `WM_CLASS` class / Wayland app id — the matching
+    /// key at restore time.
+    pub class: String,
+    /// The `.desktop` id the class resolved to when the record was
+    /// made (`None` when nothing matched). Resolved at record time
+    /// rather than restore time so a layout survives the application
+    /// index changing shape between sessions — the id is looked up
+    /// again at restore and falls back to a fresh class match.
+    pub app: Option<String>,
+    /// Monitor-relative *content* geometry when `monitor_identity` is
+    /// present, root-relative geometry for legacy records or backends
+    /// without stable output identity. For a maximized window this is
+    /// the pre-maximize geometry (the one worth restoring — the
+    /// maximize itself is re-derived from the flag against whatever
+    /// workarea the new session has).
+    pub geometry: Rect,
+    /// EDID `make model serial` of the physical monitor containing the
+    /// window. Unlike a connector name, this follows the display when
+    /// it is plugged into a different dock port.
+    pub monitor_identity: Option<String>,
+    pub workspace: usize,
+    pub maximized: bool,
+    pub shaded: bool,
+    pub miniaturized: bool,
+}
+
+/// Optional layout metadata. Invalid metadata leaves the base record usable.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SpatialRecord {
+    pub fullscreen_origin: Option<usize>,
+    pub home_geometry: Option<HomeGeometryRecord>,
+    pub floating: bool,
+    pub order: usize,
+    pub flow_width: u32,
+    pub mosaic_weight: [u32; 2],
+    pub output: Option<String>,
+    pub focused: bool,
+    pub floating_geometry: Option<[i64; 4]>,
+    pub floating_monitor: Option<String>,
+}
+
+/// Optional home placement, retained across a restart while a monitor is absent.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HomeGeometryRecord {
+    pub display: String,
+    pub bounds: [i64; 4],
+    pub normal: [i64; 4],
+    pub freeform: Option<[i64; 4]>,
+}
+
+fn rect_record(rect: Rect) -> [i64; 4] {
+    [i64::from(rect.pos.x), i64::from(rect.pos.y), i64::from(rect.size.w), i64::from(rect.size.h)]
+}
+
+impl From<&wm_core::SpaceHomeGeometry> for HomeGeometryRecord {
+    fn from(saved: &wm_core::SpaceHomeGeometry) -> Self {
+        Self { display: saved.display.clone(), bounds: rect_record(saved.bounds),
+            normal: rect_record(saved.normal), freeform: saved.freeform.map(rect_record) }
+    }
+}
+
+impl HomeGeometryRecord {
+    pub fn matches(&self, saved: &wm_core::SpaceHomeGeometry) -> bool {
+        self.display == saved.display && self.bounds == rect_record(saved.bounds)
+            && self.normal == rect_record(saved.normal) && self.freeform == saved.freeform.map(rect_record)
+    }
+
+    pub fn to_geometry(&self) -> Option<wm_core::SpaceHomeGeometry> {
+        let rect = |r: [i64; 4]| Some(Rect::new(
+            Point::new(i32::try_from(r[0]).ok()?, i32::try_from(r[1]).ok()?),
+            Size::new(u32::try_from(r[2]).ok()?, u32::try_from(r[3]).ok()?)));
+        let saved = wm_core::SpaceHomeGeometry { display: self.display.clone(),
+            bounds: rect(self.bounds)?, normal: rect(self.normal)?,
+            freeform: match self.freeform { Some(r) => Some(rect(r)?), None => None } };
+        saved.valid().then_some(saved)
+    }
+}
+
+/// How one record's application should be brought back. Split from the
+/// spawning itself so this module stays free of theme/spawn plumbing
+/// (and therefore trivially testable): the shell owns the actual
+/// launches, through the very paths its menus use.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RelaunchPlan {
+    /// The shell's own themed terminal — special-cased by class
+    /// because launching foot through its bare `.desktop` entry would
+    /// lose the theme's palette, font and geometry that
+    /// `spawn_terminal` exists to apply.
+    Terminal,
+    /// An ordinary `.desktop` application, through the shell's launch
+    /// fixups (scale env, platform args) like any menu launch.
+    App(AppEntry),
+}
+
+/// Converts global geometry to a stable monitor-relative record. The
+/// caller supplies the monitor selected by the window manager's normal
+/// nearest-monitor policy so persistence cannot invent a second idea
+/// of monitor ownership.
+pub(crate) fn relative_to_monitor(monitor: Option<&MonitorInfo>, mut geometry: Rect) -> (Rect, Option<&str>) {
+    let identity = monitor.and_then(|monitor| monitor.identity.as_deref());
+    if let (Some(monitor), Some(_)) = (monitor, identity) {
+        geometry.pos.x = geometry.pos.x.saturating_sub(monitor.geometry.pos.x);
+        geometry.pos.y = geometry.pos.y.saturating_sub(monitor.geometry.pos.y);
+    }
+    (geometry, identity)
+}
+
+/// Resolves a remembered monitor-relative record against the current
+/// output order. If that physical monitor is absent, keep the window
+/// visible by using the current primary (or first) output while
+/// preserving its within-monitor offset. Eight-field legacy records
+/// have no identity and remain absolute exactly as before.
+pub(crate) fn restored_geometry(monitors: &[MonitorInfo], record: &WindowRecord) -> Rect {
+    restored_on_monitor(
+        monitors,
+        record.geometry,
+        record.monitor_identity.as_deref(),
+    )
+}
+
+pub(crate) fn restored_on_monitor(
+    monitors: &[MonitorInfo],
+    mut geometry: Rect,
+    identity: Option<&str>,
+) -> Rect {
+    let Some(identity) = identity else {
+        return geometry;
+    };
+    let target = monitors
+        .iter()
+        .find(|monitor| monitor.identity.as_deref() == Some(identity) || monitor.name == identity)
+        .or_else(|| monitors.iter().find(|monitor| monitor.primary))
+        .or_else(|| monitors.first());
+    let Some(target) = target else {
+        return geometry;
+    };
+    geometry.pos.x = geometry.pos.x.saturating_add(target.geometry.pos.x);
+    geometry.pos.y = geometry.pos.y.saturating_add(target.geometry.pos.y);
+    geometry
+}
+
+/// The store: what has been recorded, what is waiting to be restored,
+/// and when the file was last worth writing.
+pub struct SessionLayout {
+    path: Option<PathBuf>,
+    spaces: Option<wm_core::DisplaySpacesSnapshot>,
+    restored_spaces: Option<wm_core::DisplaySpacesSnapshot>,
+    persisted_spaces: Option<wm_core::DisplaySpacesSnapshot>,
+    modes: Vec<LayoutMode>,
+    restored_modes: Option<Vec<LayoutMode>>,
+    persisted_modes: Vec<LayoutMode>,
+    /// Records loaded at startup and not yet claimed by a mapped
+    /// window. Non-empty exactly while a restore is in progress.
+    pending: Vec<WindowRecord>,
+    /// When the pending records stop waiting — set once at startup.
+    restore_deadline: Option<Instant>,
+    /// The most recent snapshot the shell handed over.
+    last_snapshot: Vec<WindowRecord>,
+    /// When `last_snapshot` last changed — the debounce clock.
+    settled_at: Instant,
+    /// What the file on disk holds, as far as this process knows.
+    /// `None` until the first write (or load) tells us.
+    persisted: Option<Vec<WindowRecord>>,
+}
+
+impl SessionLayout {
+    /// Opens the store against the shared state directory. When
+    /// `restore` is set, loads the previous session's records and
+    /// returns the launch plans for them, in file order; otherwise the
+    /// previous layout is simply the base the first persist overwrites.
+    pub fn start(restore: bool, apps: &[AppEntry], now: Instant) -> (Self, Vec<RelaunchPlan>) {
+        Self::start_at(crate::startup::session_layout_path().into(), restore, apps, now)
+    }
+
+    /// The path-injected core of [`Self::start`], for tests that must
+    /// not touch the real state directory.
+    pub fn start_at(path: Option<PathBuf>, restore: bool, apps: &[AppEntry], now: Instant) -> (Self, Vec<RelaunchPlan>) {
+        let mut layout = Self {
+            path,
+            spaces: None,
+            restored_spaces: None,
+            persisted_spaces: None,
+            modes: Vec::new(),
+            restored_modes: None,
+            persisted_modes: Vec::new(),
+            pending: Vec::new(),
+            restore_deadline: None,
+            last_snapshot: Vec::new(),
+            settled_at: now,
+            persisted: None,
+        };
+        if !restore {
+            return (layout, Vec::new());
+        }
+        let Some(text) = layout.path.as_deref().and_then(|p| read_session(p).ok()) else {
+            // First opt-in session, or nothing recorded yet: nothing
+            // to restore is the normal case, not a problem.
+            return (layout, Vec::new());
+        };
+        layout.spaces = parse_spaces(&text);
+        layout.restored_spaces = layout.spaces.clone();
+        layout.persisted_spaces = layout.spaces.clone();
+        let records = parse(&text);
+        layout.modes = parse_modes(&text);
+        layout.persisted_modes = layout.modes.clone();
+        layout.restored_modes = Some(layout.modes.clone());
+        let plans: Vec<RelaunchPlan> = records.iter().filter_map(|record| relaunch_plan(record, apps)).collect();
+        tracing::info!(
+            windows = records.len(),
+            launching = plans.len(),
+            "restoring the previous session's layout"
+        );
+        layout.persisted = Some(records.clone());
+        layout.pending = records;
+        layout.restore_deadline = (!layout.pending.is_empty()).then(|| now + RESTORE_GRACE);
+        (layout, plans)
+    }
+
+    /// Whether application windows are still claiming saved records.
+    pub fn restoring(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn take_restored_spaces(&mut self) -> Option<wm_core::DisplaySpacesSnapshot> { self.restored_spaces.take() }
+
+    pub fn note_spaces(&mut self, spaces: Option<&wm_core::DisplaySpacesSnapshot>, now: Instant) {
+        if self.spaces.as_ref() != spaces { self.spaces = spaces.cloned(); self.settled_at = now; }
+    }
+
+    pub fn take_restored_modes(&mut self) -> Option<Vec<LayoutMode>> {
+        self.restored_modes.take()
+    }
+
+    pub fn note_modes(&mut self, modes: impl Iterator<Item = LayoutMode> + Clone, now: Instant) {
+        if self.modes.iter().copied().eq(modes.clone()) {
+            return;
+        }
+        self.modes.clear();
+        self.modes.extend(modes);
+        self.settled_at = now;
+    }
+
+    /// Check whether the snapshot has settled into something worth writing,
+    /// and write it if so. Called by the existing shell tick.
+    pub fn service(&mut self, snapshot: Vec<WindowRecord>, now: Instant) {
+        if self.note(snapshot, now) {
+            self.write_out(now);
+        }
+    }
+
+    /// Advances expiry and debounce timers when the caller has proved
+    /// that the live arrangement still equals [`Self::current`].
+    ///
+    /// Keeping this separate from [`Self::service`] matters on the
+    /// compositor's steady-state path: constructing a snapshot clones
+    /// every window class and resolves every class through the desktop
+    /// application index. None of that work contributes anything when
+    /// the arrangement has not moved, but the debounce clock still has
+    /// to mature so the last real change reaches disk. This entry point
+    /// performs exactly that timer half without manufacturing an
+    /// identical `Vec<WindowRecord>` first.
+    pub fn service_current(&mut self, now: Instant) {
+        if self.ready(now) {
+            self.write_out(now);
+        }
+    }
+
+    /// The most recent live arrangement handed to [`Self::service`].
+    /// Callers may compare borrowed client state against it and use
+    /// [`Self::service_current`] when it is still exact.
+    pub fn current(&self) -> &[WindowRecord] {
+        &self.last_snapshot
+    }
+
+    /// The pure decision core of [`Self::service`] — updates the
+    /// debounce/expiry state and answers "write now?". Split out so
+    /// the rules are testable with plain `Instant` arithmetic and no
+    /// filesystem. When it returns `true` the store already considers
+    /// `last_snapshot` persisted; the caller's job is only the I/O.
+    fn note(&mut self, snapshot: Vec<WindowRecord>, now: Instant) -> bool {
+        if snapshot != self.last_snapshot {
+            self.last_snapshot = snapshot;
+            self.settled_at = now;
+        }
+        self.ready(now)
+    }
+
+    /// Advances the time-dependent half of [`Self::note`] against the
+    /// snapshot already held in `last_snapshot`.
+    fn ready(&mut self, now: Instant) -> bool {
+        if let Some(deadline) = self.restore_deadline {
+            if !self.pending.is_empty() && now >= deadline {
+                tracing::info!(
+                    unmatched = self.pending.len(),
+                    "session restore grace elapsed; letting the unmatched records go"
+                );
+                self.pending.clear();
+            }
+            if self.pending.is_empty() {
+                self.restore_deadline = None;
+            }
+        }
+        // Suppressed mid-restore: the live set is still filling in,
+        // and writing it now would replace the full recorded layout
+        // with a partial one — see the module doc.
+        if !self.pending.is_empty() {
+            return false;
+        }
+        if self.persisted.as_ref() == Some(&self.last_snapshot)
+            && self.persisted_modes == self.modes && self.persisted_spaces == self.spaces
+        {
+            return false;
+        }
+        if now < self.settled_at + DEBOUNCE {
+            return false;
+        }
+        self.persisted = Some(self.last_snapshot.clone());
+        self.persisted_modes.clone_from(&self.modes);
+        self.persisted_spaces.clone_from(&self.spaces);
+        true
+    }
+
+    /// Claims the first pending record whose class matches a freshly
+    /// mapped window's — the first-come-first-matched rule. `None`
+    /// once the restore is over (or was never on), which is the
+    /// permanent steady state; callers need no separate "is a restore
+    /// running" check.
+    pub fn claim(&mut self, class: &str, now: Instant) -> Option<WindowRecord> {
+        if self.restore_deadline.is_some_and(|deadline| now >= deadline) {
+            return None;
+        }
+        let index = self.pending.iter().position(|record| record.class.eq_ignore_ascii_case(class))?;
+        Some(self.pending.remove(index))
+    }
+
+    /// Writes the current snapshot out regardless of the debounce —
+    /// the shutdown path, so a window closed moments before logout is
+    /// forgotten rather than resurrected next login. Skipped while a
+    /// restore is still pending, for the same partial-layout reason
+    /// `note` suppresses ordinary persists then.
+    pub fn flush(&mut self) {
+        if !self.pending.is_empty()
+            || (self.persisted.as_ref() == Some(&self.last_snapshot)
+                && self.persisted_modes == self.modes && self.persisted_spaces == self.spaces)
+        {
+            return;
+        }
+        self.persisted = Some(self.last_snapshot.clone());
+        self.persisted_modes.clone_from(&self.modes);
+        self.persisted_spaces.clone_from(&self.spaces);
+        self.write_out(Instant::now());
+    }
+
+    /// The I/O half of a persist: serialize `last_snapshot` and write
+    /// it atomically. A failure warns and leaves the previous file
+    /// intact — the next settled change tries again.
+    fn write_out(&mut self, now: Instant) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let mut text = serialize(&self.last_snapshot);
+        if let Some(spaces) = &self.spaces { text.push_str(&serialize_spaces(spaces)); }
+        for (index, mode) in self.modes.iter().enumerate() {
+            text.push_str(&format!(
+                "@workspace\t{index}\t{}\n",
+                mode.compatible_name()
+            ));
+        }
+        if let Err(error) = write_atomic(path, &text) {
+            tracing::warn!(?error, path = %path.display(), "could not persist the session layout");
+            // Disk truth is now unknown; clearing the cache makes the
+            // next settle retry rather than believe this write landed.
+            self.persisted = None;
+            // A read-only/full filesystem must not turn every compositor
+            // wakeup into another write attempt and warning. Reuse the settle
+            // interval for a bounded retry without requiring another edit.
+            self.settled_at = now;
+        }
+    }
+}
+
+/// The launch plan for one record, against the current application
+/// index: the shell's own terminal by class, else the recorded
+/// `.desktop` id, else a fresh class match. `None` — an application
+/// no longer installed, or a window that never resolved to one — means
+/// nothing is launched and the record waits out its grace in case the
+/// window arrives some other way.
+fn relaunch_plan(record: &WindowRecord, apps: &[AppEntry]) -> Option<RelaunchPlan> {
+    if record.class.eq_ignore_ascii_case("foot") {
+        return Some(RelaunchPlan::Terminal);
+    }
+    if let Some(id) = &record.app {
+        if let Some(entry) = apps.iter().find(|app| &app.id == id) {
+            return Some(RelaunchPlan::App(entry.clone()));
+        }
+    }
+    match_window_class(apps, &record.class).map(|index| RelaunchPlan::App(apps[index].clone()))
+}
+
+// -- the wire format -----------------------------------------------------
+
+fn serialize(records: &[WindowRecord]) -> String {
+    let mut text = String::new();
+    for record in records {
+        let mut flags: Vec<&str> = Vec::new();
+        if record.maximized {
+            flags.push("maximized");
+        }
+        if record.shaded {
+            flags.push("shaded");
+        }
+        if record.miniaturized {
+            flags.push("miniaturized");
+        }
+        let flags = if flags.is_empty() { "-".to_string() } else { flags.join(",") };
+        text.push_str(&format!(
+            "@window\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            serde_json::to_string(&record.class).expect("string serialization is infallible"),
+            serde_json::to_string(&record.app).expect("string serialization is infallible"),
+            record.geometry.pos.x,
+            record.geometry.pos.y,
+            record.geometry.size.w,
+            record.geometry.size.h,
+            record.workspace,
+            flags,
+            serde_json::to_string(&record.monitor_identity).expect("string serialization is infallible"),
+            record
+                .spatial
+                .as_ref()
+                .and_then(|s| serde_json::to_string(s).ok())
+                .unwrap_or_else(|| "-".into()),
+        ));
+    }
+    text
+}
+
+fn parse(text: &str) -> Vec<WindowRecord> {
+    let mut rejected = 0usize;
+    let records = text.lines()
+        .filter(|line| !line.trim().is_empty()
+            && !(line.starts_with("@workspace\t") && line.split('\t').count() == 3))
+        .filter_map(|line| {
+            let record = parse_line(line);
+            rejected += usize::from(record.is_none());
+            record
+        })
+        .take(MAX_RECORDS)
+        .collect();
+    if rejected != 0 {
+        tracing::warn!(rejected, "skipping unparsable session-layout records");
+    }
+    records
+}
+
+fn parse_modes(text: &str) -> Vec<LayoutMode> {
+    let mut modes = Vec::new();
+    for line in text.lines().filter_map(|s| s.strip_prefix("@workspace\t")) {
+        if line.split('\t').count() != 2 { continue; }
+        let Some((index, mode)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(index) = index
+            .parse::<usize>()
+            .ok()
+            .filter(|&i| i < wm_core::MAX_WORKSPACES)
+        else {
+            continue;
+        };
+        modes.resize((index + 1).max(modes.len()), LayoutMode::Freeform);
+        modes[index] = LayoutMode::parse(mode).unwrap_or_default();
+    }
+    modes
+}
+
+fn parse_line(line: &str) -> Option<WindowRecord> {
+    if line.len() > MAX_RECORD_BYTES {
+        return None;
+    }
+    // Eleven fields identify the versioned format unambiguously. A legacy
+    // client named @window still has at most ten fields.
+    let escaped = line.starts_with("@window\t") && line.split('\t').count() == 11;
+    let line = if escaped {
+        line.strip_prefix("@window\t")?
+    } else {
+        line
+    };
+    let fields: Vec<&str> = line.splitn(11, '\t').collect();
+    let [class, app, x, y, w, h, workspace, flags, monitor @ ..] = fields.as_slice() else {
+        return None;
+    };
+    if monitor.len() > 2 {
+        return None;
+    }
+    let class: String = if escaped {
+        serde_json::from_str(class).ok()?
+    } else {
+        class.to_string()
+    };
+    if class.is_empty() {
+        return None;
+    }
+    // Zero-sized windows can't have been recorded by `snapshot`;
+    // a record claiming one is corruption, and restoring it would
+    // hand the client a degenerate configure.
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let spatial = monitor
+        .get(1)
+        .and_then(|text| serde_json::from_str::<SpatialRecord>(text).ok())
+        .filter(|s| {
+            s.home_geometry.as_ref().is_none_or(|r| r.to_geometry().is_some())
+                && s.order < 10000
+                && s.flow_width <= 65536
+                && s.mosaic_weight.iter().all(|&v| v <= 1_000_000)
+                && s.floating_geometry.is_none_or(|r| {
+                    r[0].unsigned_abs() <= i32::MAX as u64
+                        && r[1].unsigned_abs() <= i32::MAX as u64
+                        && r[2] > 0
+                        && r[2] <= 65536
+                        && r[3] > 0
+                        && r[3] <= 65536
+                })
+        });
+    Some(WindowRecord {
+        spatial,
+        class,
+        app: if escaped {
+            serde_json::from_str(app).ok()?
+        } else {
+            (*app != "-" && !app.is_empty()).then(|| app.to_string())
+        },
+        geometry: Rect {
+            pos: Point::new(x.parse().ok()?, y.parse().ok()?),
+            size: Size::new(w, h),
+        },
+        monitor_identity: if escaped {
+            serde_json::from_str(monitor.first()?).ok()?
+        } else {
+            monitor.first().and_then(|identity| {
+                (!identity.is_empty() && *identity != "-").then(|| (*identity).to_string())
+            })
+        },
+        workspace: workspace
+            .parse::<usize>()
+            .ok()
+            .filter(|&w| w < wm_core::MAX_WORKSPACES)?,
+        maximized: flags.split(',').any(|f| f == "maximized"),
+        shaded: flags.split(',').any(|f| f == "shaded"),
+        miniaturized: flags.split(',').any(|f| f == "miniaturized"),
+    })
+}
+
+/// Temp-and-rename write: the layout file is always either the old
+/// complete layout or the new complete one, never a torn write — the
+/// whole point of persisting is surviving a crash, and a crash is
+/// allowed to happen mid-write.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedSpaces {
+    spaces: Vec<(u64, String, String)>,
+    displays: Vec<(String, String, [i64; 4], u64)>,
+    selected: String,
+    next_id: u64,
+}
+fn serialize_spaces(snapshot: &wm_core::DisplaySpacesSnapshot) -> String {
+    let record = SavedSpaces { spaces: snapshot.spaces.iter().map(|s| (s.id, s.home_display.clone(), s.output_display.clone())).collect(),
+        displays: snapshot.displays.iter().map(|d| (d.key.clone(), d.name.clone(), [d.geometry.pos.x as i64, d.geometry.pos.y as i64,
+            d.geometry.size.w as i64, d.geometry.size.h as i64], d.active)).collect(), selected: snapshot.selected.clone(), next_id: snapshot.next_id };
+    format!("@spaces\t{}\n", serde_json::to_string(&record).expect("Space metadata is serializable"))
+}
+fn parse_spaces(text: &str) -> Option<wm_core::DisplaySpacesSnapshot> {
+    let line = text.lines().find_map(|line| line.strip_prefix("@spaces\t"))?;
+    if line.len() > 512 * 1024 { return None; }
+    let record: SavedSpaces = serde_json::from_str(line).ok()?;
+    let displays = record.displays.into_iter().map(|(key, name, r, active)| {
+        Some(wm_core::DisplaySpace { key, name, active, connected: false, geometry: Rect::new(
+            Point::new(i32::try_from(r[0]).ok()?, i32::try_from(r[1]).ok()?),
+            Size::new(u32::try_from(r[2]).ok()?, u32::try_from(r[3]).ok()?)) })
+    }).collect::<Option<Vec<_>>>()?;
+    let snapshot = wm_core::DisplaySpacesSnapshot { spaces: record.spaces.into_iter().map(|(id, home_display, output_display)|
+        wm_core::Space { id, home_display, output_display }).collect(), displays, selected: record.selected, next_id: record.next_id };
+    snapshot.valid().then_some(snapshot)
+}
+
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // A unique, owner-only file avoids following a stale .tmp symlink and
+    // cleans up on failure. Rename gives process-crash atomicity; no claim
+    // of power-loss durability (which would require file/directory fsync).
+    let mut tmp = tempfile::Builder::new().prefix(".session-layout-").tempfile_in(parent)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn read_session(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "session state is not a regular file"));
+    }
+    let mut text = String::new();
+    file.take(MAX_SESSION_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_SESSION_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "session state exceeds size limit"));
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apps::AppCategory;
+
+    fn record(class: &str, x: i32) -> WindowRecord {
+        WindowRecord {
+            spatial: None,
+            class: class.to_string(),
+            app: None,
+            geometry: Rect { pos: Point::new(x, 40), size: Size::new(500, 400) },
+            monitor_identity: None,
+            workspace: 0,
+            maximized: false,
+            shaded: false,
+            miniaturized: false,
+        }
+    }
+
+    fn entry(id: &str) -> AppEntry {
+        AppEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            exec: vec![id.to_string()],
+            terminal: false,
+            category: AppCategory::Other,
+            startup_wm_class: None,
+        }
+    }
+
+    fn fresh(now: Instant) -> SessionLayout {
+        SessionLayout::start_at(None, false, &[], now).0
+    }
+
+    #[test]
+    fn the_wire_format_round_trips_every_field() {
+        let records = vec![
+            WindowRecord {
+                spatial: None,
+                class: "Navigator".to_string(),
+                app: Some("org.mozilla.firefox".to_string()),
+                geometry: Rect { pos: Point::new(-40, 12), size: Size::new(1280, 900) },
+                monitor_identity: Some("Dell Inc. DELL U2720Q ABC123".to_string()),
+                workspace: 2,
+                maximized: true,
+                shaded: false,
+                miniaturized: true,
+            },
+            record("foot", 100),
+        ];
+        assert_eq!(parse(&serialize(&records)), records);
+    }
+
+    #[test]
+    fn client_text_cannot_inject_records_or_workspace_modes() {
+        let mut item = record("bad\n@workspace\t0\tflow\nfoot\t-\t0\t0\t500\t400\t0\t-", 100);
+        item.app = Some("app\twith\nseparators\\and\"quotes".into());
+        item.monitor_identity = Some("monitor\r\nwith\ttabs".into());
+        let encoded = serialize(std::slice::from_ref(&item));
+        assert_eq!(encoded.lines().count(), 1);
+        assert!(parse_modes(&encoded).is_empty());
+        assert_eq!(parse(&encoded), vec![item]);
+        for class in ["@workspace", "@window", "-", "\"quoted\"", "日本語", "literal\\n"] {
+            let item = record(class, 10);
+            assert_eq!(parse(&serialize(std::slice::from_ref(&item))), vec![item]);
+        }
+        for class in ["@window", "@workspace", "\"quoted\"", "literal\\n"] {
+            let legacy = format!("{class}\t-\t10\t40\t500\t400\t0\t-\n");
+            assert_eq!(parse(&legacy), vec![record(class, 10)]);
+            assert!(parse_modes(&legacy).is_empty());
+        }
+    }
+
+    #[test]
+    fn corrupt_restore_files_have_bounded_reads_records_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_BYTES + 1).unwrap();
+        assert!(read_session(&path).is_err());
+        assert!(read_session(dir.path()).is_err());
+        let (layout, plans) = SessionLayout::start_at(Some(path), true, &[], Instant::now());
+        assert!(!layout.restoring());
+        assert!(plans.is_empty());
+        let one = serialize(&[record("foot", 10)]);
+        assert_eq!(parse(&one.repeat(MAX_RECORDS + 5)).len(), MAX_RECORDS);
+        assert!(parse_line(&"x".repeat(MAX_RECORD_BYTES + 1)).is_none());
+    }
+
+    #[test]
+    fn atomic_write_is_private_and_does_not_follow_a_stale_temporary_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session");
+        let other = dir.path().join("unrelated");
+        std::fs::write(&other, "keep").unwrap();
+        symlink(&other, path.with_extension("tmp")).unwrap();
+        write_atomic(&path, "new session").unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+        assert_eq!(read_session(&path).unwrap(), "new session");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(read_session(&path.with_extension("tmp")).is_err());
+        // Failed replacement removes its unique temporary file and leaves the
+        // previous state alone, including when the destination is a directory.
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert!(write_atomic(dir.path(), "cannot replace a directory").is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), entries);
+        assert_eq!(read_session(&path).unwrap(), "new session");
+    }
+
+    #[test]
+    fn failed_persistence_retries_without_a_new_user_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, "not a directory").unwrap();
+        let path = parent.join("session");
+        let start = Instant::now();
+        let (mut store, _) = SessionLayout::start_at(Some(path.clone()), false, &[], start);
+        store.service(vec![record("foot", 10)], start);
+        store.service_current(start + DEBOUNCE);
+        assert!(store.persisted.is_none());
+        std::fs::remove_file(parent).unwrap();
+        store.service_current(start + DEBOUNCE + DEBOUNCE / 2);
+        assert!(!path.exists(), "a failed write retries at the settle interval");
+        store.service_current(start + DEBOUNCE * 2);
+        assert_eq!(parse(&read_session(&path).unwrap()), vec![record("foot", 10)]);
+    }
+
+    #[test]
+    fn old_absolute_records_still_parse_without_a_monitor_field() {
+        let parsed = parse("foot\t-\t100\t40\t500\t400\t0\t-\n");
+        assert_eq!(parsed, vec![record("foot", 100)]);
+    }
+
+    #[test]
+    fn monitor_relative_geometry_survives_connector_and_output_reorder() {
+        let dell = "Dell Inc. DELL U2720Q ABC123";
+        let first_layout = MonitorInfo {
+            geometry: Rect::new(Point::new(1920, 0), Size::new(3840, 2160)),
+            name: "DP-3".to_string(),
+            identity: Some(dell.to_string()),
+            primary: false,
+        };
+        let root_geometry = Rect::new(Point::new(2040, 80), Size::new(900, 700));
+        let (relative, identity) = relative_to_monitor(Some(&first_layout), root_geometry);
+        assert_eq!(relative.pos, Point::new(120, 80));
+
+        let mut remembered = record("foot", relative.pos.x);
+        remembered.geometry = relative;
+        remembered.monitor_identity = identity.map(str::to_owned);
+        let reordered = [
+            MonitorInfo {
+                geometry: Rect::new(Point::new(3840, 0), Size::new(1920, 1080)),
+                name: "eDP-1".to_string(),
+                identity: Some("BOE CQ NE135FBM-N41 0x00000000".to_string()),
+                primary: false,
+            },
+            MonitorInfo {
+                geometry: Rect::new(Point::new(0, 0), Size::new(3840, 2160)),
+                name: "DP-1".to_string(),
+                identity: Some(dell.to_string()),
+                primary: true,
+            },
+        ];
+        assert_eq!(restored_geometry(&reordered, &remembered).pos, Point::new(120, 80));
+    }
+
+    #[test]
+    fn absent_remembered_monitor_falls_back_to_the_current_primary() {
+        let mut remembered = record("foot", 120);
+        remembered.monitor_identity = Some("missing display".to_string());
+        let primary = MonitorInfo {
+            geometry: Rect::new(Point::new(700, 200), Size::new(1920, 1080)),
+            name: "eDP-1".to_string(),
+            identity: Some("present display".to_string()),
+            primary: true,
+        };
+        assert_eq!(restored_geometry(&[primary], &remembered).pos, Point::new(820, 240));
+    }
+
+    #[test]
+    fn a_corrupt_line_costs_that_record_and_nothing_else() {
+        let good = record("foot", 100);
+        let mut text = serialize(std::slice::from_ref(&good));
+        text.push_str("this line is not a record\n");
+        text.push_str("also\tbad\t1\t2\t3\n");
+        // A zero-sized geometry is corruption, not a window.
+        text.push_str("gimp\t-\t0\t0\t0\t0\t0\t-\n");
+        text.push_str(&serialize(&[record("gimp", 300)]));
+        assert_eq!(parse(&text), vec![good, record("gimp", 300)]);
+    }
+
+    #[test]
+    fn a_settled_change_persists_after_the_debounce_and_not_before() {
+        let start = Instant::now();
+        let mut layout = fresh(start);
+        // The change arrives...
+        assert!(!layout.note(vec![record("foot", 100)], start), "nothing persists on arrival");
+        // ...keeps not persisting while inside the debounce...
+        assert!(!layout.note(vec![record("foot", 100)], start + DEBOUNCE / 2));
+        // ...and persists once it has held still long enough.
+        assert!(layout.note(vec![record("foot", 100)], start + DEBOUNCE));
+        // Persisted state is remembered: the same snapshot never
+        // writes twice.
+        assert!(!layout.note(vec![record("foot", 100)], start + DEBOUNCE * 2));
+    }
+
+    #[test]
+    fn an_unchanged_borrowed_snapshot_still_matures_the_debounce() {
+        let start = Instant::now();
+        let mut layout = fresh(start);
+        let snapshot = vec![record("foot", 100)];
+        layout.service(snapshot.clone(), start);
+
+        assert_eq!(layout.current(), snapshot);
+        layout.service_current(start + DEBOUNCE / 2);
+        assert!(layout.persisted.is_none(), "an unchanged arrangement is still inside its debounce");
+
+        layout.service_current(start + DEBOUNCE);
+        assert_eq!(layout.persisted.as_deref(), Some(snapshot.as_slice()));
+        layout.service_current(start + DEBOUNCE * 2);
+        assert_eq!(layout.persisted.as_deref(), Some(snapshot.as_slice()), "it is not re-persisted on every tick");
+    }
+
+    #[test]
+    fn motion_keeps_resetting_the_debounce_clock() {
+        // The disk-grinder case: a drag emits a different snapshot
+        // every tick, and none of them may hit the disk until the
+        // window holds still.
+        let start = Instant::now();
+        let mut layout = fresh(start);
+        for tick in 0..200 {
+            let now = start + Duration::from_millis(16 * tick);
+            assert!(!layout.note(vec![record("foot", tick as i32)], now), "mid-drag tick {tick} must not persist");
+        }
+        let released = start + Duration::from_millis(16 * 200);
+        assert!(layout.note(vec![record("foot", 199)], released + DEBOUNCE), "the drag's end persists once, settled");
+    }
+
+    #[test]
+    fn a_closed_window_vanishes_from_the_next_persist() {
+        // "Restore must never resurrect what was deliberately
+        // dismissed": closing is observable as the window dropping out
+        // of the snapshot, and the file is always rewritten whole.
+        let start = Instant::now();
+        let mut layout = fresh(start);
+        // Two windows arrive and settle...
+        layout.note(vec![record("foot", 100), record("gimp", 300)], start);
+        assert!(layout.note(vec![record("foot", 100), record("gimp", 300)], start + DEBOUNCE));
+        // ...one closes (drops out of the snapshot), and the next
+        // settled persist no longer contains it.
+        layout.note(vec![record("gimp", 300)], start + DEBOUNCE * 2);
+        assert!(layout.note(vec![record("gimp", 300)], start + DEBOUNCE * 3));
+        assert_eq!(layout.persisted.as_deref(), Some(&[record("gimp", 300)][..]));
+    }
+
+    #[test]
+    fn claiming_is_first_come_first_matched_per_class_and_case_insensitive() {
+        let now = Instant::now();
+        let (mut layout, _) = SessionLayout::start_at(None, false, &[], now);
+        layout.pending = vec![record("foot", 100), record("foot", 300), record("gimp", 500)];
+        layout.restore_deadline = Some(now + RESTORE_GRACE);
+
+        assert_eq!(layout.claim("Foot", now), Some(record("foot", 100)), "first record for the class, case-insensitively");
+        assert_eq!(layout.claim("foot", now), Some(record("foot", 300)), "second mapping takes the second record");
+        assert_eq!(layout.claim("foot", now), None, "no third record to claim");
+        assert_eq!(layout.claim("emacs", now), None, "a window with no record follows normal placement");
+        assert_eq!(layout.claim("gimp", now), Some(record("gimp", 500)));
+    }
+
+    #[test]
+    fn unmatched_records_expire_at_the_grace_deadline() {
+        let now = Instant::now();
+        let (mut layout, _) = SessionLayout::start_at(None, false, &[], now);
+        layout.pending = vec![record("gimp", 500)];
+        layout.restore_deadline = Some(now + RESTORE_GRACE);
+
+        // Past the deadline, nothing claims and the pending list goes —
+        // and the live truth (an empty desktop, settled since startup)
+        // is free to persist over the stale records.
+        assert_eq!(layout.claim("gimp", now + RESTORE_GRACE), None, "an expired record must not claim a late window");
+        assert!(layout.note(Vec::new(), now + RESTORE_GRACE));
+        assert!(layout.pending.is_empty(), "expiry lets the records go");
+        // With the restore over, recording works normally again.
+        layout.note(vec![record("foot", 100)], now + RESTORE_GRACE + DEBOUNCE);
+        assert!(layout.note(vec![record("foot", 100)], now + RESTORE_GRACE + DEBOUNCE * 2));
+    }
+
+    #[test]
+    fn persistence_is_suppressed_while_a_restore_is_pending() {
+        // The moment after startup the live set is empty; writing that
+        // would wipe the very layout being restored, so a crash during
+        // the restore would lose it.
+        let now = Instant::now();
+        let (mut layout, _) = SessionLayout::start_at(None, false, &[], now);
+        layout.pending = vec![record("foot", 100)];
+        layout.restore_deadline = Some(now + RESTORE_GRACE);
+
+        assert!(!layout.note(Vec::new(), now + DEBOUNCE * 2), "an empty snapshot mid-restore must not persist");
+        let claimed = layout.claim("foot", now + DEBOUNCE * 2);
+        assert!(claimed.is_some());
+        // Restore complete: the live set persists again (once settled).
+        layout.note(vec![record("foot", 100)], now + DEBOUNCE * 3);
+        assert!(layout.note(vec![record("foot", 100)], now + DEBOUNCE * 4));
+    }
+
+    #[test]
+    fn start_reads_the_file_and_plans_the_relaunches() {
+        let dir = std::env::temp_dir().join(format!("chonk-session-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        let mut firefox = record("Navigator", 100);
+        firefox.app = Some("org.mozilla.firefox".to_string());
+        let records = vec![firefox, record("foot", 300), record("uninstalled-thing", 500)];
+        write_atomic(&path, &serialize(&records)).unwrap();
+
+        let apps = [entry("org.mozilla.firefox")];
+        let now = Instant::now();
+        let (mut layout, plans) = SessionLayout::start_at(Some(path.clone()), true, &apps, now);
+
+        // Firefox by its recorded .desktop id, the terminal by its
+        // class special-case; the uninstalled app launches nothing but
+        // its record still waits out the grace.
+        assert_eq!(plans, vec![RelaunchPlan::App(apps[0].clone()), RelaunchPlan::Terminal]);
+        assert_eq!(layout.pending.len(), 3);
+        assert!(layout.claim("navigator", now).is_some());
+
+        // And with restore off, the same file loads nothing.
+        let (layout_off, plans_off) = SessionLayout::start_at(Some(path), false, &apps, now);
+        assert!(plans_off.is_empty());
+        assert!(layout_off.pending.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(layout_off);
+        let _ = layout.claim("foot", now);
+    }
+
+    #[test]
+    fn service_writes_the_file_atomically_and_flush_skips_a_pending_restore() {
+        let dir = std::env::temp_dir().join(format!("chonk-session-layout-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("session");
+        let now = Instant::now();
+        let (mut layout, _) = SessionLayout::start_at(Some(path.clone()), false, &[], now);
+
+        layout.service(vec![record("foot", 100)], now);
+        assert!(!path.exists(), "nothing on disk before the debounce");
+        layout.service(vec![record("foot", 100)], now + DEBOUNCE);
+        assert_eq!(parse(&std::fs::read_to_string(&path).unwrap()), vec![record("foot", 100)]);
+        assert!(!path.with_extension("tmp").exists(), "the temp file is renamed away, not left behind");
+
+        // A pending restore blocks flush — the file keeps the full
+        // recorded layout, not a partial live set.
+        layout.pending = vec![record("gimp", 300)];
+        layout.last_snapshot = Vec::new();
+        layout.flush();
+        assert_eq!(parse(&std::fs::read_to_string(&path).unwrap()), vec![record("foot", 100)]);
+
+        // With the restore done, flush writes immediately — no debounce
+        // on the way out of the process.
+        layout.pending.clear();
+        layout.last_snapshot = vec![record("foot", 700)];
+        layout.flush();
+        assert_eq!(parse(&std::fs::read_to_string(&path).unwrap()), vec![record("foot", 700)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn spatial_metadata_roundtrips_order_membership_width_and_empty_workspace_modes() {
+        let mut item = record("foot", 80);
+        item.spatial = Some(SpatialRecord {
+            fullscreen_origin: None,
+            home_geometry: None,
+            floating: true,
+            order: 3,
+            flow_width: 780,
+            mosaic_weight: [600, 400],
+            output: Some("Dell monitor serial".into()),
+            focused: true,
+            floating_geometry: Some([40, 50, 700, 600]),
+            floating_monitor: Some("Other monitor serial".into()),
+        });
+        let text = format!(
+            "{}@workspace\t0\tdwindle\n@workspace\t4\tscrolling\n",
+            serialize(&[item.clone()])
+        );
+        assert_eq!(parse(&text), vec![item]);
+        assert_eq!(
+            parse_modes(&text),
+            vec![
+                LayoutMode::Mosaic,
+                LayoutMode::Freeform,
+                LayoutMode::Freeform,
+                LayoutMode::Freeform,
+                LayoutMode::Flow
+            ]
+        );
+        let now = Instant::now();
+        let mut store = fresh(now);
+        store.note_modes([LayoutMode::Flow].into_iter(), now);
+        assert!(!store.note(Vec::new(), now));
+        assert!(store.ready(now + DEBOUNCE));
+        assert!(!store.ready(now + DEBOUNCE * 2));
+    }
+
+    #[test]
+    fn malformed_spatial_metadata_never_discards_a_usable_legacy_window() {
+        let base = "foot\t-\t80\t40\t500\t400\t0\t-";
+        assert_eq!(parse(base), vec![record("foot", 80)]);
+        assert!(parse_modes(base).is_empty());
+        for metadata in [
+            "-",
+            "not json",
+            r#"{"order":10000}"#,
+            r#"{"flow_width":-1}"#,
+            r#"{"flow_width":4294967295}"#,
+            r#"{"mosaic_weight":[4000000000,0]}"#,
+            r#"{"floating_geometry":[-9223372036854775808,0,10,10]}"#,
+            r#"{"floating_geometry":[0,0,0,10]}"#,
+        ] {
+            assert_eq!(
+                parse(&format!("{base}\t-\t{metadata}")),
+                vec![record("foot", 80)],
+                "{metadata}"
+            );
+        }
+        assert_eq!(
+            parse_modes(
+                "@workspace\t0\tunknown\n@workspace\t9999999999999\tflow\n@workspace\t-1\tmosaic"
+            ),
+            vec![LayoutMode::Freeform]
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_space_tests {
+    use super::*;
+    fn snapshot() -> wm_core::DisplaySpacesSnapshot {
+        wm_core::DisplaySpacesSnapshot {
+            spaces: vec![wm_core::Space { id: 7, home_display: "connector:one".into(), output_display: "connector:one".into() },
+                wm_core::Space { id: 19, home_display: "connector:two".into(), output_display: "connector:two".into() }],
+            displays: vec![wm_core::DisplaySpace { key: "connector:one".into(), name: "one".into(), geometry: Rect::new(Point::new(-800, 0), Size::new(800, 600)), active: 7, connected: false },
+                wm_core::DisplaySpace { key: "connector:two".into(), name: "two".into(), geometry: Rect::new(Point::new(0, 0), Size::new(800, 600)), active: 19, connected: false }],
+            selected: "connector:two".into(), next_id: 19,
+        }
+    }
+    #[test]
+    fn empty_display_rows_survive_atomic_persistence_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-layout");
+        let now = Instant::now();
+        let (mut store, _) = SessionLayout::start_at(Some(path.clone()), false, &[], now);
+        store.note_spaces(Some(&snapshot()), now);
+        store.flush();
+        assert_eq!(parse_spaces(&std::fs::read_to_string(&path).unwrap()), Some(snapshot()));
+        let (mut restored, plans) = SessionLayout::start_at(Some(path), true, &[], now);
+        assert!(plans.is_empty());
+        assert_eq!(restored.take_restored_spaces(), Some(snapshot()));
+    }
+    #[test]
+    fn invalid_space_metadata_does_not_discard_legacy_window_records() {
+        let legacy = "foot\t-\t10\t20\t300\t200\t0\t-\n";
+        assert_eq!(parse(&format!("{legacy}@spaces\t{{broken}}\n")), parse(legacy));
+        assert_eq!(parse_spaces("@spaces\t{broken}\n"), None);
+        let mut bad = snapshot();
+        bad.spaces[1].id = 7;
+        assert_eq!(parse_spaces(&serialize_spaces(&bad)), None);
+        let malformed = serialize_spaces(&snapshot()).replace("800,600", "-1,600");
+        assert_eq!(parse_spaces(&malformed), None);
+    }
+    #[test]
+    fn connector_fallback_restores_relative_geometry_after_reordering() {
+        let monitors = vec![MonitorInfo { name: "two".into(), identity: None, primary: true,
+            geometry: Rect::new(Point::new(-640, 0), Size::new(640, 800)) }];
+        let geometry = restored_on_monitor(&monitors, Rect::new(Point::new(12, 80), Size::new(400, 300)), Some("two"));
+        assert_eq!(geometry.pos, Point::new(-628, 80));
+    }
+}
+
+#[cfg(test)]
+mod home_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn home_geometry_roundtrips_and_rejects_out_of_range_coordinates() {
+        let saved = wm_core::SpaceHomeGeometry {
+            display: "connector:external".into(),
+            bounds: Rect::new(Point::new(800, 0), Size::new(800, 600)),
+            normal: Rect::new(Point::new(1100, 300), Size::new(400, 200)),
+            freeform: Some(Rect::new(Point::new(1050, 200), Size::new(350, 300))),
+        };
+        let record = HomeGeometryRecord::from(&saved);
+        assert_eq!(record.to_geometry(), Some(saved.clone()));
+        assert!(record.matches(&saved));
+        let encoded = serde_json::to_string(&record).unwrap();
+        let mut decoded: HomeGeometryRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, record);
+        decoded.normal[0] = i64::MAX;
+        assert!(decoded.to_geometry().is_none());
+        decoded.normal[0] = 1100;
+        decoded.bounds[2] = 0;
+        assert!(decoded.to_geometry().is_none());
+    }
+}

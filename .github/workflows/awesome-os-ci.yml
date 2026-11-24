@@ -1,0 +1,68 @@
+name: Awesome-OS CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-layout:
+    name: Validate Cargo Workspace, Layout & B8G ABI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify required files and directories
+        run: |
+          test -f LICENSE
+          test -f README.md
+          test -f Cargo.toml
+          test -f Cargo.lock
+          test -f AWESOME-OS-INTEGRATION.md
+          test -f src/b8g_abi.rs
+          test -d crates
+          test -d omarchy
+          test -d vendor/smithay-0.7.0
+
+      - name: Verify Rust B8G ABI v3 bridge
+        run: |
+          rustc --test src/b8g_abi.rs && ./b8g_abi
+
+      - name: Validate Cargo.toml workspace manifest and member manifests
+        run: |
+          python3 - <<'PY'
+          import glob
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path(".")
+          data = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+          ws = data.get("workspace")
+          assert isinstance(ws, dict), "Missing [workspace] table in Cargo.toml"
+          members = ws.get("members", [])
+          assert members, "Workspace members list is empty"
+
+          pkg = ws.get("package", {})
+          assert pkg.get("license") == "GPL-3.0-only", f"Unexpected license: {pkg.get('license')}"
+          print(f"Workspace version={pkg.get('version')} edition={pkg.get('edition')} license={pkg.get('license')}")
+
+          matched = []
+          for pattern in members:
+              hits = sorted(glob.glob(pattern))
+              assert hits, f"Workspace member pattern matched nothing: {pattern}"
+              for h in hits:
+                  manifest = pathlib.Path(h) / "Cargo.toml"
+                  assert manifest.is_file(), f"Missing member Cargo.toml: {manifest}"
+                  tomllib.loads(manifest.read_text(encoding="utf-8"))
+                  matched.append(h)
+
+          print(f"Validated {len(matched)} workspace member Cargo.toml files:")
+          for m in matched:
+              print(f"  - {m}")
+          PY

@@ -1,0 +1,268 @@
+# Maintainer: Chris Kearney <chris@kearneymail.com>
+#
+# chonkstep, from a release tarball. `.github/workflows/aur.yml` turns
+# this into the AUR's PKGBUILD on every matching v$pkgver tag, pins the
+# archive checksum and regenerates .SRCINFO. The branch-head PKGBUILD
+# next to it remains the local `chonkstep-git` recipe.
+#
+# The dependency list is not copied from anywhere: the hard depends are
+# what the built binaries actually load and spawn - checked with ldd
+# against a release build (libxkbcommon, libinput, libseat->seatd,
+# libudev->systemd-libs, libgbm->mesa, libdrm), plus what is loaded at
+# runtime rather than linked (EGL/GLES through libglvnd, the Wayland
+# client libraries for nested mode) and what the desktop execs (Xwayland
+# at boot, foot as its terminal, dbus-run-session around the session).
+# The X11 session's own server and everything theme-optional is in
+# optdepends, so a Wayland-only install stays lean.
+
+# Ship the debug information rather than discarding it.
+#
+# `makepkg`'s stock `OPTIONS` include `strip` and `!debug`, and
+# `STRIP_BINARIES="--strip-all"`, so the default behaviour is to throw
+# away everything the release profile now emits — leaving a package
+# whose crashes symbolise as `??` for everyone, including the
+# maintainer on any machine but the build host. Arch's debuginfod
+# carries only official packages, so it cannot fill that gap for a
+# package installed from a GitHub release or the AUR.
+#
+# `strip` and `debug` must both be enabled: together they run
+# `objcopy --only-keep-debug` into a separate `%s-debug` package, then
+# strip the shipped binary. (`!strip debug` silently produces no debug
+# package at all.) Measured on aarch64: the shipped executable comes out
+# at ~33 MB, SMALLER than the ~44 MB it was before the release profile
+# existed, because a full strip also drops the `.symtab` the old build
+# kept. The debug package carries the ~101 MB nobody downloads unless
+# they are reading a core.
+#
+# `.eh_frame` survives the strip, so stack unwinding from a coredump
+# works off the shipped binary alone; the debug package is what turns
+# those frames into `file:line`.
+options=(strip debug)
+pkgname=chonkstep
+pkgver=0.7.2
+pkgrel=1
+pkgdesc="A traditional floating compositor for Omarchy, compatible with Hyprland workflows"
+arch=('x86_64' 'aarch64')
+url="https://github.com/iconidentify/chonkstep"
+license=('GPL-3.0-only')
+depends=(
+  'wl-clipboard'     # lossless PNG clipboard ownership
+  'wf-recorder'      # native Wayland recording (software H.264 works on Asahi)
+  'wlr-randr'        # chonkrec output selection and rotation across recorder versions
+  'wayland-utils'    # query the actual wl_output orientation used by capture clients
+  'ffmpeg'           # finalize recoverable MKV recordings as fast-start MP4
+  'libnotify'        # capture completion / failure notifications
+  'xdg-user-dirs'    # localized Pictures / Videos destinations
+  'xdg-utils'        # desktop URL and file handlers
+  'bash'             # the session launcher scripts in /usr/lib/chonkstep
+  'gcc-libs'
+  'glibc'
+  'libxkbcommon'     # seat keymaps, both backends
+  'libglvnd'         # EGL/GLES, loaded at runtime by the renderer
+  'mesa'             # libgbm: session-backend buffer allocation
+  'libdrm'           # mode setting on the graphics device
+  'libinput'         # real keyboards, mice, touchpads
+  'seatd'            # libseat; the daemon itself is only needed without logind
+  'systemd-libs'     # libudev: device discovery and hot-plug
+  'hwdata'           # PNP manufacturer names for Hyprland-compatible EDID descriptions
+  'wayland'          # client libraries, loaded at runtime for nested mode
+  'xorg-xwayland'    # spawned at boot so X11 apps run in the Wayland session
+  'foot'             # the terminal the desktop spawns
+  'dbus'             # dbus-run-session around both sessions
+  'ttf-dejavu'       # the chiseled chrome's typeface
+)
+optdepends=(
+  'imv: automatically review saved screenshots'
+  'omacut: automatically review completed recordings'
+  'xorg-server: the X11 session (the Wayland session needs no X server)'
+  'xorg-xinit: start the X11 session with startx from a TTY'
+  'picom: translucent terminals on the X11 session (the compositor composites itself)'
+  'wireplumber: wpctl, which the dock sound instrument reads and controls'
+  'gsfonts: Nimbus Sans, for the NeXT Lavender theme'
+  'ttf-jetbrains-mono-nerd: the terminal typeface the themes configure'
+  'noto-fonts: fallback glyph coverage'
+  'swaylock: a session locker for lock_command and locked crash recovery'
+  'xdg-desktop-portal: portal frontend for screen sharing and portal screenshots'
+  'xdg-desktop-portal-wlr: the ScreenCast/Screenshot backend the shipped portal map selects'
+  'xdg-desktop-portal-gtk: the fallback portal backend (file chooser and friends)'
+  'pipewire: carries screen-share frames from portal backend to application'
+  'python: agent session service and capture helpers'
+  'omarchy: host Omarchy'\''s shell and menu'
+  'socat: watch the control socket'
+  'uwsm: managed Wayland session lifecycle and desktop autostart targets'
+)
+makedepends=('rust')
+# The release workflow replaces SKIP with the tag archive's checksum
+# before this recipe reaches the AUR.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # A tag archive has no `.git`. The release workflow passes its exact
+  # version and immutable commit ID through makepkg, so tagging does not
+  # change a package already built on main. A normal AUR build falls back to the
+  # tag this recipe downloads. Direct non-git Cargo builds have their
+  # own explicit `+unknown-source` fallback in chonk-build-info.
+  export CHONKSTEP_GIT_DESCRIBE="${CHONKSTEP_GIT_DESCRIBE:-v$pkgver}"
+  # --frozen: build exactly the dependency tree the repository ships.
+  bash scripts/build-release.sh --frozen
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  export CHONKSTEP_GIT_DESCRIBE="${CHONKSTEP_GIT_DESCRIBE:-v$pkgver}"
+  # The backend-generic crates and the config round-trip; the Wayland
+  # backend's suite needs the system libraries above and runs too.
+  cargo test --frozen --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  # The two session binaries, and the dockapp package manager.
+  install -Dm755 target/release/chonkstep "$pkgdir/usr/bin/chonkstep"
+  install -Dm755 target/release/chonkstep-wayland "$pkgdir/usr/bin/chonkstep-wayland"
+  install -Dm755 scripts/chonkrec "$pkgdir/usr/bin/chonkrec"
+  # The wifi passphrase dialog. Nobody runs it by hand: the dock's LNK
+  # panel spawns it by bare name when someone clicks a secured network
+  # with no saved profile, so it has to be on PATH or that row silently
+  # does nothing. See docs/link-panel.md.
+  install -Dm755 target/release/chonk-netjoin "$pkgdir/usr/bin/chonk-netjoin"
+  # The SDK showcase launched by both desktop About menu entries. It
+  # must be a sibling of the installed compositor or available on PATH.
+  install -Dm755 target/release/chonk-about "$pkgdir/usr/bin/chonk-about"
+  # Optional desktop client: installed, never autostarted by Omarchy mode.
+  install -Dm755 target/release/chonk-dock "$pkgdir/usr/bin/chonk-dock"
+  install -Dm755 dock/chonk-get "$pkgdir/usr/bin/chonk-get"
+  install -Dm755 target/release/chonk-btpair "$pkgdir/usr/bin/chonk-btpair"
+  install -Dm644 dock/chonk-dock.desktop "$pkgdir/usr/share/applications/chonk-dock.desktop"
+  install -Dm644 dock/README.md "$pkgdir/usr/share/doc/chonkstep/dock/README.md"
+  cp -a dock/bindings dock/docs dock/examples "$pkgdir/usr/share/doc/chonkstep/dock/"
+  # The Omarchy bridge: writes chonkstep's built-in themes out as
+  # Omarchy themes, so `omarchy-theme-set` can dress the rest of the
+  # machine to match (see README, "Installing on Omarchy").
+  install -Dm755 target/release/omarchy-export-themes "$pkgdir/usr/bin/omarchy-export-themes"
+
+  # Session launcher scripts. These resolve the binary themselves:
+  # from /usr/lib/chonkstep they find no sibling checkout and fall
+  # back to the /usr/bin names installed above.
+  install -Dm755 scripts/xsession.sh "$pkgdir/usr/lib/chonkstep/xsession.sh"
+  install -Dm755 scripts/wayland-session.sh "$pkgdir/usr/lib/chonkstep/wayland-session.sh"
+  install -Dm755 scripts/chonkstep-session "$pkgdir/usr/lib/chonkstep/chonkstep-session"
+  install -Dm755 scripts/reload.sh "$pkgdir/usr/lib/chonkstep/reload.sh"
+  install -Dm755 scripts/restart.sh "$pkgdir/usr/lib/chonkstep/restart.sh"
+  install -Dm755 scripts/verify-install.sh "$pkgdir/usr/lib/chonkstep/verify-install.sh"
+  install -Dm755 scripts/chonkstep-bugreport "$pkgdir/usr/bin/chonkstep-bugreport"
+
+  # Session entries, one per stack, so a login manager offers both.
+  # TryExec is deliberate and package-only: greeters that verify it
+  # (SDDM stats an absolute TryExec and hides the session when the stat
+  # fails; GDM skips entries whose TryExec is missing) can safely check
+  # a path under /usr, because pacman guarantees it exists mode 755.
+  # The checkout installer (scripts/install.sh) writes these entries
+  # WITHOUT TryExec: its scripts live under the user's home, the
+  # greeter runs as its own user (sddm), and a default 0700 home
+  # (login.defs HOME_MODE) would make that stat fail - hiding the
+  # session from the picker, which is exactly the bug TryExec must
+  # never introduce.
+  install -d "$pkgdir/usr/share/xsessions" "$pkgdir/usr/share/wayland-sessions"
+  cat > "$pkgdir/usr/share/xsessions/chonkstep.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=chonkstep
+Comment=A NeXTSTEP-style window manager with chiseled chrome
+Exec=/usr/lib/chonkstep/xsession.sh
+TryExec=/usr/lib/chonkstep/xsession.sh
+Type=Application
+DESKTOP
+  cat > "$pkgdir/usr/share/wayland-sessions/chonkstep.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=chonkstep (Wayland)
+Comment=The chonkstep desktop as a native Wayland compositor
+Exec=/usr/lib/chonkstep/chonkstep-session
+TryExec=/usr/lib/chonkstep/chonkstep-session
+DesktopNames=chonkstep
+Type=Application
+DESKTOP
+  cat > "$pkgdir/usr/share/wayland-sessions/chonkstep-uwsm.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=chonkstep (uwsm)
+Comment=The chonkstep desktop managed by the Universal Wayland Session Manager
+Exec=uwsm start -g -1 -e -D chonkstep chonkstep.desktop
+TryExec=uwsm
+DesktopNames=chonkstep
+Type=Application
+DESKTOP
+
+  install -Dm644 packaging/sddm/chonkstep/Main.qml \
+    "$pkgdir/usr/share/sddm/themes/chonkstep/Main.qml"
+  install -Dm644 packaging/sddm/chonkstep/metadata.desktop \
+    "$pkgdir/usr/share/sddm/themes/chonkstep/metadata.desktop"
+  install -Dm644 packaging/sddm/chonkstep/theme.conf \
+    "$pkgdir/usr/share/sddm/themes/chonkstep/theme.conf"
+  install -Dm644 packaging/sddm/zz-chonkstep-theme.conf \
+    "$pkgdir/usr/share/chonkstep/sddm/zz-chonkstep-theme.conf"
+  install -Dm644 packaging/sddm/zz-chonkstep-autologin.conf \
+    "$pkgdir/usr/share/chonkstep/sddm/zz-chonkstep-autologin.conf"
+  install -Dm644 packaging/systemd/sddm.service.d/90-chonkstep-resilience.conf \
+    "$pkgdir/usr/share/chonkstep/systemd/90-chonkstep-sddm-resilience.conf"
+  install -Dm755 scripts/omarchy-install-desktop-chonkstep \
+    "$pkgdir/usr/bin/omarchy-install-desktop-chonkstep"
+  install -Dm755 scripts/omarchy-remove-desktop-chonkstep \
+    "$pkgdir/usr/bin/omarchy-remove-desktop-chonkstep"
+
+  # Portal backend declaration and map: Inhibit to chonkstep-wayland,
+  # ScreenCast/Screenshot to xdg-desktop-portal-wlr, the rest to GTK.
+  # Matched by XDG_CURRENT_DESKTOP=chonkstep, which the session script
+  # exports and the .desktop entry's DesktopNames sets.
+  install -Dm644 packaging/portal/chonkstep.portal \
+    "$pkgdir/usr/share/xdg-desktop-portal/portals/chonkstep.portal"
+  install -Dm644 packaging/portal/chonkstep-portals.conf \
+    "$pkgdir/usr/share/xdg-desktop-portal/chonkstep-portals.conf"
+
+  # Documentation, config template first: the desktop runs with no
+  # config file at all, and this is the fully commented starting point
+  # to copy to ~/.config/chonkstep/config.toml.
+  install -Dm644 docs/config.example.toml -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/quickstart.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/keybindings.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/capture.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/gestures.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/instrument-platform.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/dockapp-protocol.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/xwayland-compatibility.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/screen-sharing.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/idle-inhibition.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/night-light.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/hyprland-ipc.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/hyprland-config.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/omarchy-integration.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/appearance.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/modern-themes.md docs/system7-themes.md docs/decoration-styles.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/control-socket.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/memory.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/logging.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 README.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname"
+
+  # The Omarchy bar widgets that read the control socket, and the guide
+  # to installing them. Omarchy loads plugins from the user's own
+  # ~/.config/omarchy/plugins/<id>/, so these are shipped for the user
+  # to link from there rather than installed into Omarchy's tree.
+  for plugin in omarchy/plugins/*/; do
+    for plugin_file in "$plugin"*; do
+      [ -f "$plugin_file" ] || continue
+      install -Dm644 "$plugin_file" -t "$pkgdir/usr/share/chonkstep/omarchy/plugins/$(basename "$plugin")"
+    done
+  done
+  install -Dm644 omarchy/README.md "$pkgdir/usr/share/doc/$pkgname/omarchy-plugins.md"
+}

@@ -1,0 +1,12235 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+
+mod spatial_layout;
+
+use slotmap::SlotMap;
+use wm_theme_api::{
+    clamp_client_size, ButtonKind, ButtonRuntimeState, DecorationBuffer, DecorationLayout,
+    DecorationRequest, Point, Rect, ResizeEdge, Size, ThemeEngine,
+};
+
+use crate::backend::Backend;
+use crate::client::{Client, ClientFlags, ClientId, Lifecycle, MaximizeDirections, MonitorInfo};
+use crate::focus::{FocusDirection, FocusPolicy, OutputTarget};
+use crate::hittest::{hit_test, HitTarget};
+use crate::placement::{self, FloatPolicy, IdleInhibitRule, PlacementPolicy};
+use crate::resize;
+use crate::snap;
+mod mac;
+mod spaces;
+mod special;
+pub use spaces::{DisplaySpace, DisplaySpacesSnapshot, Space, SpaceHomeGeometry, FULLSCREEN_SPACE_STAYS_HOME, SHARED_DESKTOP_SPANS_DISPLAYS};
+pub use special::{normalize_special_name, DEFAULT_SPECIAL_NAME, MAX_SPECIAL_NAME, MAX_SPECIAL_WORKSPACES};
+use crate::types::{
+    BackendEvent, ClientChrome, DragHandle, FullscreenMode, KeyCombo, Modifiers, MouseButton, NetState, NetStateAction,
+    NetStateSnapshot, SurfaceRef, WindowType,
+};
+
+/// How close together (in ms) two presses on the same titlebar must land
+/// to count as a double-click (toggling maximize). Not backed by an
+/// X server "double-click time" setting yet — a reasonable fixed
+/// default, in the same ballpark as the classic desktop's.
+const DOUBLE_CLICK_MS: u32 = 400;
+/// Maximum travel between titlebar clicks, in logical pixels.
+const DOUBLE_CLICK_DISTANCE: f32 = 4.0;
+
+/// How close (in pixels) a dragged frame edge must come to a screen edge
+/// or another window's edge before it snaps flush — the classic "edge
+/// resistance"/"attraction" behavior, simplified to a single always-on
+/// threshold rather than separate resistance/attract modes.
+const SNAP_THRESHOLD_PX: i32 = 10;
+
+/// Keysym for the `Tab` key, per `<X11/keysymdef.h>` — the same numeric
+/// space X11 and XKB (and so a future Wayland backend) both use, so
+/// this is genuinely backend-agnostic despite the name. `Alt+Tab`/
+/// `Alt+Shift+Tab` window cycling is the only keybinding `wm-core`
+/// claims for itself — every other binding is config-driven from the
+/// binary (see `bind_default_keys`).
+const XK_TAB: u32 = 0xff09;
+const XK_ESCAPE: u32 = 0xff1b;
+const XK_ALT_L: u32 = 0xffe9;
+const XK_ALT_R: u32 = 0xffea;
+
+/// What every monitor query answers with when the backend reports no
+/// outputs at all. Not a claim about any real screen — just a
+/// non-degenerate rect, so placement and maximize arithmetic stays sane
+/// instead of dividing into a zero-sized area. Only the test fake and a
+/// backend mid-teardown ever reach it.
+const NO_MONITOR_FALLBACK: Rect = Rect { pos: Point::new(0, 0), size: Size::new(800, 600) };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TitleMetrics {
+    client_offset: Point,
+    input_margin: u32,
+    title_height: u32,
+}
+
+impl TitleMetrics {
+    fn of(layout: &DecorationLayout) -> Self {
+        Self { client_offset: layout.client_offset, input_margin: layout.input_margin, title_height: layout.titlebar_height }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RestoreKind { Maximized, Fullscreen }
+
+enum ReflowReason { Geometry, ClientCommit, Restyle, Restore(Option<TitleMetrics>) }
+
+/// The modifier the move/resize drag gesture rides on when nothing
+/// configures one: Alt, as Window Maker has bound it since 1997. The
+/// config file's `drag_modifier` overrides it, and `wm-config` carries
+/// the same constant for the parser's default.
+pub const DEFAULT_DRAG_MODIFIER: Modifiers = Modifiers::ALT;
+
+/// Maximum number of workspaces the core will create. Public input
+/// names them from 1 through 99; internally their indices are 0 through
+/// 98. The row grows on demand and never shrinks, so leaving this
+/// unbounded lets one malformed protocol request permanently amplify
+/// every workspace-sized publication and allocation.
+pub const MAX_WORKSPACES: usize = 99;
+
+/// An in-progress move. `grab_offset` is the frame-local point that was
+/// grabbed — since that's constant relative to the frame regardless of
+/// where the frame currently sits, the new frame position is simply
+/// `pointer_root - grab_offset` on every motion event.
+///
+/// Deliberately does not name a frame. A move can be started by
+/// dragging our titlebar, and it can equally be started by the client
+/// asking for one (`BackendEvent::MoveRequest`) — and a client that
+/// asks is usually one that drew its own titlebar and therefore has no
+/// frame at all. Which surface actually gets moved is resolved per
+/// motion event from the client, so both kinds drag through one path.
+struct ActiveMove {
+    client: ClientId,
+    grab_offset: Point,
+}
+
+/// An edge/corner resize drag. Every motion recomputes geometry from the
+/// starting frame, preserving the opposite edge rather than accumulating
+/// deltas. Client requests also retain the pointer's offset from the edge.
+struct ActiveResize {
+    client: ClientId,
+    edge: ResizeEdge,
+    start_frame: Rect,
+    /// Client resize handles may sit inside or outside window geometry.
+    /// Preserve that offset instead of jumping the edge under the pointer.
+    /// Server chrome and modifier drags retain their edge-position behavior.
+    start_pointer: Option<Point>,
+}
+
+/// A freeform window's content rectangle on a display that was unplugged.
+/// Recorded once, before evacuation overwrites it. Consumed when that
+/// display returns, or when the user places the window while it is gone.
+struct EvacuatedHome {
+    name: String,
+    identity: Option<String>,
+    /// The departed monitor's rectangle, so a display that comes back at
+    /// a new origin still receives the window at the same relative place.
+    bounds: Rect,
+    geometry: Rect,
+}
+
+/// A titlebar button currently held down (pressed but not yet
+/// released) — the standard "arm on press, commit on release-while-
+/// still-over, cancel on release-elsewhere" interaction every button in
+/// this theme follows. Drives the pressed/sunken-bevel visual feedback
+/// via `decoration_request`'s `pressed_button` parameter.
+struct ActiveButtonPress {
+    client: ClientId,
+    kind: ButtonKind,
+}
+
+/// A state change consumed by desktop menus, Overview and IPC publication.
+/// Notifications contain client identities, never minimized-window images.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notification {
+    LayoutChanged(crate::LayoutMode),
+    /// A client was minimized without capturing its pixels.
+    Miniaturized(ClientId),
+    /// A minimized client was restored.
+    Deminiaturized(ClientId),
+    /// A client was closed or destroyed.
+    Removed(ClientId),
+    /// The Alt-Tab switcher session started or its selection moved —
+    /// the shell should (re)draw the switch panel from
+    /// `WindowManager::cycle_state`.
+    CycleUpdated,
+    /// The Alt-Tab switcher session ended (committed or cancelled) —
+    /// the shell should take the panel down.
+    CycleEnded,
+    /// A client was just mapped and decorated for the first time — lets
+    /// the shell react to new windows (e.g. giving a freshly spawned
+    /// app a sane default size via `resize_client_content` when its own
+    /// requested geometry can't be trusted, as some apps' initial size
+    /// negotiation is unreliable across window-manager environments).
+    Mapped(ClientId),
+    /// The user right-clicked a window's titlebar — the shell should
+    /// open the per-window commands menu at `at` (root coordinates) —
+    /// the classic NeXTSTEP-style window menu. `wm-core` deliberately
+    /// knows nothing about menus; it reports the gesture and executes
+    /// whatever public-API calls the shell's menu dispatch makes.
+    WindowMenuRequested { id: ClientId, at: Point },
+}
+
+/// Owns the backend, the theme engine, and all managed-client state.
+/// `dispatch` is the sole entry point the event loop drives — plain and
+/// synchronous, doing no I/O of its own beyond calls through `Backend`
+/// and `ThemeEngine`.
+pub struct WindowManager<B: Backend> {
+    interaction: crate::InteractionConfig,
+    mac_hidden: HashSet<ClientId>,
+    mac_fullscreen: HashMap<ClientId, (usize, usize)>,
+    display_spaces: Option<spaces::DisplaySpaces>,
+    desktop_reveal: Option<(HashSet<ClientId>, Option<ClientId>)>,
+    backend: B,
+    theme: Box<dyn ThemeEngine>,
+    clients: SlotMap<ClientId, Client<B>>,
+    window_index: HashMap<B::WindowId, ClientId>,
+    frame_index: HashMap<B::FrameId, ClientId>,
+    /// The sparse subset carrying an `idle_inhibit` window rule, with the
+    /// mode each one asked for. Idle protocol reconciliation walks this
+    /// map rather than every managed client on every Wayland dispatch
+    /// pass; most desktops keep it empty for the entire session.
+    idle_inhibit_clients: HashMap<ClientId, IdleInhibitRule>,
+    /// Windows whose `scroll_touchpad` rule sets their own touchpad scroll
+    /// factor. Sparse like the idle index: the axis path consults it only
+    /// while it is non-empty.
+    touchpad_scroll_rules: HashMap<ClientId, f64>,
+    focused: Option<ClientId>,
+    /// Every client that has ever held focus and still exists, oldest
+    /// first, each appearing exactly once.
+    ///
+    /// Focus is not only something a window *takes* — it is something
+    /// three ordinary gestures make a window *give up*: closing it,
+    /// miniaturizing it, and walking to another workspace. With only
+    /// `focused` to work from, each of those could do nothing but set
+    /// the field to `None`, which on a click-to-focus desktop reads to
+    /// the user as "I closed a window and my keyboard stopped
+    /// working". Picking a successor is not focus stealing: a window
+    /// that is closing, hidden or left behind is not competing with
+    /// anything, and the alternative to choosing is choosing nothing.
+    ///
+    /// Two writers only — [`Self::focus_client`] pushes (after
+    /// removing any earlier entry) and [`Self::forget`] removes — so
+    /// the two invariants hold by construction and are asserted in the
+    /// tests: no id here is absent from `clients`, and none appears
+    /// twice. The same discipline `managed_order` follows.
+    focus_history: Vec<ClientId>,
+    active_move: Option<ActiveMove>,
+    /// The pointer grab held for the duration of an interactive drag.
+    ///
+    /// A framed window did not need one: the window manager owns the
+    /// frame the pointer is over, so the motion and the release land on
+    /// it by construction. A window whose client draws its own chrome
+    /// has no such surface — every event goes to the client — so a drag
+    /// begun on one would start and then never end, and the window
+    /// would follow the pointer with no button held until something
+    /// else interrupted it. That was reported from a real session,
+    /// dragging LibreOffice.
+    ///
+    /// `Some` exactly while a move or a resize is in flight. Paired
+    /// with the backend's grab so a leak is visible in one place rather
+    /// than distributed across every path a drag can end on — and a
+    /// leaked pointer grab freezes the desktop for every client, which
+    /// is worse than the bug it fixes.
+    drag_grab: Option<DragHandle>,
+    active_resize: Option<ActiveResize>,
+    /// Content geometry at the start of the current move or resize.
+    /// A click that never moves the window is not a placement.
+    drag_started_geometry: Option<Rect>,
+    active_button_press: Option<ActiveButtonPress>,
+    /// The most recent press on a titlebar drag region, for double-click
+    /// detection — a second press on the *same* client's titlebar within
+    /// `DOUBLE_CLICK_MS` and the movement tolerance trigger a titlebar action.
+    last_titlebar_press: Option<(ClientId, u32, Point)>,
+    /// Per-monitor screen area windows should maximize into,
+    /// reserved-space-aware — e.g. `chonkstep`'s desktop shell excludes
+    /// its dock strip from the entry for the monitor the dock hangs on,
+    /// by calling `set_workareas`. Indexed in `Backend::monitors()`
+    /// order, and deliberately allowed to be *shorter* than that list
+    /// (empty included): a monitor with no entry uses its full
+    /// geometry, which is both the right answer for an output no panel
+    /// reserves anything on and what makes a single-rect
+    /// `set_workarea` call meaningful on a multi-head session.
+    workareas: Vec<Rect>,
+    /// Monotonic identity of the most recent workarea publication.
+    /// Protocol adapters use this to compose their own reservations
+    /// only after the shell has changed its baseline, instead of
+    /// rebuilding the same geometry at client-commit rate.
+    workarea_revision: u64,
+    /// Monotonic identity of protocol-visible window-manager state.
+    /// Adapters compare this at reconciliation boundaries instead of
+    /// assuming that every input-shaped event changed the desktop.
+    protocol_state_revision: u64,
+    /// The last root-relative pointer position the core has seen.
+    /// `None` until the first `PointerMotion` arrives — a session's
+    /// first window can map before the mouse has moved at all — so
+    /// every reader needs a fallback rather than a default position,
+    /// which would be indistinguishable from the pointer genuinely
+    /// resting at the origin.
+    last_pointer: Option<Point>,
+    /// Where freshly mapped windows that expressed no position
+    /// preference go — see `crate::placement`. Configured by the shell
+    /// (`set_placement_policy`); `Smart` by default.
+    placement_policy: PlacementPolicy,
+    /// Monotonic count of placements performed, feeding the cascade
+    /// staircase (`placement::place_frame`'s `cascade_index`).
+    placements: usize,
+    /// The desktop's UI scale, as the shell resolved it — the factor
+    /// every *logical* measurement in this crate is device pixels
+    /// times. Exactly one thing needs it today
+    /// (`placement::float_override`, whose 875×600 is a logical size),
+    /// and everything else here is already device pixels because the
+    /// theme engine hands out pre-scaled layouts. `1.0` until the
+    /// shell says otherwise (`set_ui_scale`), which is also the right
+    /// answer for a session that never mentions scale at all.
+    ui_scale: f32,
+    /// Edge-attraction distance for move drags — see `crate::snap`.
+    /// Configurable (`set_snap_threshold`); `0` disables snapping.
+    snap_threshold: i32,
+    /// The modifier that turns a press anywhere on a window's *content*
+    /// into a move (left button) or a resize (right button). `None`
+    /// disables the gesture entirely.
+    ///
+    /// This is what makes it safe to take a client at its word when it
+    /// says it draws its own chrome. Such a window has no titlebar of
+    /// ours to grab and no resize bar to pull, and if it then draws
+    /// nothing — a terminal configured `decorations = "None"` for a
+    /// tiling desktop does exactly that — the gesture is the only way
+    /// to move or resize it that does not depend on the client
+    /// cooperating. Window Maker has bound it to Alt since 1997 and
+    /// grabs it on the client window for precisely this case.
+    drag_modifier: Option<Modifiers>,
+    /// Per-window float rules read out of the user's *own* desktop
+    /// configuration, or `None` when there are none to read.
+    ///
+    /// `None` is not "float nothing": it is "fall back to the one
+    /// built-in rule", which is `placement::float_override`'s
+    /// `org.omarchy.` prefix. So a machine with no configuration to
+    /// read behaves exactly as it did before this field existed, and a
+    /// machine with one gets its own fifteen rules instead of a
+    /// transcription of one of them. Installed by the shell through
+    /// [`Self::set_float_policy`], the same way every other config
+    /// value reaches this type.
+    float_policy: Option<std::sync::Arc<dyn FloatPolicy>>,
+    notifications: VecDeque<Notification>,
+    focus_policy: FocusPolicy,
+    /// Whether taking focus also takes the top of the stack.
+    ///
+    /// Orthogonal to [`Self::focus_policy`] on purpose. Focus and
+    /// stacking are two things on a floating desktop, and the pair a
+    /// user wants is not a third focus mode: under click-to-focus the
+    /// raise belongs to the *click* and must survive whatever this
+    /// says, while under focus-follows-mouse an unconditional raise
+    /// reorders every window the pointer merely travels across on its
+    /// way somewhere else. Installed by the shell through
+    /// [`Self::set_raise_on_focus`], from the config's `autoraise`.
+    ///
+    /// `true` by default, so a session that sets nothing behaves
+    /// exactly as it did before this existed.
+    raise_on_focus: bool,
+    /// 0-based, matching `Client::workspace`. Grows on demand up to
+    /// [`MAX_WORKSPACES`] the first time something switches to or moves
+    /// a client onto an index past the current row's end. Removing a
+    /// workspace compacts memberships and retains at least one desktop.
+    current_workspace: usize,
+    /// The workspace `current_workspace` was before the last switch, for
+    /// Hyprland's `workspace previous`. Written by the two switch paths
+    /// only, never by a display selection, so it reads as "where I was
+    /// before" rather than "where the pointer last crossed". Remapped by
+    /// workspace removal like every other index; `None` until the first
+    /// switch and after the workspace it named is removed.
+    previous_workspace: Option<usize>,
+    workspace_count: usize,
+    layouts: Vec<crate::spatial::WorkspaceLayout>,
+    /// The style a workspace starts in when nothing chose one for it:
+    /// what every row grown on demand is seeded with, and what a
+    /// workspace never explicitly set follows when the default changes.
+    /// Installed by the shell from the desktop's configuration.
+    default_layout: crate::LayoutMode,
+    /// The special workspaces created so far, in creation order and
+    /// never removed, so an index is a stable identity for the session.
+    /// See `special.rs`.
+    specials: Vec<special::SpecialWorkspace>,
+    /// Output identity key -> index of the special workspace shown there.
+    special_shown: HashMap<String, usize>,
+    /// Whether a workspace switch hides the special shown on the output
+    /// it lands on — Omarchy's `binds.hide_special_on_workspace_change`.
+    hide_special_on_workspace_change: bool,
+    /// Whether an application's own activation request may take the
+    /// keyboard with no input of the user's behind it — Hyprland's
+    /// `misc:focus_on_activate`. Read by the backend at the protocol
+    /// edge that carries a token; the user-driven activation routes
+    /// (taskbar, pager, Alt-Tab, IPC) never consult it.
+    focus_on_activate: bool,
+    layout_drop: Option<(ClientId, ClientId)>,
+    layout_resize_snapshot: Option<crate::spatial::ResizeSnapshot>,
+    layout_statistics: crate::LayoutStatistics,
+    /// An in-progress Alt-Tab switcher session: the snapshot of cycle
+    /// candidates and which one is currently selected. Selection moves
+    /// on every Tab press while Alt stays held; releasing Alt commits
+    /// it, Escape cancels. The shell renders the panel from
+    /// `cycle_state` on every `Notification::CycleUpdated`.
+    cycle: Option<CycleSession>,
+    /// Managed clients' own windows in insertion (oldest-first) order —
+    /// exactly the order EWMH wants `_NET_CLIENT_LIST` published in,
+    /// which the unordered `window_index`/`clients` maps can't provide.
+    managed_order: Vec<B::WindowId>,
+    /// Content geometry to restore on leaving fullscreen. Deliberately a
+    /// separate slot from `Client::restore_geometry` (maximize's
+    /// snapshot): going fullscreen over a maximized window must come
+    /// back to the *maximized* rect, and reusing maximize's slot would
+    /// either clobber its own pre-maximize snapshot or restore too far.
+    fullscreen_restore: HashMap<ClientId, Rect>,
+    /// Freeform windows evacuated off an unplugged display, keyed by
+    /// client. Absent in Spaces mode, which has its own home geometry.
+    evacuated_homes: HashMap<ClientId, EvacuatedHome>,
+    /// Geometry snapshots keep the title metrics they were captured under.
+    /// A later restyle may require rescuing their restored title, while a
+    /// same-chrome restore preserves deliberate overlap exactly.
+    restore_title_metrics: HashMap<(ClientId, RestoreKind), TitleMetrics>,
+    /// Chrome invalidated by an interactive drag. Drains once at the render
+    /// boundary, not once per input event.
+    pending_decorations: HashSet<ClientId>,
+    /// Whether and how fast the transitions this manager starts move
+    /// (`set_motion_policy`). Layout reflows consult it here; the
+    /// backend's own scenes read it back through `motion_policy`.
+    motion: crate::MotionPolicy,
+}
+
+struct CycleSession {
+    order: Vec<ClientId>,
+    selected: usize,
+    modifier: Modifiers,
+    applications: bool,
+}
+
+impl<B: Backend> WindowManager<B> {
+    /// Bounds one client's size before any theme layout or raster
+    /// allocation can observe it. Protocol backends should reject bad
+    /// geometry at their own trust boundary too; this is the final,
+    /// backend-independent guard protecting every sibling path (X11
+    /// ConfigureRequest, session restore, shell-driven resize).
+    fn clamp_geometry(client: &mut Client<B>, screen: Size) {
+        let requested = client.geometry.size;
+        let accepted = clamp_client_size(requested, screen);
+        if requested == accepted {
+            return;
+        }
+        if !client.geometry_clamp_logged {
+            tracing::warn!(
+                window = ?client.window,
+                ?requested,
+                ?accepted,
+                ?screen,
+                "client window geometry exceeded the desktop allocation limit; clamping"
+            );
+            client.geometry_clamp_logged = true;
+        }
+        client.geometry.size = accepted;
+    }
+
+    pub fn new(mut backend: B, theme: Box<dyn ThemeEngine>) -> Self {
+        // Publish the initial workspace shape immediately: an EWMH pager
+        // that starts alongside the WM reads `_NET_NUMBER_OF_DESKTOPS`/
+        // `_NET_CURRENT_DESKTOP` right away, before any switch ever
+        // happens to publish them as a side effect.
+        backend.publish_workspaces(1, 0);
+        Self {
+            backend,
+            theme,
+            clients: SlotMap::with_key(),
+            window_index: HashMap::new(),
+            frame_index: HashMap::new(),
+            idle_inhibit_clients: HashMap::new(),
+            touchpad_scroll_rules: HashMap::new(),
+            focused: None,
+            active_move: None,
+            drag_grab: None,
+            active_resize: None,
+            drag_started_geometry: None,
+            active_button_press: None,
+            last_titlebar_press: None,
+            workareas: Vec::new(),
+            workarea_revision: 0,
+            protocol_state_revision: 0,
+            last_pointer: None,
+            placement_policy: PlacementPolicy::Smart,
+            placements: 0,
+            ui_scale: 1.0,
+            snap_threshold: SNAP_THRESHOLD_PX,
+            drag_modifier: Some(DEFAULT_DRAG_MODIFIER),
+            float_policy: None,
+            notifications: VecDeque::new(),
+            focus_policy: FocusPolicy::default(),
+            raise_on_focus: true,
+            current_workspace: 0,
+            previous_workspace: None,
+            workspace_count: 1,
+            layouts: vec![crate::spatial::WorkspaceLayout::default()],
+            default_layout: crate::LayoutMode::Freeform,
+            specials: Vec::new(),
+            special_shown: HashMap::new(),
+            hide_special_on_workspace_change: false,
+            focus_on_activate: false,
+            layout_drop: None,
+            layout_resize_snapshot: None,
+            layout_statistics: crate::LayoutStatistics::default(),
+            cycle: None,
+            interaction: crate::InteractionConfig::default(),
+            mac_hidden: HashSet::new(),
+            mac_fullscreen: HashMap::new(),
+            display_spaces: None,
+            desktop_reveal: None,
+            managed_order: Vec::new(),
+            focus_history: Vec::new(),
+            fullscreen_restore: HashMap::new(),
+            evacuated_homes: HashMap::new(),
+            restore_title_metrics: HashMap::new(),
+            pending_decorations: HashSet::new(),
+            motion: crate::MotionPolicy::default(),
+        }
+    }
+
+    /// Installs the motion policy a config load or reload resolved,
+    /// sanitized here so an out-of-range speed from a file never reaches
+    /// a spring. Takes effect on the next transition and, through
+    /// [`Self::motion_policy`], on any transition already in flight.
+    pub fn set_motion_policy(&mut self, policy: crate::MotionPolicy) {
+        self.motion = policy.sanitized();
+    }
+
+    pub fn motion_policy(&self) -> crate::MotionPolicy {
+        self.motion
+    }
+
+    /// Switches between click-to-focus (the default) and focus-follows-
+    /// mouse — the whole reason `HitTarget`/button handling and pointer-
+    /// enter tracking are kept as separate concerns: a shell can flip
+    /// this at runtime (e.g. a preferences toggle) without either code
+    /// path needing to know the other exists.
+    pub fn set_focus_policy(&mut self, policy: FocusPolicy) {
+        self.focus_policy = policy;
+    }
+
+    /// Whether a window that *takes* focus is also brought to the front
+    /// — the config's `autoraise`, and the axis that makes sloppy focus
+    /// usable on an overlapping desktop.
+    ///
+    /// Only the focus a pointer crossing hands out is governed by this.
+    /// A click still raises what it lands on, because that raise is the
+    /// click's, not the focus's; see [`Self::focus_client_with`].
+    pub fn set_raise_on_focus(&mut self, raise: bool) {
+        self.raise_on_focus = raise;
+    }
+
+    /// Selects the initial-placement policy for windows that request no
+    /// position of their own — the config file's `placement` entry.
+    pub fn set_placement_policy(&mut self, policy: PlacementPolicy) {
+        self.placement_policy = policy;
+    }
+
+    /// Installs the per-window float rules — the ones read live out of
+    /// the user's own desktop configuration (`wm_config::hyprland`).
+    ///
+    /// Applies to windows mapped from here on, not retroactively: a
+    /// rule is a statement about how a window *arrives*, and re-placing
+    /// windows the user has since moved would be a config reload
+    /// rearranging their desk. `None` restores the built-in fallback.
+    pub fn set_float_policy(&mut self, policy: Option<std::sync::Arc<dyn FloatPolicy>>) {
+        self.float_policy = policy;
+    }
+
+    /// Tells the window manager what the desktop's UI scale is — the
+    /// config file's `scale`, resolved by the shell.
+    ///
+    /// A plain setter, deliberately: nothing already on screen is
+    /// re-laid-out by it, because everything that *draws* is scaled by
+    /// the theme engine the shell swaps in on the same pass. This is
+    /// only the factor for the logical measurements written into this
+    /// crate itself — see the private `placement::float_override` — so a window
+    /// that maps after the change gets the new scale and one already
+    /// mapped keeps the size it has, which is the same deal every
+    /// other window on the desk gets.
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = scale;
+    }
+
+    /// Sets the move-drag edge-attraction distance in pixels — the
+    /// config file's `edge_resistance` entry. `0` disables snapping
+    /// entirely (every position passes through untouched).
+    /// The edge-snapping distance in force, in pixels (`0`: off).
+    pub fn snap_threshold(&self) -> u32 {
+        self.snap_threshold.max(0) as u32
+    }
+    pub fn set_snap_threshold(&mut self, px: u32) {
+        self.snap_threshold = px.min(i32::MAX as u32) as i32;
+    }
+
+    /// Sets the modifier for the move/resize drag gesture — the config
+    /// file's `drag_modifier` entry. `None` turns the gesture off.
+    ///
+    /// A backend that takes passive pointer grabs (the X11 session
+    /// does) has to re-grab when this changes; the compositor reads it
+    /// per event and needs nothing.
+    pub fn set_drag_modifier(&mut self, modifier: Option<Modifiers>) {
+        if self.drag_modifier == modifier {
+            return;
+        }
+        self.drag_modifier = modifier;
+        let windows: Vec<B::WindowId> = self.clients.iter().map(|(_, client)| client.window).collect();
+        for window in windows {
+            self.backend.set_drag_gesture_grab(window, modifier);
+        }
+    }
+
+    /// The modifier currently driving the move/resize gesture, for a
+    /// backend that has to decide whether a press belongs to the window
+    /// manager or the client *before* `wm-core` sees it.
+    pub fn drag_modifier(&self) -> Option<Modifiers> {
+        self.drag_modifier
+    }
+
+    /// Whether `mods` is exactly the drag modifier: the gesture's own
+    /// modifier held, and no other.
+    ///
+    /// Exact rather than "contains" on purpose. Alt+Shift is this
+    /// desktop's binding prefix for eleven window commands, and a
+    /// gesture that fired on any superset of Alt would turn every one
+    /// of those chords into a latent window drag the moment the user's
+    /// hand touched the mouse.
+    pub fn is_drag_gesture(&self, mods: Modifiers) -> bool {
+        self.drag_modifier.is_some_and(|wanted| mods == wanted)
+    }
+
+    /// Swaps the decoration engine and re-lays-out every managed client
+    /// against it — how a live theme or UI-scale change reaches the
+    /// window chrome without restarting the session.
+    ///
+    /// The sweep is part of the swap rather than a second call the
+    /// caller makes afterward, because the two are not independently
+    /// useful: an engine whose metrics no client has been reflowed
+    /// against is a window manager whose `Client::layout` cache
+    /// disagrees with what is on screen, and every hit-test and drag
+    /// computed from that cache would be wrong. Making it one act means
+    /// it cannot be half-done.
+    ///
+    /// `wm-core` still never sees a `Theme` — the caller builds the
+    /// engine (see `wm_theme::RasterThemeEngine::with_fonts`, which
+    /// reuses the loaded font database so a restyle costs no fontconfig
+    /// scan) and this crate only knows it has a new source of layouts.
+    pub fn set_theme_engine(&mut self, theme: Box<dyn ThemeEngine>) {
+        self.theme = theme;
+        // A release must not activate a control whose geometry/availability
+        // belonged to the previous style.
+        self.active_button_press = None;
+        self.last_titlebar_press = None;
+        for client in self.clients.values_mut() {
+            client.last_decoration_request = None;
+        }
+        self.relayout_all_clients();
+    }
+
+    /// Re-derives every managed client's decoration layout from the
+    /// current engine, pushes the resulting frame geometry to the
+    /// backend, and repaints the chrome.
+    ///
+    /// Withdrawn clients are skipped: they are unmapped and possibly
+    /// already destroyed, and `reflow_frame` would still push a
+    /// position and a size at the window. Miniaturized ones are *not* —
+    /// their frame is unmapped but alive, and reflowing it now is what
+    /// makes a later deminiaturize exact rather than restoring a window
+    /// into chrome measured for the previous theme.
+    ///
+    /// Rebase an in-flight grab against the new frame after the sweep. The
+    /// next motion then starts from the current pointer/content geometry,
+    /// including the new opposite edge during a north/west resize.
+    pub fn relayout_all_clients(&mut self) {
+        if self.separate_spaces() && self.monitors_ref().is_empty() { return; }
+        let moving_before = self.active_move.as_ref().and_then(|drag| {
+            self.clients.get(drag.client).map(client_input_rect)
+        });
+        let ids: Vec<ClientId> = self.clients.keys().collect();
+        for id in ids {
+            let Some(client) = self.clients.get(id) else { continue; };
+            if client.lifecycle == Lifecycle::Withdrawn || self.layout_candidate(id) {
+                continue;
+            }
+            // Spatial candidates get their final content geometry and exactly
+            // one forced reflow in the workspace pass below. Maximized clients
+            // first measure the new overhead, then fit and submit only their
+            // final geometry; the old cached title height cannot size content.
+            let directions = Self::maximize_directions(client);
+            if directions.is_empty() {
+                self.reflow_frame_internal(id, ReflowReason::Restyle);
+            } else {
+                let layout = self.chrome_layout(client.chrome, &Self::decoration_request(client, None), self.client_decoration_scale(id));
+                let changed = client.layout != layout;
+                self.refit_maximized_chrome(id, layout, directions, changed);
+            }
+        }
+        for workspace in 0..self.workspace_count {
+            self.reflow_workspace_with_force(workspace, true);
+        }
+        if let (Some(before), Some(drag)) = (moving_before, self.active_move.as_mut()) {
+            if let Some(client) = self.clients.get(drag.client) {
+                let after = client_input_rect(client);
+                drag.grab_offset.x = drag.grab_offset.x.saturating_add(before.pos.x.saturating_sub(after.pos.x));
+                drag.grab_offset.y = drag.grab_offset.y.saturating_add(before.pos.y.saturating_sub(after.pos.y));
+            }
+        }
+        if let Some(drag) = self.active_resize.as_mut() {
+            if let Some(client) = self.clients.get(drag.client) {
+                drag.start_frame = client_input_rect(client);
+                drag.start_pointer = self.last_pointer;
+            }
+        }
+        self.bump_protocol_state_revision();
+    }
+
+    /// Reserves screen space windows should not maximize into (e.g. a
+    /// dock/panel strip), one rect per monitor in `Backend::monitors()`
+    /// order — a reusable SDK primitive: any desktop shell built on
+    /// this crate calls this once at startup and again on output
+    /// changes, rather than `wm-core` hardcoding a notion of "the
+    /// dock".
+    ///
+    /// A vector shorter than the monitor list is legal and leaves every
+    /// monitor past its end at that monitor's full geometry, so a shell
+    /// that only reserves space on one output needs to say nothing
+    /// about the rest.
+    ///
+    /// A maximized window is a promise to fill the usable area, and the
+    /// usable area just changed: every window maximized along either
+    /// axis is refitted to the new one, so a bar that comes up after
+    /// the windows did pushes them out of its strip, and a bar that
+    /// exits hands the strip back. Fullscreen windows never followed
+    /// the workarea and are left alone; a shaded one keeps its rolled-
+    /// up geometry and catches up when it is unshaded.
+    ///
+    /// Every call advances [`Self::workarea_revision`], even when the
+    /// rectangles compare equal. A caller is publishing its baseline;
+    /// an adapter may have composed another reservation over the same
+    /// numeric value and still needs to observe that ownership edge.
+    pub fn set_workareas(&mut self, areas: Vec<Rect>) {
+        let before = self.effective_workareas();
+        self.workareas = areas.into_iter().map(|area| self.backend.constrain_workarea(area)).collect();
+        self.workarea_revision = self.workarea_revision.wrapping_add(1);
+        self.publish_workarea_union();
+        // A disconnected Mac session retains its window geometry until a
+        // real output returns; the headless fallback is not a resize target.
+        if self.separate_spaces() && self.monitors_ref().is_empty() { return; }
+        if self.effective_workareas() != before {
+            self.refit_maximized();
+            self.reflow_layouts();
+            // A bar can map after ordinary windows, including windows on
+            // inactive desktops. Only reflow frames actually inside its strip.
+            let displaced: Vec<_> = self
+                .clients
+                .iter()
+                .filter(|(_, client)| !client.flags.contains(ClientFlags::FULLSCREEN))
+                .filter_map(|(id, client)| {
+                    let frame = client_frame_rect(client);
+                    let anchor = Point::new(
+                        frame.pos.x + frame.size.w as i32 / 2,
+                        frame.pos.y + frame.size.h as i32 / 2,
+                    );
+                    (self.below_top_reservation(frame.pos, anchor) != frame.pos).then_some(id)
+                })
+                .collect();
+            for id in displaced {
+                self.reflow_frame(id);
+            }
+        }
+    }
+
+    /// Revision of the most recent [`Self::set_workareas`] call.
+    ///
+    /// This is an invalidation edge, not a clock: wrapping is allowed,
+    /// and consumers compare only for inequality before recording the
+    /// value they just reconciled.
+    pub fn workarea_revision(&self) -> u64 {
+        self.workarea_revision
+    }
+
+    /// Revision of state represented by taskbar and compatibility
+    /// protocols: client lifecycle/identity/state, focus and workspaces.
+    /// Geometry changes from an interactive drag are deliberately updated
+    /// through the dragged window's protocol handle directly.
+    pub fn protocol_state_revision(&self) -> u64 {
+        self.protocol_state_revision
+    }
+
+    fn bump_protocol_state_revision(&mut self) {
+        self.protocol_state_revision = self.protocol_state_revision.wrapping_add(1);
+    }
+
+    /// Re-maximizes every window that is maximized along some axis
+    /// into the current usable area of its own monitor. The fit keeps
+    /// an already-saved restore geometry, so unmaximizing later
+    /// still lands where the user left the window before any of this.
+    fn refit_maximized(&mut self) {
+        let maximized: Vec<(ClientId, MaximizeDirections)> = self
+            .clients
+            .iter()
+            .filter(|(_, client)| !client.flags.intersects(ClientFlags::FULLSCREEN | ClientFlags::SHADED))
+            .filter_map(|(id, client)| {
+                let mut directions = MaximizeDirections::empty();
+                if client.flags.contains(ClientFlags::MAXIMIZED_H) {
+                    directions |= MaximizeDirections::HORIZONTAL;
+                }
+                if client.flags.contains(ClientFlags::MAXIMIZED_V) {
+                    directions |= MaximizeDirections::VERTICAL;
+                }
+                (!directions.is_empty()).then_some((id, directions))
+            })
+            .collect();
+        for (id, directions) in maximized {
+            self.fit_maximized(id, directions);
+            tracing::debug!(?id, ?directions, "refitted a maximized window to the new workarea");
+        }
+    }
+
+    /// The *primary* monitor's workarea — the single-rect form, and
+    /// the whole call for a single-monitor session. Delegates to
+    /// `set_workareas` with the primary's entry replaced and every
+    /// other monitor left at its full geometry, so calling this on a
+    /// multi-head session reserves space on exactly the one output the
+    /// shell's chrome hangs on.
+    pub fn set_workarea(&mut self, area: Rect) {
+        let primary = self.primary_monitor_index();
+        // Stops at the primary rather than covering every monitor: the
+        // trailing ones are already "full geometry" by `set_workareas`'
+        // short-vector rule, so spelling them out would only be a
+        // snapshot to go stale.
+        let mut areas: Vec<Rect> = self.backend.monitors().into_iter().take(primary + 1).map(|m| m.geometry).collect();
+        match areas.get_mut(primary) {
+            Some(slot) => *slot = area,
+            // No monitors reported at all — this one rect is the only
+            // screen information there is.
+            None => areas.push(area),
+        }
+        self.set_workareas(areas);
+    }
+
+    /// `_NET_WORKAREA` is per-desktop in the property format and has no
+    /// per-monitor dimension whatsoever (it predates multi-head), so a
+    /// multi-monitor session publishes the bounding box of its
+    /// per-monitor workareas — the only rect that is true of the whole
+    /// desktop rather than of one output. The backend repeats it once
+    /// per workspace, since the reserved strips are the same on all of
+    /// them (see `Backend::publish_workarea`).
+    fn publish_workarea_union(&mut self) {
+        let union = self.effective_workareas().into_iter().reduce(union_rect).unwrap_or(NO_MONITOR_FALLBACK);
+        self.backend.publish_workarea(union, self.workspace_count);
+    }
+
+    /// One workarea per reported monitor: the shell's own entry where
+    /// it set one, that monitor's full geometry where it did not. With
+    /// no monitors reported at all this is whatever `set_workareas` was
+    /// handed, which is then the only screen information in existence.
+    fn effective_workareas(&self) -> Vec<Rect> {
+        let monitors = self.backend.monitors();
+        if monitors.is_empty() {
+            return self.workareas.clone();
+        }
+        monitors.iter().enumerate().map(|(index, m)| self.workareas.get(index).copied().unwrap_or(m.geometry)).collect()
+    }
+
+    /// Every physical output, in the backend's stable order — the same
+    /// indices `set_workareas` addresses. The shell reads this to hang
+    /// its chrome on the primary and to compute one workarea per
+    /// monitor.
+    pub fn monitors(&self) -> Vec<MonitorInfo> {
+        self.backend.monitors()
+    }
+
+    /// The backend's stable monitor ledger without cloning its names.
+    /// Hot read-only consumers should prefer this over [`Self::monitors`].
+    pub fn monitors_ref(&self) -> &[MonitorInfo] {
+        self.backend.monitors_ref()
+    }
+
+    /// Index of the monitor the shell's chrome belongs on: the one the
+    /// backend flagged `primary`, else the first (see
+    /// `Backend::monitors`, which allows a platform to name none).
+    /// Always a valid index into a non-empty monitor list; `0` for an
+    /// empty one, where nothing indexes it anyway.
+    fn primary_monitor_index(&self) -> usize {
+        self.backend.monitors().iter().position(|m| m.primary).unwrap_or(0)
+    }
+
+    /// The monitor `point` falls on: the one containing it, else the
+    /// nearest one. "Nearest" rather than "none" is what makes every
+    /// caller total — the dead corner of an L-shaped dual-head
+    /// arrangement belongs to no output at all, and a frame dragged
+    /// mostly off-screen still has to maximize somewhere.
+    pub fn monitor_index_at(&self, point: Point) -> usize {
+        let monitors = self.backend.monitors_ref();
+        if let Some(index) = monitors.iter().position(|m| m.geometry.contains(point)) {
+            return index;
+        }
+        monitors
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, m)| squared_distance_to(m.geometry, point))
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    /// The full geometry of the monitor `point` falls on.
+    pub fn monitor_rect_at(&self, point: Point) -> Rect {
+        self.backend
+            .monitors_ref()
+            .get(self.monitor_index_at(point))
+            .map(|m| m.geometry)
+            .unwrap_or(NO_MONITOR_FALLBACK)
+    }
+
+    /// Re-homes windows whose physical monitor disappeared. The
+    /// backend updates its monitor list first, then calls this once per
+    /// departed rect; keeping the policy here makes X11 and Wayland
+    /// geometry obey the same rules if the X backend grows RandR
+    /// hotplug later.
+    ///
+    /// Callers that can name the departed display should use
+    /// [`Self::rescue_departed_output`] so a later reconnect can put
+    /// freeform windows back. This entry point still evacuates, and it
+    /// does not record a home.
+    pub fn rescue_clients_from_removed_monitor(&mut self, departed: Rect) {
+        self.rescue_departed_output(departed, "", None);
+    }
+
+    /// Evacuates windows off one departed display and, for a freeform
+    /// window whose center was on it, remembers that display and the
+    /// rectangle from before the move. The rectangle is recorded once:
+    /// a later clamp, or a second topology change while the display is
+    /// still gone, must not replace it. [`Self::restore_evacuated_clients`]
+    /// puts it back when the display returns.
+    ///
+    /// `identity` is the stable EDID description when the backend has
+    /// one. A unique identity matches even if the connector name
+    /// changed. With no identity, or with a duplicated one, the
+    /// connector `name` is the match.
+    pub fn rescue_departed_output(&mut self, departed: Rect, name: &str, identity: Option<&str>) {
+        self.prune_special_shown();
+        if self.separate_spaces() { self.reconcile_display_spaces(); return; }
+        let monitors = self.backend.monitors();
+        if monitors.is_empty() {
+            return;
+        }
+        let affected: Vec<(ClientId, bool)> = self
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                let frame = client_frame_rect(client);
+                let center = Point::new(
+                    frame.pos.x + frame.size.w as i32 / 2,
+                    frame.pos.y + frame.size.h as i32 / 2,
+                );
+                let visible_somewhere = monitors.iter().any(|monitor| {
+                    let other = monitor.geometry;
+                    frame.pos.x < other.pos.x.saturating_add(other.size.w as i32)
+                        && other.pos.x < frame.pos.x.saturating_add(frame.size.w as i32)
+                        && frame.pos.y < other.pos.y.saturating_add(other.size.h as i32)
+                        && other.pos.y < frame.pos.y.saturating_add(frame.size.h as i32)
+                });
+                let on_departed = departed.contains(center);
+                (on_departed || !visible_somewhere).then_some((id, on_departed))
+            })
+            .collect();
+        // Snapshot before ending a drag or reflowing. Both of those clamp
+        // the live rectangle against the smaller desktop, and that clamp
+        // must not become the rectangle we return to.
+        for &(id, on_departed) in &affected {
+            if on_departed {
+                self.remember_evacuated_home(id, name, identity, departed);
+            }
+        }
+        self.end_active_drag();
+
+        for (id, _) in affected {
+            if self.clients.get(id).is_some_and(|client| client.flags.contains(ClientFlags::FULLSCREEN)) {
+                self.unfullscreen(id);
+            }
+            if self.clients.get(id).is_some_and(|client| {
+                client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V)
+            }) {
+                self.unmaximize(id);
+            }
+            let Some(client) = self.clients.get(id) else { continue };
+            let frame = client_frame_rect(client);
+            let center = Point::new(
+                frame.pos.x + frame.size.w as i32 / 2,
+                frame.pos.y + frame.size.h as i32 / 2,
+            );
+            let target = monitors
+                .iter()
+                .min_by_key(|monitor| squared_distance_to(monitor.geometry, center))
+                .map(|monitor| monitor.geometry)
+                .unwrap_or(NO_MONITOR_FALLBACK);
+            let frame_pos = placement::clamp_to(target, frame.size, frame.pos);
+            let Some(client) = self.clients.get_mut(id) else { continue };
+            client.geometry.pos = Point::new(
+                frame_pos.x + client.layout.client_offset.x - client.layout.input_margin as i32,
+                frame_pos.y + client.layout.client_offset.y - client.layout.input_margin as i32,
+            );
+            self.reflow_frame(id);
+            tracing::info!(?id, ?departed, ?target, "rescued window from a removed monitor");
+        }
+        self.reflow_layouts();
+    }
+
+    /// Puts evacuated freeform windows back on a display that has
+    /// returned. A unique EDID matches across a connector rename.
+    /// Otherwise the connector name has to match. A display that comes
+    /// back at a different origin keeps the window's place relative to
+    /// that origin; a smaller display clamps the rectangle so it fits,
+    /// and either way the saved home is then forgotten.
+    pub fn restore_evacuated_clients(&mut self) {
+        if self.separate_spaces() || self.evacuated_homes.is_empty() {
+            return;
+        }
+        let monitors = self.backend.monitors();
+        let pending: Vec<ClientId> = self.evacuated_homes.keys().copied().collect();
+        for id in pending {
+            if !self.clients.contains_key(id) {
+                self.evacuated_homes.remove(&id);
+                continue;
+            }
+            let Some(target) = self.evacuated_homes.get(&id).and_then(|home| returning_monitor(&monitors, home)).map(|monitor| monitor.geometry) else {
+                continue;
+            };
+            let Some(home) = self.evacuated_homes.remove(&id) else { continue };
+            let geometry = Self::place_evacuated_geometry(home.geometry, home.bounds, target);
+            tracing::info!(?id, ?geometry, "restored window to a returned monitor");
+            self.apply_evacuated_geometry(id, geometry);
+        }
+    }
+
+    /// Freeform windows, including ones floated out of a tiled layout,
+    /// keep a rectangle of their own. Tiled windows already remember an
+    /// output key and are placed by the layout solver.
+    fn keeps_evacuation_home(&self, id: ClientId) -> bool {
+        let Some(client) = self.clients.get(id) else { return false };
+        self.client_layout_mode(client) == crate::LayoutMode::Freeform || client.placement.floating
+    }
+
+    fn remember_evacuated_home(&mut self, id: ClientId, name: &str, identity: Option<&str>, bounds: Rect) {
+        let identity = identity.filter(|value| !value.is_empty());
+        if name.is_empty() && identity.is_none() {
+            return;
+        }
+        if !self.keeps_evacuation_home(id) {
+            return;
+        }
+        let Some(geometry) = self.clients.get(id).map(|client| client.geometry) else { return };
+        self.evacuated_homes.entry(id).or_insert(EvacuatedHome {
+            name: name.to_string(),
+            identity: identity.map(str::to_string),
+            bounds,
+            geometry,
+        });
+    }
+
+    /// The user placed this window while its display was gone. The
+    /// saved rectangle must not undo that.
+    fn release_evacuated_home(&mut self, id: ClientId) {
+        self.evacuated_homes.remove(&id);
+    }
+
+    fn remember_drag_start(&mut self, id: ClientId) {
+        self.drag_started_geometry = self.clients.get(id).map(|client| client.geometry);
+    }
+
+    fn apply_evacuated_geometry(&mut self, id: ClientId, geometry: Rect) {
+        let Some(client) = self.clients.get_mut(id) else { return };
+        if client.geometry == geometry {
+            return;
+        }
+        client.geometry = geometry;
+        self.bump_protocol_state_revision();
+        self.reflow_frame(id);
+    }
+
+    /// Translate `saved` from the departed monitor onto `target`.
+    /// Same-sized displays keep the exact rectangle. A different size
+    /// clamps it onto the monitor that actually came back.
+    fn place_evacuated_geometry(saved: Rect, from: Rect, target: Rect) -> Rect {
+        let mut rect = saved;
+        rect.pos.x = rect.pos.x.saturating_sub(from.pos.x).saturating_add(target.pos.x);
+        rect.pos.y = rect.pos.y.saturating_sub(from.pos.y).saturating_add(target.pos.y);
+        if from.size != target.size {
+            rect.size.w = rect.size.w.min(target.size.w).max(1);
+            rect.size.h = rect.size.h.min(target.size.h).max(1);
+            rect.pos = placement::clamp_to(target, rect.size, rect.pos);
+        }
+        rect
+    }
+
+    /// That monitor's workarea: the shell-reserved area if one was set
+    /// for it, else its full geometry. The per-monitor twin of
+    /// `usable_area`, and what maximize actually measures against.
+    pub fn usable_area_at(&self, point: Point) -> Rect {
+        let index = self.monitor_index_at(point);
+        self.workareas
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| self.monitor_rect_at(point))
+    }
+
+    /// A reserved top strip is a hard boundary for managed titlebars. Other
+    /// edges retain normal overlapping-window behavior; an unreserved monitor
+    /// does not inherit its neighbor's bar. The anchor chooses the destination
+    /// output (the pointer during a move, the frame center otherwise).
+    fn below_top_reservation(&self, mut pos: Point, anchor: Point) -> Point {
+        let index = self.monitor_index_at(anchor);
+        if let (Some(area), Some(monitor)) = (
+            self.workareas.get(index),
+            self.backend.monitors_ref().get(index),
+        ) {
+            if area.pos.y > monitor.geometry.pos.y {
+                pos.y = pos.y.max(area.pos.y);
+            }
+        }
+        pos
+    }
+
+    /// Registers the Alt+Tab / Alt+Shift+Tab window-cycling grabs — the
+    /// only keybindings `wm-core` claims for itself. The split is
+    /// deliberate: cycling is *modal* machinery (a switcher session, an
+    /// exclusive keyboard grab, commit-on-Alt-release, cancel-on-Escape,
+    /// the lost-release fallback) that only works woven through this
+    /// crate's internal state, so it lives here; everything else — close,
+    /// maximize, workspace switching, and the rest — is a plain
+    /// combo-to-action mapping the binary drives from user config
+    /// (`wm-config`), registering each configured combo via `grab_key`
+    /// and calling the matching public method when its `KeyPress`
+    /// arrives. Call once after construction.
+    pub fn bind_default_keys(&mut self) {
+        if self.mac_keyboard() { return; }
+        self.backend.grab_key(KeyCombo { keysym: XK_TAB, modifiers: Modifiers::ALT });
+        self.backend.grab_key(KeyCombo { keysym: XK_TAB, modifiers: Modifiers::ALT | Modifiers::SHIFT });
+    }
+
+    /// Registers a global keybinding with the backend — a pure
+    /// passthrough. The binary calls this once per configured combo at
+    /// startup and then reacts to the resulting
+    /// `BackendEvent::KeyPress`es itself: `wm-core` neither knows nor
+    /// cares what action a combo is bound to (the sole exception being
+    /// the modal Alt+Tab machinery — see `bind_default_keys`).
+    pub fn grab_key(&mut self, combo: KeyCombo) {
+        self.backend.grab_key(combo);
+    }
+
+    /// Releases a passive grab taken by [`Self::grab_key`] — how a
+    /// config reload lets go of a combo the user has just unbound.
+    /// Without it a rebind could only ever add grabs, and a combo
+    /// removed from the config file would keep being swallowed by this
+    /// session for as long as it ran.
+    pub fn ungrab_key(&mut self, combo: KeyCombo) {
+        self.backend.ungrab_key(combo);
+    }
+
+    pub fn current_workspace(&self) -> usize {
+        self.current_workspace
+    }
+
+    /// Iterates managed clients for menus, navigation and IPC snapshots.
+    pub fn iter_clients(&self) -> impl Iterator<Item = (ClientId, &Client<B>)> {
+        self.clients.iter()
+    }
+
+    /// Whether any window's `idle_inhibit` rule currently holds.
+    ///
+    /// The query walks a sparse index populated only by matching windows,
+    /// rather than revisiting the entire client table every dispatch pass.
+    pub fn rule_idle_inhibited(&self) -> bool {
+        self.idle_inhibit_clients.keys().any(|&id| self.client_inhibits_idle(id))
+    }
+
+    /// Whether this window's `idle_inhibit` rule currently holds.
+    ///
+    /// Every mode needs the window mapped and showing (visible workspace,
+    /// or pinned), without requiring keyboard focus: a game or stream stays
+    /// awake while it is on screen. `Focus` and `Fullscreen` then add the
+    /// one condition their names say, so a launcher's windowed library is
+    /// not mistaken for its game. Whoever reconciles idle must re-ask after
+    /// a focus or fullscreen change, not only after a visibility change.
+    pub fn client_inhibits_idle(&self, id: ClientId) -> bool {
+        let Some(&mode) = self.idle_inhibit_clients.get(&id) else {
+            return false;
+        };
+        let Some(client) = self.clients.get(id) else {
+            return false;
+        };
+        self.client_on_screen(client)
+            && match mode {
+                IdleInhibitRule::None => false,
+                IdleInhibitRule::Always => true,
+                IdleInhibitRule::Focus => self.focused == Some(id),
+                IdleInhibitRule::Fullscreen => client.flags.contains(ClientFlags::FULLSCREEN),
+            }
+    }
+
+    /// Whether any window carries a `scroll_touchpad` rule, so the axis
+    /// path can skip the per-event lookup on desktops that write none.
+    pub fn has_touchpad_scroll_rules(&self) -> bool {
+        !self.touchpad_scroll_rules.is_empty()
+    }
+
+    /// This window's `scroll_touchpad` factor, if a rule set one.
+    pub fn client_touchpad_scroll_factor(&self, id: ClientId) -> Option<f64> {
+        self.touchpad_scroll_rules.get(&id).copied()
+    }
+
+    /// Sets a client's attention state (xdg-system-bell/EWMH urgency).
+    pub fn set_urgent(&mut self, id: ClientId, urgent: bool) {
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if client.flags.contains(ClientFlags::URGENT) == urgent {
+            return;
+        }
+        client.flags.set(ClientFlags::URGENT, urgent);
+        // Logged because it is a real, user-visible transition with two
+        // protocol sources (`xdg_system_bell`, and EWMH/ICCCM through
+        // XWayland) and one implicit clear (focus). A log line is also
+        // the only *level-triggered* account of it: the IPC event
+        // stream emits `urgent` on the false→true edge alone, so a
+        // dismissal is invisible there.
+        tracing::info!(?id, urgent, "window urgency changed");
+        self.bump_protocol_state_revision();
+        self.repaint_decoration(id);
+    }
+
+    /// Pin/unpin a window. Pinned windows are visible on every
+    /// workspace and are kept above ordinary windows.
+    pub fn set_client_pinned(&mut self, id: ClientId, pinned: bool) -> bool {
+        self.cancel_client_layout_interaction(id);
+        if pinned && self.is_layout_managed(id) {
+            if let Some(saved) = self.clients[id].placement.freeform {
+                self.restore_freeform_geometry(id, saved);
+            }
+        }
+        let Some(client) = self.clients.get_mut(id) else { return false };
+        if client.flags.contains(ClientFlags::STICKY) == pinned {
+            return true;
+        }
+        client.flags.set(ClientFlags::STICKY, pinned);
+        self.reflow_client_workspace(id);
+        self.bump_protocol_state_revision();
+        if !self.client_visible(id) {
+            self.focus_successor_of(id);
+            self.hide_client_surface(id);
+        } else if pinned {
+            self.show_client_surface(id);
+            self.raise_client(id);
+        }
+        true
+    }
+
+    /// Forces a client opaque for the session (`Some(true)`), lets its
+    /// opacity rule apply again (`Some(false)`), or toggles between the
+    /// two (`None`): Omarchy's `SUPER + BACKSPACE`. The state lives on
+    /// the backend with the rule it overrides; `false` when the client
+    /// is unknown or the backend draws every window opaque anyway.
+    pub fn set_client_opaque(&mut self, id: ClientId, opaque: Option<bool>) -> bool {
+        let Some(client) = self.clients.get(id) else { return false };
+        self.backend.set_window_opaque(client.window, opaque)
+    }
+
+    /// Add or remove a stable IPC tag from a managed client.
+    pub fn set_client_tag(&mut self, id: ClientId, tag: &str, present: bool) -> bool {
+        let Some(client) = self.clients.get_mut(id) else { return false };
+        let had = client.tags.iter().any(|held| held == tag);
+        if had == present {
+            return true;
+        }
+        if present {
+            client.tags.push(tag.to_string());
+        } else {
+            client.tags.retain(|held| held != tag);
+        }
+        self.bump_protocol_state_revision();
+        true
+    }
+
+    /// Center a window in the workarea of the output it currently
+    /// occupies, preserving its content size.
+    pub fn center_client(&mut self, id: ClientId) -> bool {
+        let Some(client) = self.clients.get(id) else { return false };
+        let frame_size = client.layout.frame_size;
+        let offset = client.layout.client_offset;
+        let centre = Point::new(
+            client.geometry.pos.x + i32::try_from(client.geometry.size.w / 2).unwrap_or(0),
+            client.geometry.pos.y + i32::try_from(client.geometry.size.h / 2).unwrap_or(0),
+        );
+        let area = self.usable_area_at(centre);
+        let frame_x = area.pos.x + (i32::try_from(area.size.w).unwrap_or(i32::MAX)
+            - i32::try_from(frame_size.w).unwrap_or(i32::MAX)) / 2;
+        let frame_y = area.pos.y + (i32::try_from(area.size.h).unwrap_or(i32::MAX)
+            - i32::try_from(frame_size.h).unwrap_or(i32::MAX)) / 2;
+        let position = Point::new(frame_x + offset.x, frame_y + offset.y);
+        let unchanged = self.clients.get(id).is_some_and(|client| client.geometry.pos == position);
+        if unchanged {
+            return true;
+        }
+        self.release_evacuated_home(id);
+        let Some(client) = self.clients.get_mut(id) else { return false };
+        client.geometry.pos = position;
+        self.bump_protocol_state_revision();
+        self.reflow_frame(id);
+        true
+    }
+
+    /// Raise a client through the same transient-aware path focus uses.
+    pub fn raise_client_to_top(&mut self, id: ClientId) -> bool {
+        if !self.clients.contains_key(id) {
+            return false;
+        }
+        self.raise_client(id);
+        true
+    }
+
+    /// The other half of [`Self::raise_client_to_top`]: give a window
+    /// the keyboard and leave the stack exactly as it is.
+    ///
+    /// What a stacking desktop needs to type into a half-visible window
+    /// without covering the reference material in front of it. Unlike
+    /// the pointer-crossing path this ignores `autoraise` — a caller
+    /// asking for this by name has already decided.
+    pub fn focus_client_without_raising(&mut self, id: ClientId) -> bool {
+        if !self.clients.contains_key(id) {
+            return false;
+        }
+        self.reveal_application(id);
+        self.focus_client_with(id, false);
+        true
+    }
+
+    /// Whether `id` can be given the keyboard right now: a live
+    /// client, on the workspace being looked at (or sticky, so on all
+    /// of them), that no window rule has excused from focus.
+    ///
+    /// One predicate rather than the four hand-copied filters this
+    /// replaced. They had already drifted — the modal switcher's
+    /// omitted `NO_FOCUS`, so Alt-Tab could land on a window a rule
+    /// said must never be focused, and `focus_client` would then
+    /// silently refuse it and leave the switcher pointing at a window
+    /// that never got focus.
+    fn is_focusable(&self, id: ClientId) -> bool {
+        if self.mac_client_hidden(id)
+            || (self.separate_spaces() && self.monitors_ref().is_empty()) { return false; }
+        self.clients.get(id).is_some_and(|client| {
+            self.client_on_screen(client) && !client.flags.contains(ClientFlags::NO_FOCUS)
+        })
+    }
+
+    /// Whether `client` is somewhere the user can see it: mapped
+    /// (neither miniaturized nor withdrawn) and on a visible workspace,
+    /// pinned to all of them, or a member of a special workspace that
+    /// is shown. The one condition keyboard focus is never granted
+    /// without; [`Self::client_visible`] is the by-id form.
+    fn client_on_screen(&self, client: &Client<B>) -> bool {
+        client.lifecycle == Lifecycle::Normal && self.client_placed_on_screen(client)
+    }
+
+    /// Every focusable client, most-recently-focused first, with any
+    /// that has never held focus appended in creation order.
+    ///
+    /// This is the order a user means by "the last window I was in".
+    /// Cycling used to read `self.clients.iter()` directly, so Alt-Tab
+    /// followed storage order rather than focus order. Pressing it
+    /// twice advanced two windows along that arbitrary ring instead of
+    /// returning to where the user started.
+    ///
+    /// Never-focused windows go last rather than being dropped: a
+    /// window that has only just mapped is still somewhere the user can
+    /// mean to go, and leaving it unreachable would be a worse bug than
+    /// the one this fixes.
+    fn focus_order(&self) -> Vec<ClientId> {
+        self.ordered_clients(|id| self.is_focusable(id))
+    }
+
+    /// Minimized windows remain selectable, but cannot gain focus until
+    /// the user commits the switch. Automatic focus succession still skips them.
+    fn is_switchable(&self, id: ClientId) -> bool {
+        if self.mac_client_hidden(id)
+            || (self.separate_spaces() && self.monitors_ref().is_empty()) { return false; }
+        self.clients.get(id).is_some_and(|client| {
+            matches!(client.lifecycle, Lifecycle::Normal | Lifecycle::Miniaturized)
+                && self.client_placed_on_screen(client)
+                && !client.flags.contains(ClientFlags::NO_FOCUS)
+        })
+    }
+
+    fn ordered_clients(&self, eligible: impl Fn(ClientId) -> bool) -> Vec<ClientId> {
+        let mut seen = HashSet::with_capacity(self.focus_history.len());
+        let mut order = Vec::with_capacity(self.clients.len());
+        for &id in self.focus_history.iter().rev() {
+            seen.insert(id);
+            if eligible(id) {
+                order.push(id);
+            }
+        }
+        for id in self.clients.keys() {
+            if seen.insert(id) && eligible(id) {
+                order.push(id);
+            }
+        }
+        order
+    }
+
+    /// The client that should receive focus when the focused one stops
+    /// being able to hold it — most-recently-focused first, skipping
+    /// `excluding` (the window on its way out, which may still be in
+    /// `clients` when this is asked).
+    ///
+    /// Falls through to any other focusable client when the history is
+    /// exhausted, so a desk whose windows have never been focused —
+    /// every one mapped while the user was elsewhere — still hands the
+    /// keyboard to something rather than to nothing.
+    fn focus_successor(&self, excluding: Option<ClientId>) -> Option<ClientId> {
+        // Only one successor is needed. Avoid allocating the full cycle order
+        // and its de-duplication set on every close, hide or workspace switch.
+        // If history has no eligible entry, checking it again in the fallback
+        // cannot change the answer; creation order remains the final tie-break.
+        self.focus_history.iter().rev().copied().chain(self.clients.keys())
+            .find(|&id| Some(id) != excluding && self.is_focusable(id))
+    }
+
+    /// Hands focus to [`Self::focus_successor`], or clears it when the
+    /// desk has nothing eligible left. The shared tail of the three
+    /// gestures that take focus away from a window without another one
+    /// asking for it: closing, miniaturizing, and switching workspace.
+    ///
+    /// `losing` is the client giving focus up. It is excluded from the
+    /// search rather than assumed already gone, because two of the
+    /// three callers still have it in `clients` — miniaturized, or
+    /// parked on another workspace — where [`Self::is_focusable`]
+    /// would reject it anyway; saying so explicitly is what makes that
+    /// a guarantee rather than a coincidence.
+    fn focus_successor_of(&mut self, losing: ClientId) {
+        if self.focused != Some(losing) {
+            return;
+        }
+        match self.focus_successor(Some(losing)) {
+            Some(next) => {
+                // `focus_client` clears the previous client's FOCUSED
+                // flag, publishes the new active window and repaints
+                // both, so nothing else is owed here.
+                self.focus_client(next);
+            }
+            None => self.clear_focus(losing),
+        }
+    }
+
+    /// Every client that has held focus and still exists, oldest
+    /// first. When a client currently holds focus it is the last entry,
+    /// and the one before it is where "the previous window" points.
+    ///
+    /// Exposed for the Hyprland compatibility wire's
+    /// `focus_history_id`, which is documented as "Position in the
+    /// focus history, 0 = focused" and used to be filled in from the
+    /// window manager's iteration order, i.e. creation order: a
+    /// plausible shape carrying a fabricated value, so a consumer
+    /// asking "what was the previously focused window" got an
+    /// arbitrary answer.
+    pub fn focus_history(&self) -> &[ClientId] {
+        &self.focus_history
+    }
+
+    /// Focus the next or previous visible client immediately. IPC has
+    /// no held-modifier lifetime, so it must not enter the modal
+    /// Alt-Tab state machine.
+    pub fn focus_adjacent_client(&mut self, forward: bool) -> bool {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return false;
+        }
+        let current = self.focused.and_then(|id| order.iter().position(|candidate| *candidate == id));
+        let next = match (current, forward) {
+            (Some(index), true) => (index + 1) % order.len(),
+            (Some(index), false) => index.checked_sub(1).unwrap_or(order.len() - 1),
+            (None, _) => 0,
+        };
+        self.focus_client(order[next]);
+        true
+    }
+
+    /// Focuses the nearest visible window in `direction` from the
+    /// focused window, using the windows' actual frame geometry.
+    ///
+    /// A floating desktop has no tiling tree, but it does have a stable
+    /// two-dimensional arrangement. Ranking by the gap between frame
+    /// edges makes neighbouring windows win without their differing
+    /// sizes distorting the result; perpendicular displacement breaks
+    /// ties, and center distance makes overlapping stacks deterministic.
+    /// Miniaturized, hidden-workspace and `NO_FOCUS` clients cannot be
+    /// destinations, exactly as for immediate focus cycling.
+    pub fn focus_direction(&mut self, direction: FocusDirection) -> bool {
+        if let Some(id) = self.focused.filter(|&id| self.is_layout_managed(id)) {
+            let Some(target) = self
+                .layout_neighbor(id, direction)
+                .or_else(|| self.layout_neighbor_across_outputs(id, direction))
+            else {
+                return false;
+            };
+            self.focus_client(target);
+            return true;
+        }
+        let Some(source) = self.focused.and_then(|id| self.clients.get(id)).map(client_frame_rect) else {
+            return false;
+        };
+        let target = self.clients.iter()
+            .filter(|(id, _)| self.is_focusable(*id))
+            .filter_map(|(id, client)| {
+                let candidate = client_frame_rect(client);
+                directional_score(source, candidate, direction).map(|score| (id, score))
+            })
+            .min_by_key(|(_, score)| *score)
+            .map(|(id, _)| id);
+        let Some(target) = target else { return false };
+        self.focus_client(target);
+        true
+    }
+
+    pub fn workspace_count(&self) -> usize {
+        self.workspace_count
+    }
+
+    /// The output monitor-relative verbs count from: the display whose
+    /// Space is active under separate Spaces, else the one under the
+    /// pointer, which is what the Hyprland IPC reports as focused.
+    pub fn focused_output_index(&self) -> usize {
+        if self.separate_spaces() {
+            return self.active_output_index();
+        }
+        self.backend
+            .pointer_position()
+            .or(self.last_pointer)
+            .map(|point| self.monitor_index_at(point))
+            .or_else(|| self.focused.map(|id| self.client_output_index(id)))
+            .unwrap_or_else(|| self.primary_monitor_index())
+    }
+
+    /// The monitor index an [`OutputTarget`] names right now, or `None`
+    /// when nothing does: an unknown name, no output in that direction,
+    /// or no outputs at all. Resolved against the live list on purpose,
+    /// because the target was read from a config file or a socket some
+    /// time ago and an output can have gone since.
+    pub fn resolve_output_target(&self, target: &OutputTarget) -> Option<usize> {
+        let monitors = self.monitors_ref();
+        if monitors.is_empty() {
+            return None;
+        }
+        match target {
+            OutputTarget::Name(name) => monitors.iter().position(|monitor| monitor.name == *name),
+            OutputTarget::Relative(step) => {
+                let count = monitors.len() as i64;
+                let from = self.focused_output_index().min(monitors.len() - 1) as i64;
+                Some((from + i64::from(*step)).rem_euclid(count) as usize)
+            }
+            OutputTarget::Direction(direction) => {
+                self.output_in_direction(self.focused_output_index(), *direction)
+            }
+        }
+    }
+
+    /// The nearest other output in `direction` from output `from`, by
+    /// the same ranking directional window focus uses over frames.
+    fn output_in_direction(&self, from: usize, direction: FocusDirection) -> Option<usize> {
+        let monitors = self.monitors_ref();
+        let source = monitors.get(from)?.geometry;
+        monitors
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != from)
+            .filter_map(|(index, monitor)| {
+                directional_score(source, monitor.geometry, direction).map(|score| (index, score))
+            })
+            .min_by_key(|(_, score)| *score)
+            .map(|(index, _)| index)
+    }
+
+    /// Focuses the output at `index`: Hyprland's `focusmonitor`.
+    ///
+    /// The pointer is warped to the centre of that output's workarea, so
+    /// everything the desktop derives from the pointer follows — on the
+    /// shared desktop that includes where the next window is placed,
+    /// which is how Omarchy's screensaver puts one fullscreen terminal
+    /// on every display. Under separate Spaces the display is selected
+    /// as well, which moves placement there in that mode. Keyboard focus
+    /// goes to the most recently focused window on that output; when it
+    /// has none, focus stays where it was rather than going nowhere.
+    ///
+    /// `false` when no such output exists, which a hotplug between the
+    /// verb being read and applied can arrange.
+    pub fn focus_output(&mut self, index: usize) -> bool {
+        let Some(monitor) = self.monitors_ref().get(index).map(|monitor| monitor.geometry) else {
+            return false;
+        };
+        let area = self.workareas.get(index).copied().unwrap_or(monitor);
+        let center = Point::new(
+            area.pos.x.saturating_add((area.size.w / 2) as i32),
+            area.pos.y.saturating_add((area.size.h / 2) as i32),
+        );
+        self.backend.warp_pointer(center);
+        // The backend's motion event arrives later, if at all; placement
+        // must follow the verb now, not the next hardware motion.
+        self.last_pointer = Some(center);
+        self.select_output(index);
+        let next = self
+            .focus_history
+            .iter()
+            .rev()
+            .copied()
+            .find(|&id| self.is_focusable(id) && self.client_output_index(id) == index);
+        if let Some(next) = next {
+            self.focus_client(next);
+        }
+        true
+    }
+
+    /// Includes minimized windows, but not withdrawn clients awaiting remap.
+    pub fn workspace_has_windows(&self, workspace: usize) -> bool {
+        self.clients.values().any(|client| {
+            client.workspace == workspace
+                && client.special.is_none()
+                && matches!(client.lifecycle, Lifecycle::Normal | Lifecycle::Miniaturized)
+        })
+    }
+
+    /// Removes a desktop without closing applications. Its windows join the
+    /// preceding desktop (the next one when removing the first); later desktop
+    /// indices compact. The active desktop and focused window survive this
+    /// renumbering, and the last remaining desktop cannot be removed.
+    pub fn remove_workspace(&mut self, workspace: usize) -> bool {
+        if self.separate_spaces() { return self.remove_display_workspace(workspace); }
+        if self.workspace_count <= 1 || workspace >= self.workspace_count {
+            return false;
+        }
+        if self.mac_fullscreen.values().any(|(_, space)| *space == workspace) { return false; }
+        self.end_active_drag();
+        let removed = self.layouts.remove(workspace);
+        let target = workspace.saturating_sub(1).min(self.layouts.len() - 1);
+        self.layouts[target]
+            .order
+            .extend(removed.order.iter().copied());
+        let remap = |index: usize| {
+            if index == workspace {
+                workspace.saturating_sub(1)
+            } else {
+                index - usize::from(index > workspace)
+            }
+        };
+        for (origin, space) in self.mac_fullscreen.values_mut() {
+            *origin = remap(*origin);
+            *space = remap(*space);
+        }
+        let previous = self.current_workspace;
+        self.current_workspace = remap(previous);
+        self.previous_workspace = self.previous_workspace.filter(|&p| p != workspace).map(remap);
+        self.workspace_count -= 1;
+        let mut revealed = Vec::new();
+        for (id, client) in &mut self.clients {
+            let old = client.workspace;
+            client.workspace = remap(old);
+            if client.workspace != old {
+                self.backend.publish_window_desktop(client.window, client.workspace);
+            }
+            // Visible windows stay visible under this merge. Only the newly
+            // joined windows need mapping; minimized/withdrawn clients retain
+            // their lifecycle, and sticky windows were already on screen.
+            if client.lifecycle == Lifecycle::Normal
+                && !client.flags.contains(ClientFlags::STICKY)
+                && client.special.is_none()
+                && old != previous
+                && client.workspace == self.current_workspace
+            {
+                revealed.push(id);
+            }
+        }
+        if self.workspace_layout(target) == crate::LayoutMode::Freeform {
+            for id in removed.order {
+                self.restore_freeform_view(id);
+            }
+        }
+        self.reflow_layouts();
+        self.bump_protocol_state_revision();
+        self.backend.publish_workspaces(self.workspace_count, self.current_workspace);
+        self.publish_workarea_union();
+        for id in revealed {
+            self.show_client_surface(id);
+            self.repaint_decoration(id);
+        }
+        if self.focused.is_none() {
+            if let Some(next) = self.focus_successor(None) {
+                self.focus_client(next);
+            }
+        }
+        tracing::info!(workspace, count = self.workspace_count, "removed workspace");
+        true
+    }
+
+    /// Switches to `workspace`, growing the workspace row on demand up
+    /// to [`MAX_WORKSPACES`]. Every *mapped* client not on
+    /// the target workspace gets its frame unmapped; every mapped
+    /// client that IS on it gets remapped. Miniaturized/withdrawn
+    /// clients remain unmapped. A no-op if already on `workspace` or if
+    /// the index is out of range.
+    pub fn switch_workspace(&mut self, workspace: usize) {
+        self.switch_workspace_to_focus(workspace, None);
+    }
+
+    /// The workspace the desktop was on before the last switch, if any:
+    /// what Hyprland's `workspace previous` names.
+    pub fn previous_workspace(&self) -> Option<usize> {
+        self.previous_workspace.filter(|&index| index < self.workspace_count && index != self.current_workspace)
+    }
+
+    /// Switches back to [`Self::previous_workspace`]. Two presses flip
+    /// between the same two workspaces, because the switch records the
+    /// one being left. `false`, and nothing changes, when there is no
+    /// workspace to go back to yet.
+    pub fn switch_to_previous_workspace(&mut self) -> bool {
+        let Some(target) = self.previous_workspace() else { return false };
+        self.switch_workspace(target);
+        self.current_workspace == target
+    }
+
+    /// The workspace `delta` steps away along the row, counting only
+    /// workspaces that have windows plus the current one, and wrapping
+    /// at either end: Hyprland's `e+1` / `e-1`, "the next workspace that
+    /// exists". Unlike stepping by index this never lands on an empty
+    /// workspace and never grows the row. `None` when nothing else on
+    /// the row is occupied, so the caller stays put.
+    pub fn occupied_workspace_step(&self, delta: i32) -> Option<usize> {
+        let current = self.current_workspace;
+        let row: Vec<usize> = self
+            .workspace_row()
+            .into_iter()
+            .filter(|&space| space == current || self.workspace_has_windows(space))
+            .collect();
+        let at = row.iter().position(|&space| space == current)?;
+        if row.len() < 2 {
+            return None;
+        }
+        let count = row.len() as i64;
+        row.get((at as i64 + i64::from(delta)).rem_euclid(count) as usize).copied()
+    }
+
+    /// [`Self::switch_workspace`], for a caller about to focus
+    /// `arriving` on the destination.
+    ///
+    /// A plain switch hands the keyboard to the destination's most
+    /// recent window, and an activation then took it straight back for
+    /// its own target. The seat and the Hyprland event stream only ever
+    /// saw the final answer, but `focus_history` kept the detour: an
+    /// unrelated window pushed in just before the activated one, so
+    /// Alt-Tab's "previous window" pointed at somewhere the user never
+    /// went. Focusing `arriving` directly leaves the history reading
+    /// the way the user moved. When it cannot take focus the ordinary
+    /// successor still does, so no hidden window keeps the keyboard.
+    fn switch_workspace_to_focus(&mut self, workspace: usize, arriving: Option<ClientId>) {
+        if workspace >= MAX_WORKSPACES {
+            return;
+        }
+        if self.separate_spaces() { self.switch_display_workspace(workspace); return; }
+        if workspace == self.current_workspace {
+            return;
+        }
+        // Before the switch, so the special's focused member hands the
+        // keyboard to something still on screen and the switch below
+        // then moves it on exactly as it would have.
+        self.hide_special_for_workspace_switch(workspace);
+        self.workspace_count = self.workspace_count.max(workspace + 1);
+        self.grow_layouts();
+        self.previous_workspace = Some(self.current_workspace);
+        self.current_workspace = workspace;
+        self.bump_protocol_state_revision();
+        self.backend.publish_workspaces(self.workspace_count, self.current_workspace);
+
+        let ids: Vec<ClientId> = self.clients.keys().collect();
+        for id in ids {
+            let Some(client) = self.clients.get(id) else {
+                continue;
+            };
+            if client.lifecycle != Lifecycle::Normal {
+                continue;
+            }
+            // No `frame` guard: a client that draws its own chrome has
+            // none and must still follow its workspace on and off the
+            // screen. A special member follows its overlay instead.
+            if self.client_placed_on_screen(client) {
+                self.show_client_surface(id);
+                // Same reasoning as `deminiaturize`: a remapped frame
+                // isn't guaranteed to still hold its old pixel content
+                // (no backing-store requested), so repaint explicitly
+                // rather than hope an `Expose` arrives and gets replayed.
+                // A no-op for a frameless window, which has no
+                // decoration of ours to repaint.
+                self.repaint_decoration(id);
+            } else {
+                self.hide_client_surface(id);
+            }
+        }
+
+        // Whatever the switch just remapped went on top of a special
+        // still shown; the overlay is reasserted before focus lands.
+        self.raise_shown_specials();
+        let still_visible = self
+            .focused
+            .and_then(|id| self.clients.get(id))
+            .is_some_and(|c| self.client_placed_on_screen(c));
+        if !still_visible {
+            if let Some(next) = arriving.filter(|&id| self.is_focusable(id)) {
+                self.focus_client(next);
+            } else if let Some(prev) = self.focused {
+                // `current_workspace` is already the new one, so
+                // `is_focusable` sees the left-behind window as
+                // ineligible and the successor comes from the
+                // workspace being entered — which is what makes a
+                // workspace come back the way it was left, rather than
+                // with three windows on screen and none of them
+                // holding the keyboard.
+                self.focus_successor_of(prev);
+            } else if let Some(next) = self.focus_successor(None) {
+                // Leaving an empty workspace has no previous focused client.
+                // The destination still needs its own most recent eligible
+                // window to regain the keyboard without an extra click.
+                self.focus_client(next);
+            }
+        }
+        tracing::info!(workspace, "switched workspace");
+    }
+
+    /// Moves `id` onto `workspace` (growing the row up to
+    /// [`MAX_WORKSPACES`] if needed) and hides its frame immediately if
+    /// that isn't the active workspace — the classic "move to
+    /// next/previous workspace" window actions. A no-op if `id` is
+    /// already on `workspace` or if the index is out of range.
+    pub fn move_client_to_workspace(&mut self, id: ClientId, workspace: usize) {
+        if self.mac_fullscreen.get(&id).is_some_and(|(_, space)| *space != workspace) {
+            self.unfullscreen(id);
+        }
+        self.cancel_client_layout_interaction(id);
+        for member in self.transient_family(id) {
+            self.move_one_client_to_workspace(member, workspace);
+        }
+    }
+
+    fn move_one_client_to_workspace(&mut self, id: ClientId, workspace: usize) {
+        if workspace >= MAX_WORKSPACES { return; }
+        if !self.ensure_display_space_slots(workspace + 1) { return; }
+        if workspace + 1 > self.workspace_count {
+            self.workspace_count = workspace + 1;
+            self.bump_protocol_state_revision();
+            // Growth is a count change even though `current` stayed put
+            // — a pager showing the workspace row needs to hear it.
+            self.backend.publish_workspaces(self.workspace_count, self.current_workspace);
+        }
+        // A numbered destination ends any special membership; a member
+        // going back to its own home still has to rejoin that
+        // workspace's layout and come on or off screen with it.
+        let special_output = self.clients.get(id).filter(|client| client.special.is_some()).map(|_| self.client_output_index(id));
+        let left_special = self.leave_special(id);
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        if client.workspace == workspace && !left_special {
+            return;
+        }
+        // Sending the active window away should expose a usable
+        // desktop, not strand keyboard focus on `None`. Select the next
+        // visible client while the departing one is still in the
+        // cycle, so the ordinary focus path handles decorations,
+        // passive grabs, raising and active-window publication. With no
+        // alternative the cycle lands back on `id` and the hide path
+        // below clears it exactly as before. A pinned client remains
+        // visible on every workspace, so moving its membership must not
+        // move focus away from it.
+        if self.focused == Some(id)
+            && !self.workspace_visible(workspace)
+            && !client.flags.contains(ClientFlags::STICKY)
+        {
+            self.focus_adjacent_client(true);
+        }
+        let target_visible = self.workspace_visible(workspace);
+        self.translate_space_move_from_output(id, workspace, special_output);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        let old_workspace = client.workspace;
+        client.workspace = workspace;
+        let window = client.window;
+        let should_hide = !target_visible && !client.flags.contains(ClientFlags::STICKY);
+        self.bump_protocol_state_revision();
+        // A move is precisely when a window's `_NET_WM_DESKTOP`
+        // changes — pagers track membership from this property, not by
+        // guessing from map/unmap traffic.
+        self.backend.publish_window_desktop(window, workspace);
+        self.publish_space_output(id);
+        self.layouts[old_workspace]
+            .order
+            .retain(|&other| other != id);
+        self.register_layout_client(id);
+        if self.workspace_layout(workspace) == crate::LayoutMode::Freeform {
+            self.restore_freeform_view(id);
+        }
+        self.reflow_workspace(old_workspace);
+        self.reflow_workspace(workspace);
+        if self.separate_spaces() { self.reflow_frame(id); }
+        if should_hide {
+            self.hide_client_surface(id);
+            if self.focused == Some(id) {
+                self.clear_focus(id);
+            }
+        } else if (left_special || self.separate_spaces())
+            && !self.mac_client_hidden(id)
+            && self.clients[id].lifecycle == Lifecycle::Normal
+        {
+            self.show_client_surface(id);
+            if left_special {
+                self.repaint_decoration(id);
+                self.raise_client(id);
+            }
+        }
+    }
+
+    /// Carries the focused window to `workspace` and follows it there:
+    /// move, switch, activate, in that order. The "take this window
+    /// with me" gesture, as one verb — the sequence the keyboard's
+    /// carry bindings and any external controller both need, kept here
+    /// so there is exactly one of it.
+    ///
+    /// The order is not incidental. `move_client_to_workspace`
+    /// deliberately drops focus when the client leaves the active
+    /// workspace, so the activate at the end is what makes a *repeated*
+    /// carry keep carrying the same window instead of stranding it one
+    /// workspace along. Routed through the same activate path a pager's
+    /// `_NET_ACTIVE_WINDOW` message takes, so a carried window that was
+    /// shaded or miniaturized arrives usable rather than arriving as a
+    /// title bar.
+    ///
+    /// Growth is inherited, not decided here: both steps grow the
+    /// workspace row on demand, so carrying to workspace 7 from a desk
+    /// with three creates the four that were missing exactly as
+    /// `switch_workspace` alone would. A no-op if nothing is focused,
+    /// and harmless if `workspace` is the one the window is already on
+    /// — the move and the switch both no-op, and the window is simply
+    /// re-activated.
+    pub fn carry_focused_to_workspace(&mut self, workspace: usize) {
+        let Some(id) = self.focused else {
+            return;
+        };
+        let Some(window) = self.clients.get(id).map(|client| client.window) else {
+            return;
+        };
+        self.move_client_to_workspace(id, workspace);
+        self.switch_workspace(workspace);
+        self.handle_activate_request(window);
+    }
+
+    /// Drains one pending desktop-shell notification (icon-tile
+    /// lifecycle for miniaturized windows) — call this in a loop each
+    /// time around the event loop, same as `Backend::poll_event`.
+    pub fn take_notification(&mut self) -> Option<Notification> {
+        self.notifications.pop_front()
+    }
+
+    /// The client whose window menu is about to be asked for (a queued
+    /// `Notification::WindowMenuRequested`), so a host can prepare its own rows first.
+    pub fn pending_window_menu(&self) -> Option<ClientId> {
+        self.notifications.iter().rev().find_map(|n| match n {
+            Notification::WindowMenuRequested { id, .. } => Some(*id),
+            _ => None,
+        })
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
+    pub fn client(&self, id: ClientId) -> Option<&Client<B>> {
+        self.clients.get(id)
+    }
+
+    pub fn client_for_window(&self, window: B::WindowId) -> Option<ClientId> {
+        self.window_index.get(&window).copied()
+    }
+
+    pub fn client_for_frame(&self, frame: B::FrameId) -> Option<ClientId> {
+        self.frame_index.get(&frame).copied()
+    }
+
+    pub fn clients(&self) -> impl Iterator<Item = (ClientId, &Client<B>)> {
+        self.clients.iter()
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    pub fn focused_client(&self) -> Option<ClientId> {
+        self.focused
+    }
+
+    /// Whether a pointer-driven window move or resize is in progress.
+    ///
+    /// Backends use this narrow signal to invalidate geometry-derived
+    /// protocols while coalescing pointer motion. Keeping the detail in
+    /// `wm-core` avoids making every idle pointer event look like a
+    /// desktop mutation merely because an interactive drag *could*
+    /// have used it.
+    pub fn interactive_drag_active(&self) -> bool {
+        self.active_move.is_some() || self.active_resize.is_some()
+    }
+
+    /// Client whose geometry is currently following pointer motion.
+    /// Protocol adapters use this narrow identity to update only that
+    /// window's output membership during a drag.
+    pub fn interactive_drag_client(&self) -> Option<ClientId> {
+        self.active_move
+            .as_ref()
+            .map(|drag| drag.client)
+            .or_else(|| self.active_resize.as_ref().map(|drag| drag.client))
+    }
+
+    /// The event loop's sole entry point: drain `Backend::poll_event`
+    /// into this on every wakeup.
+    pub fn dispatch(&mut self, event: BackendEvent<B::WindowId, B::FrameId>) {
+        match event {
+            BackendEvent::MapRequest(window) => self.handle_map_request(window),
+            BackendEvent::Unmapped(window) => self.handle_unmap(window),
+            BackendEvent::Destroyed(window) => self.handle_destroy(window),
+            BackendEvent::ConfigureRequest { window, requested } => self.handle_configure_request(window, requested, false),
+            BackendEvent::ClientSizeCommitted { window, size } => {
+                self.handle_configure_request(window, Rect::new(Point::new(0, 0), size), true);
+            }
+            BackendEvent::PointerButton { surface, local, button, pressed, time_ms, mods } => {
+                self.handle_pointer_button(surface, local, button, pressed, time_ms, mods)
+            }
+            BackendEvent::PointerMotion { root, surface_local } => {
+                self.handle_pointer_motion(root);
+                // Only while idle — during an active move/resize drag,
+                // the cursor should stay whatever it was when the drag
+                // started (typically already the right resize shape),
+                // not flicker based on hovering in/out of the original
+                // hitbox as the drag moves the pointer around.
+                if self.active_move.is_none() && self.active_resize.is_none() {
+                    if let Some((surface, local)) = surface_local {
+                        self.handle_frame_hover(surface, local);
+                    }
+                }
+            }
+            BackendEvent::TitleChanged(window) => self.handle_title_changed(window),
+            BackendEvent::ChromeChanged(window) => self.handle_chrome_changed(window),
+            BackendEvent::MetadataChanged(window) => self.handle_metadata_changed(window),
+            BackendEvent::SizeHintsChanged(window) => {
+                if let Some(id) = self.client_for_window(window) {
+                    // Terminals update WM_NORMAL_HINTS while answering each
+                    // resize configure. A freeform drag reads fresh hints on
+                    // its next motion; cancelling it here stops after one cell.
+                    // Spatial layouts must still invalidate their constraint
+                    // snapshot and recompute the affected workspace.
+                    if self.is_layout_managed(id) { self.cancel_client_layout_interaction(id); }
+                    self.reflow_client_workspace(id);
+                }
+            }
+            BackendEvent::ParentChanged(window) => self.handle_parent_changed(window),
+            BackendEvent::ModalChanged { window, modal } => {
+                self.handle_modal_changed(window, modal)
+            }
+            BackendEvent::MoveRequest(window) => self.handle_move_request(window),
+            BackendEvent::WindowMenuRequested { window, at } => {
+                // The same menu a right-click on our own titlebar opens, for a
+                // window whose client draws its titlebar itself.
+                if let Some(&id) = self.window_index.get(&window) {
+                    if self.clients.get(id).is_some_and(|client| client.lifecycle == Lifecycle::Normal) {
+                        self.notifications.push_back(Notification::WindowMenuRequested { id, at });
+                    }
+                }
+            }
+            BackendEvent::DragEnded => self.commit_active_drag(),
+            BackendEvent::DragCancelled => self.end_active_drag(),
+            BackendEvent::ResizeRequest { window, edge } => self.handle_resize_request(window, edge),
+            // Routed through the very same miniaturize the titlebar
+            // button runs, so the client's own button and ours are one
+            // behavior: frame unmapped, minimized state published, the whole
+            // NeXTSTEP gesture rather than a taskbar-shaped hiding.
+            BackendEvent::MinimizeRequest(window) => {
+                if let Some(&id) = self.window_index.get(&window) {
+                    self.miniaturize(id);
+                }
+            }
+            // `XRaiseWindow`. The same raise a click performs, and
+            // nothing more: the client asked for the front, not for the
+            // keyboard, and `raise_client_to_top` is exactly that verb.
+            BackendEvent::RaiseRequest(window) => {
+                if let Some(&id) = self.window_index.get(&window) {
+                    self.raise_client_to_top(id);
+                }
+            }
+            BackendEvent::KeyPress(combo) => self.handle_key_press(combo),
+            BackendEvent::KeyRelease(combo) => self.handle_key_release(combo),
+            BackendEvent::PointerEnter { surface } => self.handle_pointer_enter(surface),
+            BackendEvent::ActivateRequested(window) => self.handle_activate_request(window),
+            BackendEvent::CloseRequested(window) => self.handle_close_request(window),
+            BackendEvent::NetStateRequested { window, action, first, second } => {
+                self.handle_net_state_request(window, action, first, second)
+            }
+            // `_NET_CURRENT_DESKTOP` rides the exact same path as the
+            // keyboard switch — a pager and Alt+Right can never disagree
+            // about what switching means (growth on demand included).
+            BackendEvent::DesktopSwitchRequested(workspace) => self.switch_workspace(workspace),
+            // `_NET_WM_DESKTOP`: a pager dragging a window onto another
+            // desktop. Only the window's own workspace changes — the
+            // active workspace stays put, unlike the follow-the-window
+            // keyboard combos.
+            BackendEvent::WindowDesktopRequested { window, desktop } => {
+                if let Some(&id) = self.window_index.get(&window) {
+                    self.move_client_to_workspace(id, desktop);
+                }
+            }
+            // The event-loop driver (the binary) watches for this itself
+            // and exits — there's no per-client state worth unwinding
+            // when the display connection is already gone.
+            BackendEvent::ShutdownRequested => {}
+            other => {
+                tracing::debug!(?other, "backend event not yet handled");
+            }
+        }
+    }
+
+    /// Starts tracking a newly mapped window and immediately realizes
+    /// its decoration: asks the theme for a layout, creates the frame,
+    /// renders and paints it, and maps it.
+    fn handle_map_request(&mut self, window: B::WindowId) {
+        if self.window_index.contains_key(&window) {
+            return;
+        }
+
+        // Decoration policy from `_NET_WM_WINDOW_TYPE`, decided before
+        // any frame or tracking state exists. Kept as an explicit
+        // three-arm match (not `Unmanaged` vs. catch-all) so the
+        // Dialog/Normal distinction stays visible for the future
+        // transient-for/placement policy `WindowType::Dialog`'s doc
+        // comment anticipates.
+        let window_type = self.backend.window_type(window);
+        match window_type {
+            WindowType::Unmanaged => {
+                // Docks/menus/tooltips draw their own chrome and place
+                // themselves — map as the client created it, track
+                // nothing.
+                tracing::info!(?window, "unmanaged window type — mapping without decoration");
+                self.backend.map_unmanaged(window);
+                return;
+            }
+            // Both decorated and managed normally today.
+            WindowType::Dialog => {}
+            WindowType::Normal => {}
+        }
+
+        // The second half of the decoration question, and the one this
+        // window manager never used to ask: `WindowType` said what kind
+        // of window this is, but not whether its client has already
+        // drawn a titlebar. Asking both is what stops Edge, LibreOffice
+        // and every other client-decorated application from wearing two.
+        let chrome = self.backend.client_chrome(window);
+
+        let title = self.backend.window_title(window).unwrap_or_default();
+        let content = self.backend.window_geometry(window);
+        tracing::debug!(?window, ?content, "map request — client's own geometry at map time");
+        let mut client = Client::new(window, title);
+        client.chrome = chrome;
+        client.class = self.backend.window_class(window).map(|c| c.class).unwrap_or_default();
+        // The third leg of the identity a window rule matches on. Read
+        // once here, like the title: a client normally tags a window
+        // before its first commit, and a tag set later reaches the IPC
+        // but not the rules, exactly as a later title does not.
+        let xdg_tag = self.backend.window_xdg_tag(window).unwrap_or_default();
+        client.geometry = content;
+        Self::clamp_geometry(&mut client, self.backend.screen_size());
+        client.parent = self
+            .backend
+            .window_parent(window)
+            .and_then(|parent| self.window_index.get(&parent).copied());
+        client.workspace = client
+            .parent
+            .and_then(|parent| self.clients.get(parent).map(|parent| parent.workspace))
+            .unwrap_or(self.current_workspace);
+        client
+            .flags
+            .set(ClientFlags::MODAL, self.backend.window_is_modal(window));
+
+        let window_rule = self
+            .float_policy
+            .as_deref()
+            .map(|policy| policy.window_decision_for(&client.class, &client.title, &xdg_tag))
+            .unwrap_or_else(|| placement::WindowRuleDecision::for_identity(&client.class));
+        if window_rule.pin {
+            client.flags.insert(ClientFlags::STICKY);
+        }
+        if window_rule.idle_inhibit != IdleInhibitRule::None {
+            client.flags.insert(ClientFlags::IDLE_INHIBIT);
+        }
+        if window_rule.no_focus {
+            client.flags.insert(ClientFlags::NO_FOCUS);
+        }
+        if window_rule.focus_on_activate == Some(false) {
+            client.flags.insert(ClientFlags::NO_ACTIVATE);
+        }
+        if window_rule.suppress_maximize {
+            client.flags.insert(ClientFlags::SUPPRESS_MAXIMIZE);
+        }
+        if window_rule.suppress_fullscreen {
+            client.flags.insert(ClientFlags::SUPPRESS_FULLSCREEN);
+        }
+
+        let mut request = Self::decoration_request(&client, None);
+        // A bare window is laid out as though the frame were exactly its
+        // content, so every placement and geometry calculation below
+        // reads the same for all three kinds.
+        let mut decoration_scale = self.backend.decoration_scale(content);
+        let mut layout = match chrome {
+            ClientChrome::Bare => frameless_layout(content.size),
+            ClientChrome::Full | ClientChrome::Edges => self.chrome_layout(chrome, &request, decoration_scale),
+        };
+        // The one rule that keys on *who* the window is: Omarchy's own
+        // windows (`org.omarchy.*`) map at one fixed size, centered,
+        // the way Omarchy's own Hyprland rules float them — see
+        // `placement::float_override`. The size is settled before the
+        // layout that everything below is computed from, so the window
+        // never flashes at the size its terminal emulator would
+        // otherwise have picked. The chrome the clamp needs is what
+        // this first layout already added around the client's own
+        // content; a titlebar's height does not depend on how wide the
+        // window under it is.
+        //
+        // A rule can also be arithmetic on the monitor — Omarchy's
+        // picture-in-picture sits at `(monitor_w-window_w-40)`, its
+        // webcam overlay is `(monitor_h*4/25)` wide — which only makes
+        // sense against the output the window is mapping onto, in that
+        // output's own logical pixels. The core measures monitor,
+        // client and chrome in those pixels and lets the policy do the
+        // arithmetic; whatever it answers is scaled back by the same
+        // output's scale, so a mixed-DPI desk places the window where
+        // the rule says on the head it opens on.
+        let (output, workarea) = self.placement_output();
+        let monitor = self.backend.monitors_ref().get(output).map(|m| m.geometry).unwrap_or(workarea);
+        // On a backend that fits new windows to the work area, the frame's invisible grab
+        // margin at the right and bottom (its resize band and corner) is kept on the screen too: placed by its
+        // visible bounds alone, a window as tall as the work area had its bottom resize band below the panel.
+        let workarea = if self.backend.fits_new_windows_to_workarea() && chrome.is_framed() {
+            let grab = layout.input_margin;
+            Rect::new(workarea.pos, Size::new(workarea.size.w.saturating_sub(grab).max(1), workarea.size.h.saturating_sub(grab).max(1)))
+        } else {
+            workarea
+        };
+        let output_scale = self.backend.decoration_scale(monitor);
+        let chrome_size = Size::new(
+            layout.visual_bounds().size.w.saturating_sub(content.size.w),
+            layout.visual_bounds().size.h.saturating_sub(content.size.h),
+        );
+        let metrics = placement::RuleMetrics {
+            monitor: placement::logical_size(monitor.size, output_scale),
+            window: placement::logical_size(content.size, output_scale),
+            chrome: placement::logical_size(chrome_size, output_scale),
+        };
+        let rule_placement = self
+            .float_policy
+            .as_deref()
+            .and_then(|policy| policy.placement_for(&client.class, &client.title, &xdg_tag, &metrics));
+        let floated = match rule_placement.and_then(|rule| rule.size) {
+            Some(size) => Some(placement::fit_in(size, workarea, chrome_size, output_scale)),
+            None => placement::float_override_for(
+                self.float_policy.as_deref(),
+                &client.class,
+                &client.title,
+                &xdg_tag,
+                workarea,
+                chrome_size,
+                content.size,
+                self.ui_scale,
+            ),
+        };
+        let mut fitted_to_workarea = false;
+        if let Some(size) = floated {
+            tracing::info!(?window, app = %client.class, title = %client.title, ?size, "a window rule places this window at a fixed size");
+            client.geometry.size = size;
+            // The request goes with it: it is what the titlebar is
+            // painted from a few lines down, and a frame drawn from the
+            // size the client asked for inside a layout sized to the
+            // one it got is a frame with a seam in it.
+            request = Self::decoration_request(&client, None);
+            layout = self.chrome_layout(chrome, &request, decoration_scale);
+        } else if self.backend.fits_new_windows_to_workarea() {
+            // A window that opens larger than the work area holds would
+            // have its frame's far edges, resize grips included, off the
+            // screen. A backend whose clients size themselves from the
+            // whole screen (a Mac application opening "as large as the
+            // display") asks for the frame to be made to fit instead.
+            let fitted = placement::fit_in(content.size, workarea, chrome_size, 1.0);
+            if fitted != content.size {
+                tracing::info!(?window, app = %client.class, asked = ?content.size, ?fitted, "a new window is made to fit the work area");
+                client.geometry.size = fitted;
+                fitted_to_workarea = true;
+                request = Self::decoration_request(&client, None);
+                layout = self.chrome_layout(chrome, &request, decoration_scale);
+            }
+        }
+        // Place the FRAME at the client's own requested position rather
+        // than deriving it by subtracting the chrome offset from it.
+        // Most apps request (0, 0) as a "don't care, WM decides"
+        // placeholder rather than a real intent to sit flush with the
+        // screen's corner; treating that as the *content* position and
+        // subtracting the titlebar/border offset would push the frame
+        // (and its titlebar) to negative coordinates, off-screen.
+        // Initial placement: a client that asked for a real position (a
+        // terminal launched with `-geometry +x+y`) is honored verbatim,
+        // but the overwhelmingly common (0, 0) means "don't care, WM
+        // decides" (see the comment below), and that is exactly what
+        // the placement policy exists for. Dialogs center regardless of
+        // policy — they are conversations, not workspace furniture, and
+        // so is an Omarchy window, which additionally ignores a
+        // position the client asked for: the whole rule is "this window
+        // appears in the middle at this size", and honoring a
+        // placeholder origin would put half of it under the dock.
+        let transient_pos = client.parent.and_then(|parent| {
+            let parent = self.clients.get(parent)?;
+            (parent.lifecycle == Lifecycle::Normal).then(|| {
+                let parent_frame = client_frame_rect(parent);
+                let center = Point::new(
+                    parent_frame.pos.x + parent_frame.size.w as i32 / 2,
+                    parent_frame.pos.y + parent_frame.size.h as i32 / 2,
+                );
+                let desired = Point::new(
+                    center.x - layout.visual_bounds().size.w as i32 / 2,
+                    center.y - layout.visual_bounds().size.h as i32 / 2,
+                );
+                placement::clamp_to(self.usable_area_at(center), layout.visual_bounds().size, desired)
+            })
+        });
+        let rule_pos = rule_placement.and_then(|rule| rule.position).map(|logical| {
+            // Monitor-relative, in the output's logical pixels, and
+            // pulled inside the workarea: a rule can never put a frame
+            // where it cannot be reached, so a reserved bar or dock is
+            // never covered whatever the expression says.
+            let device = placement::device_position(monitor.pos, logical, output_scale);
+            let pos = placement::clamp_to(workarea, layout.visual_bounds().size, device);
+            tracing::info!(?window, app = %client.class, title = %client.title, ?logical, ?pos, "a window rule places this window at a position");
+            pos
+        });
+        let frame_pos = if let Some(pos) = transient_pos {
+            pos
+        } else if let Some(pos) = rule_pos {
+            pos
+        } else if floated.is_none() && content.pos != Point::new(0, 0) {
+            content.pos
+        } else {
+            let existing: Vec<Rect> = self
+                .clients
+                .iter()
+                .filter(|(_, c)| self.client_on_screen(c))
+                .map(|(_, c)| client_frame_rect(c))
+                .collect();
+            let policy = if window_type == WindowType::Dialog || floated.is_some() {
+                PlacementPolicy::Center
+            } else {
+                self.placement_policy
+            };
+            let cascade_step = layout.titlebar_height.max(16);
+            let pos =
+                placement::place_frame(policy, workarea, layout.visual_bounds().size, &existing, self.placements, cascade_step);
+            self.placements += 1;
+            pos
+        };
+        let anchor = Point::new(
+            frame_pos.x + layout.visual_bounds().size.w as i32 / 2,
+            frame_pos.y + layout.visual_bounds().size.h as i32 / 2,
+        );
+        let frame_pos = self.below_top_reservation(frame_pos, anchor);
+        let provisional_frame = Rect {
+            pos: frame_pos,
+            size: layout.frame_size,
+        };
+        let target_scale = self.backend.decoration_scale(provisional_frame);
+        if chrome.is_framed() && target_scale.to_bits() != decoration_scale.to_bits() {
+            decoration_scale = target_scale;
+            layout = self.chrome_layout(chrome, &request, decoration_scale);
+        }
+        let frame_pos = Point::new(frame_pos.x - layout.input_margin as i32, frame_pos.y - layout.input_margin as i32);
+        let frame_geom = Rect { pos: frame_pos, size: layout.frame_size };
+        client.geometry.pos =
+            Point::new(frame_geom.pos.x + layout.client_offset.x, frame_geom.pos.y + layout.client_offset.y);
+
+        // Before the frame exists or the window is shown, so whatever the
+        // backend tells the client about its framing rides on the same
+        // configure as the rest of the map.
+        self.backend.set_window_chrome(window, chrome);
+        let frame = match chrome {
+            ClientChrome::Full | ClientChrome::Edges => {
+                let frame = self.backend.create_decoration(window, &layout);
+                self.backend.set_frame_geometry(frame, frame_geom);
+                if floated.is_some() || fitted_to_workarea {
+                    // The map paths that override the client's own
+                    // size, and so the ones that have to tell it:
+                    // framing a window neither resizes it nor implies a
+                    // configure (`set_frame_geometry` moves the content
+                    // rect and deliberately leaves its size alone —
+                    // "resizes leave the content alone until the
+                    // separate `resize_client` call that always
+                    // accompanies them").
+                    self.backend.resize_client(window, client.geometry.size);
+                }
+                let surface = self.chrome_surface(chrome, &request, &layout, decoration_scale);
+                self.backend.paint_decoration(frame, &surface);
+                client.last_decoration_request = Some(request.clone());
+                client.last_decoration_frame_size = layout.frame_size;
+                client.last_decoration_scale_bits = decoration_scale.to_bits();
+                self.backend.map_frame(frame);
+                Some(frame)
+            }
+            ClientChrome::Bare => {
+                // No frame is created, so nothing reparents the client
+                // or maps it as a side effect the way `create_decoration`
+                // does: it has to be placed and shown directly. The
+                // position is the frame position, which for this layout
+                // is the content position.
+                self.backend.position_client(window, frame_geom.pos);
+                self.backend.resize_client(window, frame_geom.size);
+                self.backend.map_frameless(window);
+                None
+            }
+        };
+
+        client.frame = frame;
+        client.layout = layout;
+        let hints = self.backend.size_hints(window);
+        client.placement.floating = floated.is_some()
+            || window_type == WindowType::Dialog
+            || client.parent.is_some()
+            || hints
+                .min_size
+                .zip(hints.max_size)
+                .is_some_and(|(min, max)| min == max);
+
+        if self.separate_spaces() && client.parent.is_none() {
+            let output = self.monitor_index_at(anchor);
+            client.workspace = self.regular_workspace_on_output(output);
+        }
+        let id = self.clients.insert(client);
+        self.publish_space_output(id);
+        self.bump_protocol_state_revision();
+        if window_rule.idle_inhibit != IdleInhibitRule::None {
+            self.idle_inhibit_clients.insert(id, window_rule.idle_inhibit);
+        }
+        if let Some(factor) = window_rule.touchpad_scroll_factor {
+            self.touchpad_scroll_rules.insert(id, factor);
+        }
+        self.backend.set_window_opacity(window, window_rule.opacity, window_rule.no_dim);
+        self.backend.set_capture_redacted(window, window_rule.no_screen_share);
+        self.window_index.insert(window, id);
+        if self.spaces_mode() && self.mac_hidden.iter().any(|other| self.same_application(*other, id)) {
+            self.mac_hidden.insert(id);
+            self.hide_client_surface(id);
+        }
+        if let Some(frame) = frame {
+            self.frame_index.insert(frame, id);
+        }
+        self.managed_order.push(window);
+        // Click-to-focus from the moment the window is managed, not
+        // only once it has held focus and lost it: a window mapped
+        // without initial focus never loses it, so it would otherwise
+        // never be grabbed. The `focus_client` at the end of this
+        // function lifts the grab again in the common case. Issued
+        // before the drag gesture's grab, which shares button 1, so
+        // the gesture's own modifier combinations stay the gesture's.
+        if !window_rule.no_focus {
+            self.backend.grab_button_passive(window, MouseButton::Left);
+        }
+        // The gesture has to reach this window's own content, which on
+        // X11 means a passive grab the backend installs per window.
+        self.backend.set_drag_gesture_grab(window, self.drag_modifier);
+        self.backend.publish_client_list(&self.managed_order);
+        // A fresh window's `_NET_WM_DESKTOP` — published once here (it
+        // lands on the current workspace) and again on every later
+        // move; a pager that never sees the property at all would have
+        // to treat the window as on-every-desktop.
+        self.backend.publish_window_desktop(window, self.clients[id].workspace);
+        // The identity goes in both lines on purpose. A user whose
+        // window arrived with the wrong chrome has exactly one thing to
+        // do about it — name the application in `[decorations]` — and
+        // the log was the only place that string could have come from,
+        // while naming nothing but an opaque `WlWindowId(102)`.
+        let identity = self.clients.get(id).map(|c| c.class.clone()).unwrap_or_default();
+        match chrome {
+            ClientChrome::Full => {
+                tracing::info!(?window, app = %identity, "mapped and decorated window")
+            }
+            ClientChrome::Edges => tracing::info!(
+                ?window,
+                app = %identity,
+                "mapped window with edge chrome — its client draws its own titlebar, so only the borders \
+                 and resize handles are ours (decorations.server_side = [\"…\"] adds our titlebar, \
+                 client_side = [\"…\"] removes the borders)"
+            ),
+            ClientChrome::Bare => tracing::info!(
+                ?window,
+                app = %identity,
+                "mapped window undecorated — a decorations.client_side rule or the client's own \
+                 no-decoration hint asked for no chrome (decorations.server_side = [\"…\"] overrides this)"
+            ),
+        }
+
+        self.publish_frame_extents(id);
+        // A `workspace` rule decides where the window lives before it
+        // joins any layout: a special member never enters its numbered
+        // home's order, and a numbered destination is a move made
+        // before the window has been seen anywhere else. `silent` maps
+        // it there without following — no switch, no shown overlay, and
+        // no initial focus below.
+        let silent = window_rule.workspace.as_ref().is_some_and(|rule| rule.silent);
+        match window_rule.workspace.as_ref().map(|rule| &rule.target) {
+            Some(placement::RuleWorkspaceTarget::Special(name)) if self.move_client_to_special(id, name, !silent) => {}
+            Some(placement::RuleWorkspaceTarget::Numbered(workspace)) => {
+                let workspace = *workspace;
+                self.register_layout_client(id);
+                self.reflow_client_workspace(id);
+                self.move_client_to_workspace(id, workspace);
+                if !silent {
+                    self.switch_workspace_to_focus(workspace, Some(id));
+                }
+            }
+            _ => {
+                // Dialogs inherit the parent's overlay as well as its
+                // numbered home. Do not show a hidden overlay merely
+                // because an application opened another toplevel.
+                let special = self.clients[id].parent.and_then(|parent| self.clients.get(parent)?.special);
+                if let Some(special) = special {
+                    self.move_one_client_to_special(id, special);
+                } else {
+                    self.register_layout_client(id);
+                    self.reflow_client_workspace(id);
+                }
+            }
+        }
+        self.notifications.push_back(Notification::Mapped(id));
+        // Maximize first so a simultaneous fullscreen rule preserves
+        // the maximized geometry/state underneath fullscreen.
+        if window_rule.maximize {
+            self.maximize(id, MaximizeDirections::FULL);
+        }
+        if window_rule.fullscreen {
+            self.fullscreen(id);
+        }
+        if !window_rule.no_initial_focus && !window_rule.no_focus && !silent {
+            self.focus_client(id);
+        }
+    }
+
+    /// Explicitly resizes a managed client's content, independent of any
+    /// `ConfigureRequest` from the client itself — for the shell to call
+    /// right after a `Notification::Mapped` when an app's own initial
+    /// size can't be trusted (see that variant's doc comment). Shares
+    /// its resize path with a client's own post-map `ConfigureRequest`
+    /// (`handle_configure_request`), so both end up equally "real" as
+    /// far as layout/repaint are concerned.
+    pub fn resize_client_content(&mut self, id: ClientId, size: Size) {
+        if self.is_layout_managed(id) {
+            self.release_evacuated_home(id);
+            let current = self.clients[id].geometry.size;
+            self.resize_layout_window(
+                id,
+                Point::new(
+                    size.w as i32 - current.w as i32,
+                    size.h as i32 - current.h as i32,
+                ),
+            );
+            return;
+        }
+        let unchanged = self.clients.get(id).is_none_or(|client| client.geometry.size == size);
+        if unchanged {
+            return;
+        }
+        self.release_evacuated_home(id);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        client.geometry.size = size;
+        self.bump_protocol_state_revision();
+        self.reflow_frame(id);
+    }
+
+    /// Explicitly moves *and* resizes a managed client's content to a
+    /// root-relative rectangle — the whole-geometry sibling of
+    /// [`Self::resize_client_content`], sharing its reflow path so the
+    /// result is exactly as "real" as any interactive move or resize.
+    ///
+    /// Exists for session-layout restore: a freshly mapped window that
+    /// the shell has a record for gets its remembered position back,
+    /// and position is otherwise entirely WM-managed once a client is
+    /// framed (see `handle_configure_request` — a client cannot ask
+    /// for this itself). A no-op for an unknown `id`, like every other
+    /// stale-id path here.
+    pub fn set_client_content_geometry(&mut self, id: ClientId, geometry: Rect) {
+        if self.is_layout_managed(id) {
+            self.release_evacuated_home(id);
+            self.resize_client_content(id, geometry.size);
+            return;
+        }
+        let unchanged = self.clients.get(id).is_none_or(|client| client.geometry == geometry);
+        if unchanged {
+            return;
+        }
+        self.release_evacuated_home(id);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        client.geometry = geometry;
+        self.bump_protocol_state_revision();
+        self.reflow_frame(id);
+    }
+
+    fn handle_unmap(&mut self, window: B::WindowId) {
+        if self.forget(window) {
+            tracing::info!(?window, "unmapped, no longer tracked");
+        }
+    }
+
+    fn handle_destroy(&mut self, window: B::WindowId) {
+        if self.forget(window) {
+            tracing::info!(?window, "destroyed, no longer tracked");
+        }
+    }
+
+    fn forget(&mut self, window: B::WindowId) -> bool {
+        let Some(id) = self.window_index.remove(&window) else {
+            return false;
+        };
+
+        // Out of the history before anything can pick a successor from
+        // it, and before `clients` loses the entry below — the two
+        // invariants this vector has are that every id in it is live
+        // and that none repeats, and this is the removal half.
+        self.focus_history.retain(|&other| other != id);
+        self.mac_hidden.remove(&id);
+        if let Some((ids, focus)) = self.desktop_reveal.as_mut() {
+            ids.remove(&id);
+            if *focus == Some(id) { *focus = None; }
+        }
+        if self.active_move.as_ref().is_some_and(|m| m.client == id)
+            || self.active_resize.as_ref().is_some_and(|r| r.client == id)
+            || self.layout_drop.is_some_and(|(_, target)| target == id)
+        {
+            // The window being dragged has gone. Ending the drag here
+            // is what stops the grab outliving it — a pointer grab with
+            // nothing left to move is a frozen desktop.
+            self.end_active_drag();
+        }
+        let workspace = self.clients.get(id).map(|c| c.workspace);
+        let special = self.clients.get(id).and_then(|c| c.special);
+        for layout in &mut self.layouts {
+            layout.order.retain(|&other| other != id);
+        }
+        self.forget_special_member(id);
+        self.fullscreen_restore.remove(&id);
+        self.evacuated_homes.remove(&id);
+        self.restore_title_metrics.remove(&(id, RestoreKind::Maximized));
+        self.restore_title_metrics.remove(&(id, RestoreKind::Fullscreen));
+        if let Some(state) = self.display_spaces.as_mut() { state.home_geometry.remove(&id); }
+        self.idle_inhibit_clients.remove(&id);
+        self.touchpad_scroll_rules.remove(&id);
+        if let Some(client) = self.clients.remove(id) {
+            if let Some(frame) = client.frame {
+                self.frame_index.remove(&frame);
+                self.backend.destroy_decoration(frame);
+            }
+        }
+        self.mac_leave_fullscreen(id);
+        for (_, child) in &mut self.clients {
+            if child.parent == Some(id) {
+                child.parent = None;
+            }
+        }
+        self.managed_order.retain(|&other| other != window);
+        self.backend.publish_client_list(&self.managed_order);
+        // After `clients.remove`, so the dying window can never be
+        // chosen as its own successor. Closing the focused terminal
+        // with three windows still on screen used to leave the keyboard
+        // pointed at nothing until the user clicked something.
+        if self.focused == Some(id) {
+            // The entry is already gone, so this clears `focused` and
+            // nothing else: there is no window left to grab or repaint.
+            self.release_focus(id);
+            // A member of a shown overlay hands the keyboard to a
+            // sibling first: the overlay is what the user was working
+            // in, and the ordinary successor would be the window under
+            // it.
+            let sibling = special.and_then(|index| self.special_focus_successor(index, id));
+            match sibling.or_else(|| self.focus_successor(Some(id))) {
+                Some(next) => self.focus_client(next),
+                None => self.backend.publish_active_window(None),
+            }
+        }
+        // Keep an active switcher session honest when one of its
+        // candidates disappears mid-cycle: prune it from the snapshot
+        // (clamping the selection) and let the shell redraw — or end
+        // the session outright if nothing is left to switch to.
+        if let Some(session) = &mut self.cycle {
+            let before = session.order.len();
+            session.order.retain(|&other| other != id);
+            if session.order.is_empty() {
+                self.cycle_end(false);
+            } else if session.order.len() != before {
+                session.selected = session.selected.min(session.order.len() - 1);
+                self.notifications.push_back(Notification::CycleUpdated);
+            }
+        }
+        if let Some(workspace) = workspace {
+            self.reflow_workspace(workspace);
+        }
+        self.notifications.push_back(Notification::Removed(id));
+        self.bump_protocol_state_revision();
+        true
+    }
+
+    /// Re-reads `WM_NAME` for an already-managed window and repaints its
+    /// decoration if it actually changed — a no-op for a window we don't
+    /// track (e.g. a property change on something never mapped).
+    fn handle_title_changed(&mut self, window: B::WindowId) {
+        let Some(id) = self.client_for_window(window) else {
+            return;
+        };
+        let title = self.backend.window_title(window).unwrap_or_default();
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if client.title == title {
+            return;
+        }
+        client.title = title;
+        self.bump_protocol_state_revision();
+        // A short title tab can grow/shrink when its label changes. Refresh
+        // its hitboxes and desktop cutout without configuring the client or
+        // moving its content. Rectangular recipes keep their existing layout.
+        let client = &self.clients[id];
+        let layout = self.chrome_layout(client.chrome, &Self::decoration_request(client, None), self.client_decoration_scale(id));
+        if layout != client.layout {
+            if layout.frame_size != client.layout.frame_size || layout.client_offset != client.layout.client_offset {
+                self.reflow_frame_internal(id, ReflowReason::Geometry);
+                return;
+            }
+            if let Some(frame) = client.frame { self.backend.set_decoration_layout(frame, &layout); }
+            self.clients[id].layout = layout;
+        }
+        self.repaint_decoration(id);
+    }
+
+    /// A window's protocol-only metadata — its xdg toplevel tag or
+    /// description — changed. The core keeps no copy of either (the
+    /// IPC snapshot reads the backend's record directly), so the only
+    /// work is telling the publishers that a window they last
+    /// published is stale. Rules are not re-run: they are evaluated
+    /// at map time, exactly as a later title change does not re-run
+    /// them.
+    fn handle_metadata_changed(&mut self, window: B::WindowId) {
+        if self.client_for_window(window).is_some() {
+            self.bump_protocol_state_revision();
+        }
+    }
+
+    /// Refreshes the transient edge after a client reparents itself.
+    /// Late parenting is common (LibreOffice does it after map), so the
+    /// relationship cannot be a map-time-only hint.
+    fn handle_parent_changed(&mut self, window: B::WindowId) {
+        let Some(&id) = self.window_index.get(&window) else {
+            return;
+        };
+        let parent = self
+            .backend
+            .window_parent(window)
+            .and_then(|parent| self.window_index.get(&parent).copied())
+            .filter(|parent| *parent != id);
+        if self
+            .clients
+            .get(id)
+            .is_some_and(|client| client.parent == parent)
+        {
+            return;
+        }
+        if parent.is_some() && self.is_layout_managed(id) {
+            self.set_floating(id, true);
+        }
+        if let Some(client) = self.clients.get_mut(id) {
+            client.parent = parent;
+        }
+        self.reflow_client_workspace(id);
+        let Some(parent) = parent else {
+            return;
+        };
+        let Some(parent_client) = self.clients.get(parent) else {
+            return;
+        };
+        let workspace = parent_client.workspace;
+        let special = parent_client.special;
+        let parent_frame = client_frame_rect(parent_client);
+        let center = Point::new(
+            parent_frame.pos.x + parent_frame.size.w as i32 / 2,
+            parent_frame.pos.y + parent_frame.size.h as i32 / 2,
+        );
+        if let Some(special) = special {
+            for member in self.transient_family(id) {
+                self.move_one_client_to_special(member, special);
+            }
+        } else {
+            self.move_client_to_workspace(id, workspace);
+        }
+        if let Some(child) = self.clients.get(id) {
+            let desired = Point::new(
+                center.x - child.layout.frame_size.w as i32 / 2,
+                center.y - child.layout.frame_size.h as i32 / 2,
+            );
+            let frame_pos = placement::clamp_to(
+                self.usable_area_at(center),
+                child.layout.frame_size,
+                desired,
+            );
+            if let Some(child) = self.clients.get_mut(id) {
+                child.geometry.pos = Point::new(
+                    frame_pos.x + child.layout.client_offset.x,
+                    frame_pos.y + child.layout.client_offset.y,
+                );
+            }
+            self.reflow_frame(id);
+        }
+        self.raise_client(parent);
+        self.reflow_client_workspace(id);
+    }
+
+    fn handle_modal_changed(&mut self, window: B::WindowId, modal: bool) {
+        let Some(&id) = self.window_index.get(&window) else {
+            return;
+        };
+        if modal && self.is_layout_managed(id) {
+            self.set_floating(id, true);
+        }
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if client.flags.contains(ClientFlags::MODAL) == modal {
+            return;
+        }
+        client.flags.set(ClientFlags::MODAL, modal);
+        self.bump_protocol_state_revision();
+        self.publish_client_net_state(id);
+        self.reflow_client_workspace(id);
+        if modal {
+            self.focus_client(id);
+        }
+    }
+
+    fn handle_configure_request(&mut self, window: B::WindowId, requested: Rect, committed: bool) {
+        let Some(&id) = self.window_index.get(&window) else {
+            if committed { return; }
+            // Not yet managed (configure can arrive before the first
+            // map request) — ICCCM requires honoring it directly.
+            tracing::debug!(?window, ?requested, "configure request for an unmanaged window — applying directly");
+            self.backend.configure_unmanaged(window, requested);
+            return;
+        };
+
+        if self.is_layout_managed(id) {
+            return;
+        }
+        // Where the frame is and what the work area under it holds, for the
+        // backends whose clients size themselves from the whole screen (see
+        // `Backend::fits_new_windows_to_workarea`): a window that grows itself
+        // past the work area after it is mapped is held to it as a new one is.
+        let fit = (committed && self.backend.fits_new_windows_to_workarea())
+            .then(|| self.clients.get(id))
+            .flatten()
+            .map(|client| {
+                let frame = client_frame_rect(client);
+                let center = Point::new(frame.pos.x + frame.size.w as i32 / 2, frame.pos.y + frame.size.h as i32 / 2);
+                let chrome = Size::new(
+                    frame.size.w.saturating_sub(client.geometry.size.w),
+                    frame.size.h.saturating_sub(client.geometry.size.h),
+                );
+                (self.usable_area_at(center), chrome, frame.pos)
+            });
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        // Once a client is managed (reparented into a frame), its own
+        // ConfigureRequest x/y are relative to its new parent — the
+        // frame, not root — so they don't mean anything as root-relative
+        // `Client::geometry`. Only the requested *size* is meaningful
+        // here; position is entirely WM-managed from this point on
+        // (interactive move), so it's left untouched.
+        if client.flags.contains(ClientFlags::SIZE_LOCKED) {
+            tracing::debug!(?id, ?requested, "configure request from a size-locked client — ignored");
+            return;
+        }
+        // A fullscreen window's size is its monitor's, the way a maximized
+        // axis below is the work area's. A client that answers fullscreen
+        // with another buffer (a browser still showing its windowed frame, a
+        // fixed-size game) keeps that buffer inside the fullscreen rectangle.
+        // Adopting its size made the fullscreen reflow resize the window
+        // straight back, and the backend answered that unchanged resize with
+        // the same commit, repainting every pass.
+        if client.flags.contains(ClientFlags::FULLSCREEN) {
+            tracing::debug!(?id, ?requested, "configure request from a fullscreen client — ignored");
+            return;
+        }
+        // A maximized axis is the WM's to decide, not the client's. A
+        // client that re-asks for its pre-maximize size — which toolkits
+        // do, on a font change, a DPI change, or just late in startup —
+        // used to have that size adopted wholesale while the window kept
+        // the maximized *origin*. The result is the reported bug: the
+        // window parks at the work area's top-left corner at its old
+        // size, looking like a failed maximize, while still flagged
+        // maximized. Clamp per axis rather than ignoring the request
+        // outright, so a vertically-maximized window can still be given
+        // a new width.
+        let maximized_h = client.flags.contains(ClientFlags::MAXIMIZED_H);
+        let maximized_v = client.flags.contains(ClientFlags::MAXIMIZED_V);
+        let mut size = requested.size;
+        if maximized_h {
+            size.w = client.geometry.size.w;
+        }
+        if maximized_v {
+            size.h = client.geometry.size.h;
+        }
+        tracing::debug!(
+            ?id,
+            ?requested,
+            ?size,
+            maximized_h,
+            maximized_v,
+            "configure request from a managed client — applying"
+        );
+        let fit = fit.filter(|_| !client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        if let Some((workarea, chrome, frame_pos)) = fit {
+            let fitted = placement::fit_in(size, workarea, chrome, 1.0);
+            let pos = placement::clamp_to(workarea, Size::new(fitted.w + chrome.w, fitted.h + chrome.h), frame_pos);
+            if fitted != size || pos != frame_pos {
+                tracing::info!(?id, asked = ?size, ?fitted, ?pos, "a window that grew past the work area is held to it");
+                client.geometry.pos.x += pos.x - frame_pos.x;
+                client.geometry.pos.y += pos.y - frame_pos.y;
+                // The client drew the size it asked for; it has to be told the one it gets.
+                let refit = fitted != size;
+                client.geometry.size = fitted;
+                self.bump_protocol_state_revision();
+                self.reflow_frame_internal(id, if refit { ReflowReason::Geometry } else { ReflowReason::ClientCommit });
+                return;
+            }
+        }
+        if client.geometry.size == size {
+            return;
+        }
+        client.geometry.size = size;
+        self.bump_protocol_state_revision();
+        self.reflow_frame_internal(id, if committed { ReflowReason::ClientCommit } else { ReflowReason::Geometry });
+    }
+
+    /// See `ClientFlags::SIZE_LOCKED`'s doc comment for what this does
+    /// and why it exists. A no-op for an unknown `id`.
+    pub fn set_size_locked(&mut self, id: ClientId, locked: bool) {
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        client.flags.set(ClientFlags::SIZE_LOCKED, locked);
+    }
+
+    fn handle_pointer_button(
+        &mut self,
+        surface: SurfaceRef<B::WindowId, B::FrameId>,
+        local: Point,
+        button: MouseButton,
+        pressed: bool,
+        time_ms: u32,
+        mods: Modifiers,
+    ) {
+        // A drag ends on the button coming up, wherever that happens.
+        // Not only on the frame: a window whose client draws its own
+        // chrome is dragged with the pointer over the *client*, and
+        // under the drag grab the release may be reported against the
+        // root, the frame or the client depending on the backend. Any
+        // of them means the same thing, and treating only one of them
+        // as the end is what left the window stuck to the cursor.
+        if !pressed && button == MouseButton::Left && (self.active_move.is_some() || self.active_resize.is_some()) {
+            self.commit_active_drag();
+        }
+        match surface {
+            SurfaceRef::Frame(frame) => self.handle_frame_button(frame, local, button, pressed, time_ms, mods),
+            SurfaceRef::Client(window) => self.handle_client_button(window, local, button, pressed, mods),
+        }
+    }
+
+    /// Focus-follows-mouse: the pointer entering a client's frame
+    /// focuses it immediately, no click needed. A no-op under the
+    /// default click-to-focus policy, and a no-op for a surface that
+    /// isn't (or is no longer) a managed client.
+    fn handle_pointer_enter(&mut self, surface: SurfaceRef<B::WindowId, B::FrameId>) {
+        if self.focus_policy != FocusPolicy::FocusFollowsMouse {
+            return;
+        }
+        let id = match surface {
+            SurfaceRef::Frame(frame) => self.frame_index.get(&frame).copied(),
+            SurfaceRef::Client(window) => self.window_index.get(&window).copied(),
+        };
+        if let Some(id) = id {
+            // The one focus in the crate that is not a click. `autoraise`
+            // exists for exactly this call: crossing a window on the way
+            // to somewhere else should not bury what the pointer left.
+            self.focus_client_with(id, self.raise_on_focus);
+        }
+    }
+
+    fn handle_client_button(
+        &mut self,
+        window: B::WindowId,
+        local: Point,
+        button: MouseButton,
+        pressed: bool,
+        mods: Modifiers,
+    ) {
+        if !pressed {
+            return;
+        }
+        let Some(&id) = self.window_index.get(&window) else {
+            self.backend.replay_pointer();
+            return;
+        };
+        if let Some(modal) = self.modal_blocker(id) {
+            self.focus_client(modal);
+            return;
+        }
+        // The modifier-drag: a move or a resize begun over a window's
+        // own content, reaching windows a titlebar cannot.
+        //
+        // Every window answers to it, framed or not, because the
+        // gesture's whole job is to not depend on chrome. For a framed
+        // window it is a convenience — the titlebar is right there. For
+        // a client-decorated one it is the only pointer route to a
+        // move or a resize that exists, and the reason this desktop can
+        // honor a client's request to decorate itself without risking a
+        // window nobody can shift off the corner it opened in.
+        if self.is_drag_gesture(mods) && matches!(button, MouseButton::Left | MouseButton::Right) {
+            self.focus_client(id);
+            self.begin_modifier_drag(id, local, button);
+            return;
+        }
+        self.focus_client(id);
+        // A click on a client's own content only ever reaches this
+        // handler at all via the passive grab every unfocused client
+        // holds — installed at map, lifted by `focus_client`, restored
+        // by `release_focus` (an already-focused client isn't
+        // grabbed, so its own clicks go straight to it without `wm-core`
+        // seeing them) — so every call here came through that grab, and
+        // needs replaying: without it, the click that just focused this
+        // window would never actually reach the window itself (to place
+        // a text cursor, say), only the WM would see it.
+        self.backend.replay_pointer();
+    }
+
+    fn handle_frame_button(
+        &mut self,
+        frame: B::FrameId,
+        local: Point,
+        button: MouseButton,
+        pressed: bool,
+        time_ms: u32,
+        mods: Modifiers,
+    ) {
+        let Some(&id) = self.frame_index.get(&frame) else {
+            return;
+        };
+
+        if !pressed {
+            self.handle_frame_button_release(id, local, button);
+            return;
+        }
+
+        if let Some(modal) = self.modal_blocker(id) {
+            self.active_button_press = None;
+            self.focus_client(modal);
+            return;
+        }
+
+        self.focus_client(id);
+
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        match hit_test(&client.layout, local) {
+            // Arm on press — the button visibly goes "down" (sunken
+            // bevel) immediately, but the Close/Miniaturize action only
+            // commits on release, and only if the pointer is still over
+            // the same button then. This is the universal press/release
+            // contract every button in this theme follows, matching how
+            // real buttons everywhere behave: you can press-and-drag
+            // away to cancel.
+            HitTarget::Button(kind) if button == MouseButton::Left => {
+                self.active_button_press = Some(ActiveButtonPress { client: id, kind });
+                self.repaint_decoration(id);
+            }
+            // Right-click anywhere on the titlebar surface asks the
+            // shell for the per-window commands menu — reported at root
+            // coordinates so the shell can pop the menu under the
+            // pointer without knowing frame geometry.
+            HitTarget::TitlebarDrag | HitTarget::Button(_) if button == MouseButton::Right => {
+                let frame_pos = Point::new(
+                    client.geometry.pos.x - client.layout.client_offset.x,
+                    client.geometry.pos.y - client.layout.client_offset.y,
+                );
+                let at = Point::new(frame_pos.x + local.x, frame_pos.y + local.y);
+                self.notifications.push_back(Notification::WindowMenuRequested { id, at });
+            }
+            HitTarget::TitlebarDrag if button == MouseButton::Left => {
+                // A second press on this same client's titlebar within
+                // `DOUBLE_CLICK_MS` triggers a titlebar action instead of
+                // starting a drag — exactly the classic titlebar
+                // double-click behavior: a plain double-click shades
+                // (rolls the window up to just its titlebar), and
+                // maximizing needs a modifier — Ctrl alone for vertical-
+                // only, Shift alone for horizontal-only, both together
+                // for full. (The classic desktop also offers a
+                // preference that swaps the plain case to full-maximize
+                // instead of shade; not implemented here — shade is the
+                // flagship default.) No X server gives double-click
+                // detection for free; this is why
+                // `BackendEvent::PointerButton` carries a timestamp.
+                let at = Point::new(
+                    client.geometry.pos.x - client.layout.client_offset.x + local.x,
+                    client.geometry.pos.y - client.layout.client_offset.y + local.y,
+                );
+                let tolerance = (DOUBLE_CLICK_DISTANCE * self.client_decoration_scale(id)).ceil() as i64;
+                let is_double_click = self
+                    .last_titlebar_press
+                    .take_if(|(prev_id, prev_time, prev_at)| {
+                        *prev_id == id && time_ms.wrapping_sub(*prev_time) <= DOUBLE_CLICK_MS
+                            && (at.x as i64 - prev_at.x as i64).abs() <= tolerance
+                            && (at.y as i64 - prev_at.y as i64).abs() <= tolerance
+                    })
+                    .is_some();
+                if is_double_click {
+                    let ctrl = mods.contains(Modifiers::CONTROL);
+                    let shift = mods.contains(Modifiers::SHIFT);
+                    match (ctrl, shift) {
+                        (true, true) => self.toggle_maximize(id, MaximizeDirections::FULL),
+                        (true, false) => self.toggle_maximize(id, MaximizeDirections::VERTICAL),
+                        (false, true) => self.toggle_maximize(id, MaximizeDirections::HORIZONTAL),
+                        (false, false) => self.toggle_shade(id),
+                    }
+                } else {
+                    self.last_titlebar_press = Some((id, time_ms, at));
+                    // Dragging a maximized window is the gesture that
+                    // un-maximizes it. Without this the window travels
+                    // under the pointer still flagged maximized: the
+                    // titlebar menu keeps reporting "maximized", and the
+                    // next Maximize pick runs *unmaximize* and teleports
+                    // it back to a corner the user last saw minutes ago.
+                    self.break_maximize(id);
+                    self.active_move = Some(ActiveMove { client: id, grab_offset: local });
+                    self.remember_drag_start(id);
+                    self.begin_drag_grab();
+                }
+            }
+            // A shaded window has nothing to resize — the classic
+            // behavior is to refuse the drag outright, rather than
+            // letting a resize silently reshape a window the user can't
+            // even see the content of.
+            HitTarget::ResizeEdge(edge)
+                if button == MouseButton::Left && !client.flags.contains(ClientFlags::SHADED) =>
+            {
+                let start_frame = Rect {
+                    pos: Point::new(
+                        client.geometry.pos.x - client.layout.client_offset.x,
+                        client.geometry.pos.y - client.layout.client_offset.y,
+                    ),
+                    size: client.layout.frame_size,
+                };
+                let start_pointer = (client.layout.input_margin > 0).then(|| Point::new(
+                    start_frame.pos.x + local.x, start_frame.pos.y + local.y));
+                self.active_resize = Some(ActiveResize { client: id, edge, start_frame, start_pointer });
+                self.remember_drag_start(id);
+                self.begin_drag_grab();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_frame_button_release(&mut self, id: ClientId, local: Point, button: MouseButton) {
+        if button != MouseButton::Left {
+            return;
+        }
+        if self.active_move.as_ref().is_some_and(|m| m.client == id)
+            || self.active_resize.as_ref().is_some_and(|r| r.client == id)
+        {
+            self.commit_active_drag();
+        }
+
+        let Some(active) = self.active_button_press.take_if(|p| p.client == id) else {
+            return;
+        };
+
+        let still_over = self
+            .clients
+            .get(id)
+            .is_some_and(|c| matches!(hit_test(&c.layout, local), HitTarget::Button(k) if k == active.kind));
+
+        if still_over {
+            match active.kind {
+                ButtonKind::Menu => {
+                    if let Some(client) = self.clients.get(id) {
+                        let at = Point::new(client.geometry.pos.x, client.geometry.pos.y);
+                        self.notifications.push_back(Notification::WindowMenuRequested { id, at });
+                    }
+                }
+                ButtonKind::Close => {
+                    self.close_client(id);
+                }
+                ButtonKind::Miniaturize => self.miniaturize(id),
+                ButtonKind::Maximize => self.toggle_maximize(id, MaximizeDirections::FULL),
+            }
+        }
+        // Always repaint to clear the pressed/sunken visual, whether the
+        // action fired or the press was cancelled by releasing elsewhere.
+        self.repaint_decoration(id);
+    }
+
+    /// Updates a frame's cursor to indicate a resize is available
+    /// wherever the pointer is currently hovering — the visual half of
+    /// the resize-corner affordance; `render_decoration`'s grip marks
+    /// are the other half. A no-op for `SurfaceRef::Client`: the frame
+    /// (chonkstep's own border/titlebar) is the only surface whose
+    /// cursor is ours to manage — a client's own content may set its
+    /// own cursor (an I-beam over a text area, say), which this must
+    /// never override.
+    fn handle_frame_hover(&mut self, surface: SurfaceRef<B::WindowId, B::FrameId>, local: Point) {
+        let SurfaceRef::Frame(frame) = surface else {
+            return;
+        };
+        let Some(&id) = self.frame_index.get(&frame) else {
+            return;
+        };
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let edge = match hit_test(&client.layout, local) {
+            HitTarget::ResizeEdge(edge) => Some(edge),
+            _ => None,
+        };
+        self.backend.set_frame_cursor(frame, edge);
+    }
+
+    fn handle_pointer_motion(&mut self, root: Point) {
+        self.select_output(self.monitor_index_at(root));
+        // Recorded before any drag branch returns: this is the core's
+        // only sighting of where the user's attention is, and new-window
+        // placement reads it to open on the monitor being looked at
+        // (see `placement_output`). A drag in progress is no reason to
+        // stop tracking — it is the most emphatic pointer motion there
+        // is.
+        self.last_pointer = Some(root);
+
+        if self.active_resize.is_some() {
+            self.handle_resize_motion(root);
+            return;
+        }
+
+        let Some(active) = &self.active_move else {
+            return;
+        };
+        let (client_id, grab_offset) = (active.client, active.grab_offset);
+        let tolerance = (DOUBLE_CLICK_DISTANCE * self.client_decoration_scale(client_id)).ceil() as i64;
+        if self.last_titlebar_press.is_some_and(|(id, _, at)| {
+            id == client_id && ((root.x as i64 - at.x as i64).abs() > tolerance
+                || (root.y as i64 - at.y as i64).abs() > tolerance)
+        }) {
+            // A drag is not the first click of a double-click, even if it is
+            // cancelled and the user immediately grabs the same titlebar.
+            self.last_titlebar_press = None;
+        }
+        if self.is_layout_managed(client_id) {
+            self.preview_managed_move(client_id, root);
+            return;
+        }
+
+        let Some(client) = self.clients.get(client_id) else {
+            self.end_active_drag();
+            return;
+        };
+        // A shaded window's *displayed* frame is only `shaded_frame_
+        // height` tall — pushing the full unshaded `frame_size` here
+        // (as if nothing were shaded) would force it back to full
+        // height on the very first motion event, visibly "unrolling"
+        // it the instant a drag starts. `client.geometry` itself is
+        // untouched either way, so this is purely about what gets
+        // pushed to the backend during the drag, matching what
+        // `reflow_frame` already does once the drag ends.
+        let frame_size = if client.flags.contains(ClientFlags::SHADED) {
+            Size::new(client.layout.frame_size.w, client.layout.shaded_frame_height)
+        } else {
+            client.layout.frame_size
+        };
+        let old_frame = Rect {
+            pos: Point::new(
+                client.geometry.pos.x - client.layout.client_offset.x,
+                client.geometry.pos.y - client.layout.client_offset.y,
+            ),
+            size: frame_size,
+        };
+        let old_scale = self.backend.decoration_scale(old_frame);
+        let (surface_frame, surface_window) = (client.frame, client.window);
+        let raw_pos = Point::new(root.x - grab_offset.x, root.y - grab_offset.y);
+
+        // Edge resistance/attraction: pull the dragged frame flush
+        // against the screen edge or another window's frame edge once
+        // it's within `SNAP_THRESHOLD_PX`. Pure geometry against every
+        // other *visible* client's current frame rect, recomputed fresh
+        // each motion event — cheap at WM scale.
+        let outputs = self
+            .backend
+            .monitors_ref()
+            .iter()
+            .enumerate()
+            .map(|(index, monitor)| {
+                self.workareas
+                    .get(index)
+                    .copied()
+                    .unwrap_or(monitor.geometry)
+            });
+        let neighbors = self
+            .clients
+            .iter()
+            .filter(|(id, other)| {
+                *id != client_id
+                    && other.lifecycle == Lifecycle::Normal
+                    && (self.workspace_visible(other.workspace)
+                        || other.flags.contains(ClientFlags::STICKY))
+            })
+            .map(|(_, other)| client_frame_rect(other));
+        let margin = client.layout.input_margin;
+        let snapped = snap::snap_position_iter(
+            Rect {
+                pos: Point::new(raw_pos.x + margin as i32, raw_pos.y + margin as i32),
+                size: Size::new(frame_size.w.saturating_sub(margin * 2), frame_size.h.saturating_sub(margin * 2)),
+            },
+            outputs.chain(neighbors),
+            self.snap_threshold,
+        );
+        let visual_pos = self.below_top_reservation(snapped, root);
+        let new_frame_pos = Point::new(visual_pos.x - margin as i32, visual_pos.y - margin as i32);
+
+        if new_frame_pos == old_frame.pos {
+            return;
+        }
+
+        // A framed window is moved by its frame; a client-decorated one
+        // has only itself to move, and its content sits at the frame
+        // origin (its layout has a zero offset), so the same computed
+        // position applies to both.
+        match (surface_frame, surface_window) {
+            (Some(frame), _) => self.backend.set_frame_geometry(frame, Rect { pos: new_frame_pos, size: frame_size }),
+            (None, window) => self.backend.position_client(window, new_frame_pos),
+        }
+
+        let Some(client) = self.clients.get_mut(client_id) else {
+            return;
+        };
+        client.geometry.pos = Point::new(
+            new_frame_pos.x + client.layout.client_offset.x,
+            new_frame_pos.y + client.layout.client_offset.y,
+        );
+        self.track_window_display(client_id);
+        let new_scale = self.backend.decoration_scale(Rect { pos: new_frame_pos, size: frame_size });
+        if old_scale.to_bits() != new_scale.to_bits() {
+            let before = client_input_rect(&self.clients[client_id]);
+            self.reflow_frame(client_id);
+            let after = client_input_rect(&self.clients[client_id]);
+            if let Some(drag) = self.active_move.as_mut().filter(|drag| drag.client == client_id) {
+                drag.grab_offset.x = drag.grab_offset.x.saturating_add(before.pos.x.saturating_sub(after.pos.x));
+                drag.grab_offset.y = drag.grab_offset.y.saturating_add(before.pos.y.saturating_sub(after.pos.y));
+            }
+        }
+    }
+
+    /// Recomputes content size/position fresh from `start_frame` and
+    /// the current pointer position for whichever edge is being
+    /// dragged, enforces the client's `SizeHints` (min/max/resize
+    /// increment), and pushes the result through the normal
+    /// `reflow_frame` path. All eight edges/corners are handled:
+    /// dragging a north or west handle keeps the *opposite* edge
+    /// anchored, so the frame's origin moves with the drag while the
+    /// far edge stays put — the size-hint constraint
+    /// is applied to the size first and the anchored edge re-derived
+    /// from the constrained result, so a terminal snapping to its cell
+    /// grid never makes the anchored edge drift.
+    fn handle_resize_motion(&mut self, root: Point) {
+        let Some(active) = &self.active_resize else {
+            return;
+        };
+        let (client_id, edge, start_frame) = (active.client, active.edge, active.start_frame);
+
+        let Some(client) = self.clients.get(client_id) else {
+            self.active_resize = None;
+            return;
+        };
+        let overhead_w = client.layout.frame_size.w.saturating_sub(client.geometry.size.w);
+        let overhead_h = client.layout.frame_size.h.saturating_sub(client.geometry.size.h);
+        let start_right = start_frame.pos.x + start_frame.size.w as i32;
+        let start_bottom = start_frame.pos.y + start_frame.size.h as i32;
+        let root = if let Some(pointer) = active.start_pointer {
+            let dx = root.x.saturating_sub(pointer.x);
+            let dy = root.y.saturating_sub(pointer.y);
+            Point::new(
+                match edge {
+                    ResizeEdge::West | ResizeEdge::NorthWest | ResizeEdge::SouthWest => start_frame.pos.x.saturating_add(dx),
+                    _ => start_right.saturating_add(dx),
+                },
+                match edge {
+                    ResizeEdge::North | ResizeEdge::NorthWest | ResizeEdge::NorthEast => start_frame.pos.y.saturating_add(dy),
+                    _ => start_bottom.saturating_add(dy),
+                },
+            )
+        } else {
+            root
+        };
+        let anchor = Point::new(
+            start_frame.pos.x + start_frame.size.w as i32 / 2,
+            start_frame.pos.y + start_frame.size.h as i32 / 2,
+        );
+        let root = if matches!(
+            edge,
+            ResizeEdge::North | ResizeEdge::NorthEast | ResizeEdge::NorthWest
+        ) {
+            self.below_top_reservation(root, anchor)
+        } else {
+            root
+        };
+
+        let raw_frame_w = match edge {
+            ResizeEdge::North | ResizeEdge::South => start_frame.size.w as i32,
+            ResizeEdge::East | ResizeEdge::NorthEast | ResizeEdge::SouthEast => root.x - start_frame.pos.x,
+            ResizeEdge::West | ResizeEdge::NorthWest | ResizeEdge::SouthWest => start_right - root.x,
+        }
+        .max(1);
+        let raw_frame_h = match edge {
+            ResizeEdge::East | ResizeEdge::West => start_frame.size.h as i32,
+            ResizeEdge::South | ResizeEdge::SouthEast | ResizeEdge::SouthWest => root.y - start_frame.pos.y,
+            ResizeEdge::North | ResizeEdge::NorthEast | ResizeEdge::NorthWest => start_bottom - root.y,
+        }
+        .max(1);
+
+        let raw_content =
+            Size::new((raw_frame_w as u32).saturating_sub(overhead_w), (raw_frame_h as u32).saturating_sub(overhead_h));
+        if self.is_layout_managed(client_id) {
+            if self.layout_resize_snapshot.is_none() {
+                let workspace = self.clients[client_id].workspace;
+                self.layout_resize_snapshot = Some(crate::spatial::ResizeSnapshot {
+                    workspace,
+                    viewports: self.layouts[workspace].viewports.clone(),
+                    placements: self
+                        .layout_order(workspace)
+                        .iter()
+                        .map(|&id| {
+                            let p = &self.clients[id].placement;
+                            (id, p.mosaic_weight, p.flow_width)
+                        })
+                        .collect(),
+                });
+            }
+            let current = self.clients[client_id].geometry.size;
+            self.resize_managed(
+                client_id,
+                Point::new(
+                    raw_content.w as i32 - current.w as i32,
+                    raw_content.h as i32 - current.h as i32,
+                ),
+                Some(edge),
+            );
+            return;
+        }
+        let hints = self.backend.size_hints(client.window);
+        let content = resize::constrain_size(raw_content, hints);
+
+        let new_frame_w = content.w + overhead_w;
+        let new_frame_h = content.h + overhead_h;
+        let new_frame_x = match edge {
+            ResizeEdge::West | ResizeEdge::NorthWest | ResizeEdge::SouthWest => start_right - new_frame_w as i32,
+            _ => start_frame.pos.x,
+        };
+        let new_frame_y = match edge {
+            ResizeEdge::North | ResizeEdge::NorthEast | ResizeEdge::NorthWest => start_bottom - new_frame_h as i32,
+            _ => start_frame.pos.y,
+        };
+
+        let Some(client) = self.clients.get_mut(client_id) else {
+            return;
+        };
+        client.geometry.pos =
+            Point::new(new_frame_x + client.layout.client_offset.x, new_frame_y + client.layout.client_offset.y);
+        client.geometry.size = content;
+        self.reflow_frame(client_id);
+    }
+
+    /// Screen area windows should maximize into on the *primary*
+    /// monitor: the shell-reserved workarea if one was set for it, else
+    /// that monitor's full geometry. Anything that knows which monitor
+    /// it means wants `usable_area_at` instead; this is the answer for
+    /// the cases that genuinely have no anchor (a window that belongs
+    /// to no monitor yet).
+    fn usable_area(&self) -> Rect {
+        let primary = self.primary_monitor_index();
+        self.workareas
+            .get(primary)
+            .copied()
+            .or_else(|| self.backend.monitors().get(primary).map(|m| m.geometry))
+            .unwrap_or(NO_MONITOR_FALLBACK)
+    }
+
+    /// A client's frame center in root coordinates — the point that
+    /// decides which monitor a window "is on", for fullscreen and
+    /// maximize alike. Center rather than origin: a window straddling
+    /// two outputs belongs to the one showing most of it, whereas the
+    /// origin would hand it to whichever output happens to hold its
+    /// top-left corner (so a window nudged one pixel left across the
+    /// seam would maximize onto the monitor it is barely touching).
+    /// `None` for an unknown or stale id.
+    fn client_frame_center(&self, id: ClientId) -> Option<Point> {
+        let client = self.clients.get(id)?;
+        let frame_pos = Point::new(
+            client.geometry.pos.x - client.layout.client_offset.x,
+            client.geometry.pos.y - client.layout.client_offset.y,
+        );
+        Some(Point::new(
+            frame_pos.x + client.layout.frame_size.w as i32 / 2,
+            frame_pos.y + client.layout.frame_size.h as i32 / 2,
+        ))
+    }
+
+    /// Where a fresh window that expressed no position preference
+    /// should be placed: the workarea of the monitor the user is
+    /// actually looking at. "Looking at" is the pointer's monitor —
+    /// the mouse is where attention is, and it is also where the
+    /// launcher click or menu pick that spawned the window happened,
+    /// so a window launched from the second head opens on the second
+    /// head. With no pointer seen yet the focused window's monitor is
+    /// the next best guess (a keyboard-spawned window joins its
+    /// siblings), and the primary is the last.
+    ///
+    /// Returned with the index of the monitor the workarea belongs to,
+    /// for the window rules that are arithmetic on the monitor itself
+    /// rather than its workarea.
+    fn placement_output(&self) -> (usize, Rect) {
+        if self.separate_spaces() {
+            let index = self.active_output_index();
+            if let Some(monitor) = self.monitors_ref().get(index) {
+                return (index, self.workareas.get(index).copied().unwrap_or(monitor.geometry));
+            }
+        }
+        if let Some(pointer) = self.last_pointer {
+            return (self.monitor_index_at(pointer), self.usable_area_at(pointer));
+        }
+        if let Some(center) = self.focused.and_then(|id| self.client_frame_center(id)) {
+            return (self.monitor_index_at(center), self.usable_area_at(center));
+        }
+        (self.primary_monitor_index(), self.usable_area())
+    }
+
+    /// Re-derives layout from a client's current `geometry.size`, then
+    /// pushes the resulting frame geometry/decoration/client size to the
+    /// backend. Shared tail of any operation that changes a client's
+    /// content size in place (`ConfigureRequest`, maximize, unmaximize).
+    fn reflow_frame(&mut self, id: ClientId) {
+        self.reflow_frame_internal(id, ReflowReason::Geometry);
+    }
+
+    fn apply_client_size(&mut self, window: B::WindowId, size: Size, reason: ReflowReason) {
+        if matches!(reason, ReflowReason::ClientCommit) {
+            self.backend.accept_client_size(window, size);
+        } else {
+            self.backend.resize_client(window, size);
+        }
+    }
+
+    fn reflow_frame_internal(&mut self, id: ClientId, reason: ReflowReason) {
+        // Parked clients have no physical frame to fit. In particular, do not
+        // clamp their retained size against the 1x1 headless screen fallback.
+        if self.separate_spaces() && self.monitors_ref().is_empty() { return; }
+        self.track_window_display(id);
+        let screen = self.backend.screen_size();
+        if let Some(client) = self.clients.get_mut(id) {
+            Self::clamp_geometry(client, screen);
+        }
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        // Fullscreen bypasses the theme entirely: the frame is exactly
+        // the client's monitor and the content fills it edge-to-edge —
+        // no titlebar, border, or resizebar, and nothing to paint. The
+        // synthetic layout (offset 0,0, no hitboxes) keeps every
+        // consumer of `Client::layout` (hit-testing, drag math)
+        // consistent with what's actually on screen.
+        if client.flags.contains(ClientFlags::FULLSCREEN) {
+            let monitor = self.fullscreen_monitor_rect(id);
+            let Some(client) = self.clients.get_mut(id) else {
+                return;
+            };
+            client.geometry = monitor;
+            client.layout = DecorationLayout {
+                input_margin: 0,
+                input_exclusion: None,
+                frame_size: monitor.size,
+                client_offset: Point::new(0, 0),
+                titlebar_height: 0,
+                button_hitboxes: Vec::new(),
+                resize_hitboxes: Vec::new(),
+                shaded_frame_height: 0,
+            };
+            let window = client.window;
+            let frame = client.frame;
+            if let Some(frame) = frame {
+                self.backend.set_decoration_layout(frame, &client.layout);
+                self.backend.set_frame_geometry(frame, monitor);
+            }
+            self.backend.position_client(window, Point::new(0, 0));
+            self.apply_client_size(window, monitor.size, reason);
+            self.publish_frame_extents(id);
+            return;
+        }
+        // A bare window has no chrome to lay out and no
+        // frame to move: its content *is* the window, positioned in root
+        // coordinates. Handled before the theme is consulted at all,
+        // for the same reason the fullscreen branch above is — asking a
+        // theme to describe chrome that is not drawn produces a layout
+        // every consumer would then have to second-guess.
+        if client.chrome == ClientChrome::Bare {
+            let mut content = client.geometry;
+            let anchor = Point::new(
+                content.pos.x + content.size.w as i32 / 2,
+                content.pos.y + content.size.h as i32 / 2,
+            );
+            content.pos = self.below_top_reservation(content.pos, anchor);
+            let window = client.window;
+            let layout = frameless_layout(content.size);
+            self.backend.position_client(window, content.pos);
+            self.apply_client_size(window, content.size, reason);
+            if let Some(client) = self.clients.get_mut(id) {
+                client.layout = layout;
+                client.geometry = content;
+            }
+            self.publish_frame_extents(id);
+            return;
+        }
+        let request = Self::decoration_request(client, None);
+        let scale = self.client_decoration_scale(id);
+        let layout = self.chrome_layout(client.chrome, &request, scale);
+        if matches!(reason, ReflowReason::Restore(Some(saved)) if saved != TitleMetrics::of(&layout)) {
+            let mut directions = MaximizeDirections::empty();
+            directions.set(MaximizeDirections::HORIZONTAL, client.flags.contains(ClientFlags::MAXIMIZED_H));
+            directions.set(MaximizeDirections::VERTICAL, client.flags.contains(ClientFlags::MAXIMIZED_V));
+            if !directions.is_empty() {
+                // Fullscreen may have hidden a maximized frame throughout a
+                // scale change. Refit its locked axes with the new overhead
+                // before the single configure, retaining free-axis size and
+                // the original pre-maximize restore rectangle.
+                self.refit_maximized_chrome(id, layout, directions, true);
+                return;
+            }
+        }
+        // Shaded windows show only the titlebar — the frame's *visible*
+        // height is overridden to `shaded_frame_height`, but the client's
+        // own content geometry (and everything the theme computed from
+        // it) is left completely untouched, so unshading is exact.
+        let shaded = client.flags.contains(ClientFlags::SHADED);
+        let frame_height = if shaded {
+            layout.shaded_frame_height
+        } else {
+            layout.frame_size.h
+        };
+        let mut frame_geom = Rect {
+            pos: Point::new(
+                client.geometry.pos.x - layout.client_offset.x,
+                client.geometry.pos.y - layout.client_offset.y,
+            ),
+            size: Size::new(layout.frame_size.w, frame_height),
+        };
+        let anchor = Point::new(
+            frame_geom.pos.x + frame_geom.size.w as i32 / 2,
+            frame_geom.pos.y + frame_geom.size.h as i32 / 2,
+        );
+        let margin = layout.input_margin as i32;
+        let mut visual_pos = self.below_top_reservation(Point::new(frame_geom.pos.x + margin, frame_geom.pos.y + margin), anchor);
+        let rescue_title = match reason {
+            ReflowReason::Geometry | ReflowReason::ClientCommit => false,
+            ReflowReason::Restyle => client.layout != layout,
+            ReflowReason::Restore(saved) => saved.is_some_and(|saved| saved != TitleMetrics::of(&layout)),
+        };
+        if rescue_title && layout.titlebar_height > 0 {
+            // Keep the client anchor whenever the replacement title remains
+            // reachable. A larger scale/title can otherwise put every control
+            // above the output while leaving the client perfectly visible.
+            // Only the title must fit: a long client body may still extend
+            // below the workarea, and ordinary user moves retain their policy.
+            let title = Size::new(layout.visual_bounds().size.w, layout.titlebar_height);
+            visual_pos = placement::clamp_to(self.usable_area_at(anchor), title, visual_pos);
+        }
+        frame_geom.pos = Point::new(visual_pos.x - margin, visual_pos.y - margin);
+        let window = client.window;
+        let content_size = client.geometry.size;
+        let frame = client.frame;
+
+        if let Some(frame) = frame {
+            self.backend.set_decoration_layout(frame, &layout);
+            self.backend.set_frame_geometry(frame, frame_geom);
+        }
+        self.backend.position_client(window, layout.client_offset);
+        self.apply_client_size(window, content_size, reason);
+
+        if let Some(client) = self.clients.get_mut(id) {
+            client.geometry.pos = Point::new(
+                frame_geom.pos.x + layout.client_offset.x,
+                frame_geom.pos.y + layout.client_offset.y,
+            );
+            client.layout = layout;
+        }
+        self.publish_frame_extents(id);
+        if frame.is_some() {
+            if self.interactive_drag_client() == Some(id) {
+                self.pending_decorations.insert(id);
+            } else {
+                self.paint_decoration_now(id);
+            }
+        }
+    }
+
+    /// Grows `id` to fill the usable screen area along `directions`,
+    /// remembering its current geometry (the first time it's maximized
+    /// in either axis) so `unmaximize` can restore it. No titlebar button
+    /// triggers this — see `MaximizeDirections`'s doc comment.
+    pub fn maximize(&mut self, id: ClientId, directions: MaximizeDirections) {
+        self.release_evacuated_home(id);
+        self.cancel_client_layout_interaction(id);
+        self.fit_maximized(id, directions);
+        self.reflow_client_workspace(id);
+        tracing::info!(?id, ?directions, "maximized");
+    }
+
+    /// The maximized axes new chrome must keep filling: none while
+    /// fullscreen or a shade has the window.
+    fn maximize_directions(client: &Client<B>) -> MaximizeDirections {
+        let mut directions = MaximizeDirections::empty();
+        if !client.flags.intersects(ClientFlags::FULLSCREEN | ClientFlags::SHADED) {
+            if client.flags.contains(ClientFlags::MAXIMIZED_H) { directions |= MaximizeDirections::HORIZONTAL; }
+            if client.flags.contains(ClientFlags::MAXIMIZED_V) { directions |= MaximizeDirections::VERTICAL; }
+        }
+        directions
+    }
+
+    /// Measure new chrome before maximizing, rescuing only an unlocked axis.
+    /// Shared by live restyle, a chrome change and a changed-chrome
+    /// fullscreen restoration.
+    fn refit_maximized_chrome(&mut self, id: ClientId, layout: DecorationLayout, directions: MaximizeDirections, rescue_title: bool) {
+        let mut content_pos = self.clients[id].geometry.pos;
+        if rescue_title && layout.titlebar_height > 0 {
+            let visual = Point::new(content_pos.x - layout.client_offset.x + layout.input_margin as i32,
+                content_pos.y - layout.client_offset.y + layout.input_margin as i32);
+            let anchor = self.client_frame_center(id).unwrap_or(content_pos);
+            let rescued = placement::clamp_to(self.usable_area_at(anchor),
+                Size::new(layout.visual_bounds().size.w, layout.titlebar_height), visual);
+            if !directions.contains(MaximizeDirections::HORIZONTAL) { content_pos.x += rescued.x - visual.x; }
+            if !directions.contains(MaximizeDirections::VERTICAL) { content_pos.y += rescued.y - visual.y; }
+        }
+        self.clients[id].geometry.pos = content_pos;
+        self.clients[id].layout = layout;
+        self.fit_maximized(id, directions);
+    }
+
+    /// `maximize` without the announcement — shared with the workarea
+    /// refit, where one bar coming up would otherwise log a maximize
+    /// per window as if the user had asked for each.
+    fn fit_maximized(&mut self, id: ClientId, directions: MaximizeDirections) {
+        if self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::FULLSCREEN)) {
+            // Maximize changes the state underneath fullscreen. Derive its
+            // chrome and workarea geometry from that state, then keep the
+            // visible presentation fullscreen. The backend coalesces these
+            // staged sizes into the operation's final configure.
+            let saved_title = self.restore_title_metrics.get(&(id, RestoreKind::Fullscreen)).copied();
+            let had_restore = self.clients[id].restore_geometry.is_some();
+            let client = &mut self.clients[id];
+            client.flags.remove(ClientFlags::FULLSCREEN);
+            if let Some(saved) = self.fullscreen_restore.get(&id) {
+                client.geometry = *saved;
+            }
+            self.reflow_frame(id);
+            self.fit_maximized(id, directions);
+            if !had_restore {
+                // The new maximize snapshot came from the pre-fullscreen
+                // rectangle, which can predate the now-current chrome.
+                self.restore_title_metrics.remove(&(id, RestoreKind::Maximized));
+                if let Some(saved) = saved_title {
+                    self.restore_title_metrics.insert((id, RestoreKind::Maximized), saved);
+                }
+            }
+            self.fullscreen_restore.insert(id, self.clients[id].geometry);
+            // A partial maximize leaves one axis of the pre-fullscreen
+            // rectangle intact. That free axis still belongs to its original
+            // title metrics, so leaving fullscreen may need to rescue it.
+            let fullscreen_title = if directions == MaximizeDirections::FULL {
+                Some(TitleMetrics::of(&self.clients[id].layout))
+            } else {
+                saved_title
+            };
+            self.restore_title_metrics.remove(&(id, RestoreKind::Fullscreen));
+            if let Some(saved) = fullscreen_title {
+                self.restore_title_metrics.insert((id, RestoreKind::Fullscreen), saved);
+            }
+            self.clients[id].flags.insert(ClientFlags::FULLSCREEN);
+            self.reflow_frame(id);
+            self.publish_client_net_state(id);
+            return;
+        }
+        // The window's *own* monitor, not the primary: a window dragged
+        // onto the second head must maximize there. Same frame-center
+        // rule fullscreen picks its monitor by (`client_frame_center`),
+        // but through that monitor's workarea rather than its raw rect
+        // — maximize respects the shell's reserved strip, fullscreen
+        // deliberately does not.
+        let index = self.client_output_index(id);
+        let usable = self
+            .workareas
+            .get(index)
+            .copied()
+            .or_else(|| self.backend.monitors_ref().get(index).map(|m| m.geometry))
+            .unwrap_or(NO_MONITOR_FALLBACK);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        let before_geometry = client.geometry;
+        let before_flags = client.flags;
+
+        if client.restore_geometry.is_none() {
+            client.restore_geometry = Some(client.geometry);
+            self.restore_title_metrics.insert((id, RestoreKind::Maximized), TitleMetrics::of(&client.layout));
+        }
+
+        // Overhead (border/titlebar/resize-bar chrome) is constant
+        // regardless of content size for this theme, so the client's own
+        // currently-cached layout already tells us how much of the
+        // usable area's edge-to-edge size is *not* content.
+        let overhead_w = client.layout.visual_bounds().size.w.saturating_sub(client.geometry.size.w);
+        let overhead_h = client.layout.visual_bounds().size.h.saturating_sub(client.geometry.size.h);
+
+        if directions.contains(MaximizeDirections::HORIZONTAL) {
+            client.geometry.pos.x = usable.pos.x + client.layout.client_offset.x - client.layout.input_margin as i32;
+            client.geometry.size.w = usable.size.w.saturating_sub(overhead_w);
+            client.flags.insert(ClientFlags::MAXIMIZED_H);
+        }
+        if directions.contains(MaximizeDirections::VERTICAL) {
+            client.geometry.pos.y = usable.pos.y + client.layout.client_offset.y - client.layout.input_margin as i32;
+            client.geometry.size.h = usable.size.h.saturating_sub(overhead_h);
+            client.flags.insert(ClientFlags::MAXIMIZED_V);
+        }
+
+        let changed = client.geometry != before_geometry || client.flags != before_flags;
+        if changed {
+            self.bump_protocol_state_revision();
+        }
+        self.reflow_frame(id);
+        self.publish_client_net_state(id);
+    }
+
+    /// Restores the geometry saved by the most recent `maximize` call, if
+    /// any (a no-op on an already-unmaximized client).
+    pub fn unmaximize(&mut self, id: ClientId) {
+        self.cancel_client_layout_interaction(id);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        let Some(restore) = client.restore_geometry.take() else {
+            return;
+        };
+        let saved_title = self.restore_title_metrics.remove(&(id, RestoreKind::Maximized));
+        if client.flags.contains(ClientFlags::FULLSCREEN) {
+            self.fullscreen_restore.insert(id, restore);
+            self.restore_title_metrics.remove(&(id, RestoreKind::Fullscreen));
+            if let Some(saved) = saved_title {
+                self.restore_title_metrics.insert((id, RestoreKind::Fullscreen), saved);
+            }
+        } else {
+            client.geometry = restore;
+        }
+        client.flags.remove(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V);
+        self.bump_protocol_state_revision();
+        self.reflow_frame_internal(id, ReflowReason::Restore(saved_title));
+        self.publish_client_net_state(id);
+        self.reflow_client_workspace(id);
+        tracing::info!(?id, "unmaximized");
+    }
+
+    /// Maximizes along `directions` if not already exactly in that state,
+    /// otherwise restores. Always restores to the *original* (pre-any-
+    /// maximize) geometry first when switching between direction
+    /// combinations, so e.g. toggling from full-maximize to
+    /// vertical-only-maximize starts from a clean slate rather than
+    /// compounding — simpler to reason about than XOR-based incremental
+    /// toggling, at the cost of not preserving an in-progress partial
+    /// state across a direction change.
+    pub fn toggle_maximize(&mut self, id: ClientId, directions: MaximizeDirections) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let mut current = MaximizeDirections::empty();
+        if client.flags.contains(ClientFlags::MAXIMIZED_H) {
+            current |= MaximizeDirections::HORIZONTAL;
+        }
+        if client.flags.contains(ClientFlags::MAXIMIZED_V) {
+            current |= MaximizeDirections::VERTICAL;
+        }
+
+        if current == directions {
+            self.unmaximize(id);
+            return;
+        }
+        if !current.is_empty() {
+            self.unmaximize(id);
+        }
+        self.maximize(id, directions);
+    }
+
+    /// Flips full (both-axes) maximization — the config-driven
+    /// keybinding entry point, so the binary never needs to know
+    /// `MaximizeDirections` exists just to bind one key. Exactly
+    /// `toggle_maximize` with `MaximizeDirections::FULL`: the client's
+    /// current `MAXIMIZED_H`/`MAXIMIZED_V` flags decide whether this
+    /// maximizes or restores, and a partially (one-axis) maximized
+    /// window goes to full first rather than restoring, per
+    /// `toggle_maximize`'s clean-slate semantics. A no-op for an
+    /// unknown/stale `id`.
+    pub fn toggle_maximize_full(&mut self, id: ClientId) {
+        self.toggle_maximize(id, MaximizeDirections::FULL);
+    }
+
+    /// Rolls a client up to just its titlebar (the classic "shade") —
+    /// the content window is hidden (not resized to nothing; the window
+    /// is genuinely unmapped) but its geometry is left completely
+    /// untouched, so `unshade` restores exactly. A no-op if already
+    /// shaded.
+    pub fn shade(&mut self, id: ClientId) {
+        self.cancel_client_layout_interaction(id);
+        if self.is_layout_managed(id) && self.clients[id].chrome == ClientChrome::Full {
+            self.set_floating(id, true);
+        }
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if client.flags.contains(ClientFlags::SHADED) {
+            return;
+        }
+        // Shading rolls a window up *into its titlebar*, and a
+        // client-decorated window has none of ours to roll into. Doing
+        // it anyway unmapped the content and left nothing on screen at
+        // all: `reflow_frame` returns early for this kind of window,
+        // before it ever reaches the shaded-frame branch, so the
+        // renderer and the hit-test both skipped it and the window
+        // became invisible and unclickable — recoverable only through
+        // Alt+Tab or the Overview, neither of which is where a user
+        // looks for a window they just watched vanish. Refusing is the
+        // honest answer: there is no titlebar to leave behind.
+        // An edge frame is refused for the same reason, one step removed:
+        // the only titlebar it has is the client's, and that is part of
+        // the content shading would hide.
+        if client.chrome != ClientChrome::Full {
+            tracing::debug!(
+                ?id,
+                chrome = ?client.chrome,
+                "shade refused: this window wears no titlebar of ours to roll up into"
+            );
+            return;
+        }
+        // Same refusal, same reason, one state over: a fullscreen
+        // window has no titlebar either. `reflow_frame`'s fullscreen
+        // branch runs before the shaded one and sets
+        // `titlebar_height: 0` with empty hitboxes, so shading here
+        // would unmap the content and leave the full-screen rectangle
+        // exactly where it was — the window's contents gone, no chrome
+        // to click, and no way back that is visible on screen.
+        //
+        // Fullscreen wins because it is the *client's* own state
+        // (`xdg_toplevel.set_fullscreen`, `_NET_WM_STATE_FULLSCREEN`)
+        // while shade is window-manager presentation — asked for by
+        // the user or, over EWMH, a pager, never needed by the
+        // application itself; the reverse guard is in `fullscreen`.
+        // Between them they keep the invariant the rest of the shade
+        // code assumes: SHADED implies a visible titlebar, and SHADED
+        // and FULLSCREEN are never both set.
+        if client.flags.contains(ClientFlags::FULLSCREEN) {
+            tracing::debug!(
+                ?id,
+                "shade refused: a fullscreen window has no titlebar to roll up into"
+            );
+            return;
+        }
+        client.flags.insert(ClientFlags::SHADED);
+        let window = client.window;
+        self.bump_protocol_state_revision();
+        self.backend.set_client_mapped(window, false);
+        self.reflow_frame(id);
+        self.publish_client_net_state(id);
+        tracing::info!(?id, "shaded");
+    }
+
+    /// Reverses `shade`. A no-op if not currently shaded.
+    pub fn unshade(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if !client.flags.contains(ClientFlags::SHADED) {
+            return;
+        }
+        client.flags.remove(ClientFlags::SHADED);
+        let window = client.window;
+        let content_size = client.geometry.size;
+        self.bump_protocol_state_revision();
+        self.backend.set_client_mapped(window, true);
+        self.reflow_frame(id);
+        // Nudge the client to repaint everything: X preserves no pixels
+        // across the unmap, and some clients (urxvt among them) repaint
+        // lazily enough on remap that stale buffer garbage stays
+        // visible until their next full redraw.
+        self.backend.refresh_client(window, content_size);
+        self.publish_client_net_state(id);
+        tracing::info!(?id, "unshaded");
+    }
+
+    pub fn toggle_shade(&mut self, id: ClientId) {
+        match self.clients.get(id) {
+            Some(client) if client.flags.contains(ClientFlags::SHADED) => self.unshade(id),
+            Some(_) => self.shade(id),
+            None => {}
+        }
+    }
+
+    /// The monitor a client should fullscreen onto: whichever one its
+    /// frame's center lands on (`monitor_index_at`'s nearest-monitor
+    /// rule covers a frame dragged mostly off every output), and the
+    /// primary for a client that no longer exists to have a center.
+    /// Note this is the raw monitor rect, deliberately not
+    /// `usable_area_at`: fullscreen covers the dock strip too — that's
+    /// the whole point of the state.
+    fn fullscreen_monitor_rect(&self, id: ClientId) -> Rect {
+        self.backend
+            .monitors_ref()
+            .get(self.client_output_index(id))
+            .map_or(NO_MONITOR_FALLBACK, |m| m.geometry)
+    }
+
+    /// Enters EWMH fullscreen: the frame becomes exactly the client's
+    /// monitor and the content fills it completely, no chrome (see
+    /// `reflow_frame`'s fullscreen branch). The pre-fullscreen content
+    /// geometry goes into `fullscreen_restore` — its own slot, separate
+    /// from `Client::restore_geometry`, so fullscreening a maximized
+    /// window comes back to the maximized rect and a later `unmaximize`
+    /// still finds its own pre-maximize snapshot intact. A no-op if
+    /// already fullscreen.
+    pub fn fullscreen(&mut self, id: ClientId) {
+        self.cancel_client_layout_interaction(id);
+        if !self.clients.get(id).is_some_and(|client| !client.flags.contains(ClientFlags::FULLSCREEN)) {
+            return;
+        }
+        self.release_evacuated_home(id);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        // A shaded window unshades on the way in, exactly as
+        // `handle_activate_request` does and for the same reason: the
+        // state being entered has no titlebar to roll up into, so the
+        // two flags cannot both stand. Fullscreen wins over shade here
+        // rather than being refused, because this path is reachable
+        // from a client request and refusing a client's
+        // `set_fullscreen` would be the worse answer.
+        //
+        // Unshade before entering fullscreen so its remap, refresh, and
+        // SHADED state publication all happen before the fullscreen
+        // reflow. Shading changes only the backend frame geometry, not
+        // `client.geometry`, so this ordering does not affect the restore
+        // rect stored below; it keeps the state transition itself clear.
+        if client.flags.contains(ClientFlags::SHADED) {
+            self.unshade(id);
+        }
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        self.fullscreen_restore.insert(id, client.geometry);
+        self.restore_title_metrics.insert((id, RestoreKind::Fullscreen), TitleMetrics::of(&client.layout));
+        client.flags.insert(ClientFlags::FULLSCREEN);
+        // The real state tells the client on its own; the client-only
+        // flag never stands beside it (see `set_fullscreen_state`).
+        client.flags.remove(ClientFlags::CLIENT_FULLSCREEN);
+        self.bump_protocol_state_revision();
+        self.reflow_frame(id);
+        // Raise on entering: fullscreen is a "take over the screen"
+        // request — a video player going fullscreen *behind* other
+        // windows would be useless.
+        self.raise_client(id);
+        self.publish_client_net_state(id);
+        self.reflow_client_workspace(id);
+        self.mac_enter_fullscreen(id);
+        tracing::info!(?id, "entered fullscreen");
+    }
+
+    /// Reverses `fullscreen`, restoring saved content geometry and recomputing
+    /// chrome. Changed title metrics may rescue an unreachable restored title;
+    /// unchanged chrome preserves the original anchor, including overlap.
+    /// A no-op if not currently fullscreen.
+    pub fn unfullscreen(&mut self, id: ClientId) {
+        self.cancel_client_layout_interaction(id);
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if !client.flags.contains(ClientFlags::FULLSCREEN) {
+            return;
+        }
+        client.flags.remove(ClientFlags::FULLSCREEN);
+        let saved_title = self.restore_title_metrics.remove(&(id, RestoreKind::Fullscreen));
+        if let Some(saved) = self.fullscreen_restore.remove(&id) {
+            if let Some(client) = self.clients.get_mut(id) {
+                client.geometry = saved;
+            }
+        }
+        self.bump_protocol_state_revision();
+        self.reflow_frame_internal(id, ReflowReason::Restore(saved_title));
+        self.publish_client_net_state(id);
+        self.reflow_client_workspace(id);
+        self.mac_leave_fullscreen(id);
+        tracing::info!(?id, "left fullscreen");
+    }
+
+    /// Flips fullscreen via the existing `fullscreen`/`unfullscreen`
+    /// pair — the config-driven keybinding entry point, routed through
+    /// the exact same toggle logic an EWMH `_NET_WM_STATE` Toggle
+    /// message takes (`apply_fullscreen_action`), so a bound key and a
+    /// pager can never disagree about what toggling means. A no-op for
+    /// an unknown/stale `id` (both halves of the pair already bail on
+    /// one).
+    pub fn toggle_fullscreen(&mut self, id: ClientId) {
+        self.apply_fullscreen_action(id, NetStateAction::Toggle);
+    }
+
+    /// Hyprland's two-axis fullscreen state of a client: what the
+    /// compositor does with the window, and what the window is told.
+    /// `None` for an unknown id.
+    ///
+    /// The internal axis is `Fullscreen` for `FULLSCREEN`, `Maximized`
+    /// when both maximize axes are set, else `None`; the client axis is
+    /// `Fullscreen` for `FULLSCREEN` or `CLIENT_FULLSCREEN`, otherwise
+    /// the same as the internal axis. This is the reading the Hyprland
+    /// IPC reports as `fullscreen` and `fullscreenClient`, so a script
+    /// branching on either sees the state the next request acts on.
+    pub fn fullscreen_state(&self, id: ClientId) -> Option<(FullscreenMode, FullscreenMode)> {
+        let client = self.clients.get(id)?;
+        let internal = if client.flags.contains(ClientFlags::FULLSCREEN) {
+            FullscreenMode::Fullscreen
+        } else if client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V) {
+            FullscreenMode::Maximized
+        } else {
+            FullscreenMode::None
+        };
+        let told = if client.flags.contains(ClientFlags::CLIENT_FULLSCREEN) {
+            FullscreenMode::Fullscreen
+        } else {
+            internal
+        };
+        Some((internal, told))
+    }
+
+    /// Sets Hyprland's two fullscreen axes independently: `internal` is
+    /// what the compositor does (real fullscreen, a full maximize, or
+    /// neither) and `client` what the window is told. The one
+    /// combination the flags model beyond the compositor's own states
+    /// is `(None | Maximized, Fullscreen)` — the client is told it is
+    /// fullscreen while its geometry, frame, stacking and layout cell
+    /// stay exactly as they are (`ClientFlags::CLIENT_FULLSCREEN`).
+    /// Omarchy's "tiled fullscreen" chord is `(None, Fullscreen)`.
+    ///
+    /// A `Maximized` client axis has nothing of its own to set: the
+    /// protocols' maximized state already follows the two maximize
+    /// flags. `internal == Fullscreen` tells the client by itself, so
+    /// the client-only flag is cleared rather than doubled.
+    ///
+    /// Client-only fullscreen changes no geometry and therefore causes
+    /// no reflow of the workspace, no raise, and no Spaces fullscreen
+    /// Space: only compositor fullscreen does those. A no-op for an
+    /// unknown id.
+    pub fn set_fullscreen_state(&mut self, id: ClientId, internal: FullscreenMode, client: FullscreenMode) {
+        if self.clients.get(id).is_none() {
+            return;
+        }
+        match internal {
+            FullscreenMode::Fullscreen => self.fullscreen(id),
+            FullscreenMode::Maximized => {
+                self.unfullscreen(id);
+                let current = self.clients.get(id).map_or(MaximizeDirections::empty(), Self::maximize_directions);
+                if current != MaximizeDirections::FULL {
+                    if !current.is_empty() {
+                        self.unmaximize(id);
+                    }
+                    self.maximize(id, MaximizeDirections::FULL);
+                }
+            }
+            FullscreenMode::None => {
+                self.unfullscreen(id);
+                self.unmaximize(id);
+            }
+        }
+        let told = client == FullscreenMode::Fullscreen && internal != FullscreenMode::Fullscreen;
+        self.set_client_fullscreen(id, told);
+    }
+
+    /// The `fullscreenstate` dispatcher's rule on top of
+    /// [`Self::set_fullscreen_state`]: asking for exactly the state the
+    /// window already has clears both axes instead. That is how
+    /// Hyprland makes a bound `fullscreenstate 0 2` a toggle, and it is
+    /// what a classic Omarchy binding of that dispatcher relies on;
+    /// Omarchy's own script reads `fullscreenClient` first and sends
+    /// `0 0` explicitly, which this rule leaves alone.
+    pub fn toggle_fullscreen_state(&mut self, id: ClientId, internal: FullscreenMode, client: FullscreenMode) {
+        let Some(current) = self.fullscreen_state(id) else {
+            return;
+        };
+        if current == (internal, client) {
+            self.set_fullscreen_state(id, FullscreenMode::None, FullscreenMode::None);
+        } else {
+            self.set_fullscreen_state(id, internal, client);
+        }
+    }
+
+    /// Flips `CLIENT_FULLSCREEN` and publishes the change, which is the
+    /// whole of its effect: the backend sends the client the protocol's
+    /// fullscreen state and nothing else about the window moves.
+    fn set_client_fullscreen(&mut self, id: ClientId, told: bool) {
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if client.flags.contains(ClientFlags::CLIENT_FULLSCREEN) == told {
+            return;
+        }
+        client.flags.set(ClientFlags::CLIENT_FULLSCREEN, told);
+        self.bump_protocol_state_revision();
+        self.publish_client_net_state(id);
+        tracing::info!(?id, told, "client-only fullscreen changed");
+    }
+
+    /// Unmaps a client family and records its minimized state. Alt-Tab or an
+    /// explicit activation restores it; no preview image is allocated.
+    pub fn miniaturize(&mut self, id: ClientId) {
+        self.cancel_client_layout_interaction(id);
+        for member in self.transient_family(id) {
+            self.miniaturize_one(member);
+        }
+    }
+
+    fn miniaturize_one(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        if client.lifecycle != Lifecycle::Normal {
+            return;
+        }
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        client.lifecycle = Lifecycle::Miniaturized;
+        self.bump_protocol_state_revision();
+        self.hide_client_surface(id);
+        // `lifecycle` is already `Miniaturized`, so `is_focusable`
+        // rejects this client and the successor search cannot pick it
+        // back up; `Some(id)` says so rather than relying on it.
+        self.focus_successor_of(id);
+        self.notifications.push_back(Notification::Miniaturized(id));
+        self.publish_client_net_state(id);
+        self.reflow_client_workspace(id);
+        tracing::info!(?id, "miniaturized");
+    }
+
+    pub fn deminiaturize(&mut self, id: ClientId) {
+        for member in self.transient_family(id) {
+            self.deminiaturize_one(member);
+        }
+    }
+
+    fn deminiaturize_one(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if client.lifecycle != Lifecycle::Miniaturized {
+            return;
+        }
+        client.lifecycle = Lifecycle::Normal;
+        let window = client.window;
+        let content_size = client.geometry.size;
+        self.bump_protocol_state_revision();
+        // A window restores onto the workspace the user is looking at,
+        // not the one it was miniaturized on. Icon tiles are visible on
+        // every workspace, so restoring from a different one is a
+        // normal gesture — and without this reassignment the window
+        // became a ghost: mapped over the current workspace but still
+        // *owned* by the old one, so it lingered there on the next
+        // switch back and vanished from here. (Moving *to* the current
+        // workspace never unmaps or drops focus — see
+        // `move_client_to_workspace` — so ordering against the map
+        // below doesn't matter; it's pure assignment plus the
+        // `_NET_WM_DESKTOP` republish pagers need.)
+        let current = self.current_workspace;
+        self.move_one_client_to_workspace(id, current);
+        self.show_client_surface(id);
+        // Same nudge unshade needs (see there): the client's own pixels
+        // weren't retained while unmapped either.
+        self.backend.refresh_client(window, content_size);
+        // Explicit, not left to an `Expose` reply: a window without
+        // backing-store (every frame here — `create_decoration` never
+        // requests it) isn't guaranteed by X11 to retain its pixel
+        // content while unmapped, so remapping after miniaturize can
+        // surface a blank/undefined frame until *something* repaints it.
+        // Painting it ourselves right here removes that dependency on
+        // Expose timing entirely instead of hoping one arrives.
+        self.repaint_decoration(id);
+        self.reflow_client_workspace(id);
+        self.notifications.push_back(Notification::Deminiaturized(id));
+        self.publish_client_net_state(id);
+        self.focus_client(id);
+    }
+
+    /// A pager, launcher, taskbar or application asked for this window
+    /// to be activated: `_NET_ACTIVE_WINDOW`, xdg-activation,
+    /// foreign-toplevel `activate`, IPC `focuswindow`.
+    /// Restored out of miniaturized/shaded and brought onto a visible
+    /// workspace first — "activate" means "show me this window", and
+    /// focusing one that's unmapped, rolled up or parked elsewhere would
+    /// visibly do nothing — then focused (which raises). Same
+    /// restore-before-focus order the Alt-Tab commit path uses.
+    fn handle_activate_request(&mut self, window: B::WindowId) {
+        self.activate_window(window, true);
+    }
+
+    /// Overview's commit. Activates the picked window exactly as
+    /// [`Self::handle_activate_request`] does, except that a shaded window
+    /// stays rolled up: Overview shows it as its titlebar strip, and
+    /// picking that strip focuses and raises it without unrolling it.
+    /// Unrolling remains the user's own shade gesture.
+    pub fn activate_from_overview(&mut self, window: B::WindowId) {
+        self.activate_window(window, false);
+    }
+
+    fn activate_window(&mut self, window: B::WindowId, unroll: bool) {
+        let Some(&id) = self.window_index.get(&window) else {
+            return;
+        };
+        if self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::NO_ACTIVATE)) {
+            tracing::debug!(?id, "window rule refused an activation focus request");
+            return;
+        }
+        // Behind a session lock the seat focus is parked anyway, but a
+        // workspace switch is not: the user would unlock onto a desktop
+        // they did not leave, with nothing to say why. Ask for attention
+        // instead, which the bar can show and the user can act on.
+        if self.backend.session_locked() && self.activation_changes_workspace(id) {
+            tracing::debug!(?id, "activation behind the session lock marked the window urgent");
+            self.set_urgent(id, true);
+            return;
+        }
+        self.reveal_application(id);
+        if self.clients.get(id).is_some_and(|c| c.lifecycle == Lifecycle::Miniaturized) {
+            self.deminiaturize(id);
+        }
+        if unroll && self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::SHADED)) {
+            self.unshade(id);
+        }
+        self.bring_workspace_into_view(id);
+        self.focus_client(id);
+    }
+
+    /// Whether showing the window an activation of `id` focuses — its
+    /// modal blocker, if one is open — means leaving the workspace on
+    /// screen.
+    fn activation_changes_workspace(&self, id: ClientId) -> bool {
+        let target = self.modal_blocker(id).unwrap_or(id);
+        self.clients.get(target).is_some_and(|client| !self.client_placed_on_screen(client))
+    }
+
+    /// Switches to the workspace holding the window that focusing `id`
+    /// will actually reach, when it is not already on screen.
+    ///
+    /// Desktop mode never had this step. Separate Spaces switches inside
+    /// `focus_client_with`, and single-row Spaces in `reveal_application`,
+    /// so by the time this runs there the workspace is already visible
+    /// and it does nothing. Pinned windows are on every workspace and
+    /// never cause a switch.
+    fn bring_workspace_into_view(&mut self, id: ClientId) {
+        let target = self.modal_blocker(id).unwrap_or(id);
+        let Some(client) = self.clients.get(target) else {
+            return;
+        };
+        if client.lifecycle != Lifecycle::Normal || self.client_placed_on_screen(client) {
+            return;
+        }
+        if let Some(index) = client.special {
+            // A hidden special member is activated by showing its
+            // overlay where the user is, not by switching workspace.
+            let output = self.active_output_index();
+            self.show_special_on_output(index, output);
+            return;
+        }
+        let workspace = client.workspace;
+        self.switch_workspace_to_focus(workspace, Some(target));
+    }
+
+    /// Closes `id` — the config-driven keybinding entry point, routed
+    /// through exactly the mechanism the titlebar close button's commit
+    /// and `_NET_CLOSE_WINDOW` (`handle_close_request`) use:
+    /// `Backend::send_close`, which does the ICCCM dance
+    /// (`WM_DELETE_WINDOW` when the client supports it, force-kill
+    /// otherwise). One shared mechanism means a bound key can never
+    /// disagree with the other two entry points about how a window
+    /// dies. A no-op for an unknown/stale `id`.
+    pub fn close_client(&mut self, id: ClientId) {
+        let target = self.modal_blocker(id).unwrap_or(id);
+        let Some(client) = self.clients.get(target) else {
+            return;
+        };
+        self.backend.send_close(client.window);
+    }
+
+    /// Force-kills `id`'s client connection — the window menu's "Kill"
+    /// entry, for an application that hangs and stops answering the
+    /// polite `WM_DELETE_WINDOW` close. Deliberately a separate verb
+    /// from `close_client`: closing asks, killing doesn't, and a menu
+    /// should never quietly escalate one into the other.
+    pub fn kill_client(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        self.backend.kill_client(client.window);
+    }
+
+    /// `_NET_CLOSE_WINDOW`: identical to the titlebar close button's
+    /// commit — `Backend::send_close` does the ICCCM dance
+    /// (`WM_DELETE_WINDOW` when supported, force-kill otherwise), so
+    /// both paths can never disagree about how a window dies.
+    fn handle_close_request(&mut self, window: B::WindowId) {
+        if let Some(&id) = self.window_index.get(&window) {
+            self.close_client(id);
+        }
+    }
+
+    /// `_NET_WM_STATE`: applies `action` to the (up to two) states in
+    /// the message. Fullscreen is handled per-state; the two maximize
+    /// properties are collected and applied as one `MaximizeDirections`
+    /// set, because pagers conventionally send horz+vert together as a
+    /// single "maximize" — applying them one at a time through the
+    /// clean-slate maximize machinery would snapshot the intermediate
+    /// half-maximized geometry as the restore point.
+    fn handle_net_state_request(
+        &mut self,
+        window: B::WindowId,
+        action: NetStateAction,
+        first: NetState,
+        second: Option<NetState>,
+    ) {
+        let Some(&id) = self.window_index.get(&window) else {
+            return;
+        };
+        let flags = self.clients.get(id).map_or(ClientFlags::empty(), |client| client.flags);
+        let mut maximize_directions = MaximizeDirections::empty();
+        let mut suppressed = false;
+        for state in [Some(first), second].into_iter().flatten() {
+            match state {
+                NetState::Fullscreen
+                    if flags.contains(ClientFlags::SUPPRESS_FULLSCREEN)
+                        && request_enters(action, flags.contains(ClientFlags::FULLSCREEN)) =>
+                {
+                    tracing::debug!(?id, "window rule suppressed a client fullscreen request");
+                    suppressed = true;
+                }
+                NetState::Fullscreen => self.apply_fullscreen_action(id, action),
+                NetState::MaximizedHorz => maximize_directions |= MaximizeDirections::HORIZONTAL,
+                NetState::MaximizedVert => maximize_directions |= MaximizeDirections::VERTICAL,
+                NetState::Pinned => self.apply_pin_action(id, action),
+                NetState::DemandsAttention => self.apply_attention_action(id, action),
+                NetState::Modal => self.apply_modal_action(id, action),
+                NetState::Shaded => self.apply_shade_action(id, action),
+            }
+        }
+        if !maximize_directions.is_empty() {
+            let mut current = MaximizeDirections::empty();
+            if flags.contains(ClientFlags::MAXIMIZED_H) {
+                current |= MaximizeDirections::HORIZONTAL;
+            }
+            if flags.contains(ClientFlags::MAXIMIZED_V) {
+                current |= MaximizeDirections::VERTICAL;
+            }
+            if flags.contains(ClientFlags::SUPPRESS_MAXIMIZE)
+                && request_enters(action, current.contains(maximize_directions))
+            {
+                tracing::debug!(?id, "window rule suppressed a client maximize request");
+                suppressed = true;
+            } else {
+                self.apply_maximize_action(id, action, maximize_directions);
+            }
+        }
+        // A refusal is still an answer: republish the unchanged state, so
+        // an X11 client's `_NET_WM_STATE` does not keep the state it asked
+        // for, and a Wayland client's owed configure describes the truth.
+        if suppressed {
+            self.publish_client_net_state(id);
+        }
+    }
+
+    /// `_NET_WM_STATE_ABOVE` / `_NET_WM_STATE_STICKY` from a client.
+    ///
+    /// Gated on the same `NO_ACTIVATE` rule the activation path checks:
+    /// pinning is stacking-adjacent — a pinned window sits above
+    /// ordinary ones on every workspace — so a window a rule has
+    /// excused from grabbing attention must not be able to take the top
+    /// of every workspace by asking for it instead.
+    fn apply_pin_action(&mut self, id: ClientId, action: NetStateAction) {
+        if self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::NO_ACTIVATE)) {
+            tracing::debug!(?id, "window rule refused a client's pin request");
+            return;
+        }
+        let currently = self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::STICKY));
+        let target = match action {
+            NetStateAction::Add => true,
+            NetStateAction::Remove => false,
+            NetStateAction::Toggle => !currently,
+        };
+        self.set_client_pinned(id, target);
+    }
+
+    /// `_NET_WM_STATE_DEMANDS_ATTENTION`, and the `WM_HINTS` urgency
+    /// bit that reaches the same place. `set_urgent` is idempotent, so
+    /// Add/Remove need no guard of their own.
+    fn apply_attention_action(&mut self, id: ClientId, action: NetStateAction) {
+        let currently = self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::URGENT));
+        let target = match action {
+            NetStateAction::Add => true,
+            NetStateAction::Remove => false,
+            NetStateAction::Toggle => !currently,
+        };
+        self.set_urgent(id, target);
+    }
+
+    /// `_NET_WM_STATE_SHADED` from a client or pager. `shade` and
+    /// `unshade` are no-ops in their target state and keep their own
+    /// refusals, so all this decides is which of the three to call.
+    fn apply_shade_action(&mut self, id: ClientId, action: NetStateAction) {
+        match action {
+            NetStateAction::Add => self.shade(id),
+            NetStateAction::Remove => self.unshade(id),
+            NetStateAction::Toggle => self.toggle_shade(id),
+        }
+    }
+
+    fn apply_modal_action(&mut self, id: ClientId, action: NetStateAction) {
+        let currently = self
+            .clients
+            .get(id)
+            .is_some_and(|client| client.flags.contains(ClientFlags::MODAL));
+        let target = match action {
+            NetStateAction::Add => true,
+            NetStateAction::Remove => false,
+            NetStateAction::Toggle => !currently,
+        };
+        let Some(window) = self.clients.get(id).map(|client| client.window) else {
+            return;
+        };
+        self.handle_modal_changed(window, target);
+    }
+
+    fn apply_fullscreen_action(&mut self, id: ClientId, action: NetStateAction) {
+        let currently = self.clients.get(id).is_some_and(|c| c.flags.contains(ClientFlags::FULLSCREEN));
+        let target = match action {
+            NetStateAction::Add => true,
+            NetStateAction::Remove => false,
+            NetStateAction::Toggle => !currently,
+        };
+        // `fullscreen`/`unfullscreen` are no-ops when already in the
+        // target state, so Add/Remove are naturally idempotent.
+        if target {
+            self.fullscreen(id);
+        } else {
+            self.unfullscreen(id);
+            // A window told it is fullscreen in its tile leaves that
+            // state the same way a real one does: its own
+            // `unset_fullscreen` (a browser's Escape) is honoured, and
+            // the answer says so. `unfullscreen` above was a no-op for
+            // it, so the flag is retired here.
+            self.set_client_fullscreen(id, false);
+        }
+    }
+
+    /// Maps an EWMH maximize action onto the existing maximize
+    /// machinery: the target direction set is computed from the client's
+    /// current `MAXIMIZED_H`/`MAXIMIZED_V` flags per Remove/Add/Toggle
+    /// semantics, then reached the way `toggle_maximize` does — a full
+    /// restore to the original geometry first when the direction set
+    /// changes — so the EWMH path and the titlebar double-click path can
+    /// never disagree about what "maximized" means.
+    fn apply_maximize_action(&mut self, id: ClientId, action: NetStateAction, directions: MaximizeDirections) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let mut current = MaximizeDirections::empty();
+        if client.flags.contains(ClientFlags::MAXIMIZED_H) {
+            current |= MaximizeDirections::HORIZONTAL;
+        }
+        if client.flags.contains(ClientFlags::MAXIMIZED_V) {
+            current |= MaximizeDirections::VERTICAL;
+        }
+        let target = match action {
+            NetStateAction::Add => current | directions,
+            NetStateAction::Remove => current - directions,
+            NetStateAction::Toggle => current ^ directions,
+        };
+        if target == current {
+            return;
+        }
+        if target.is_empty() {
+            self.unmaximize(id);
+            return;
+        }
+        if !current.is_empty() {
+            self.unmaximize(id);
+        }
+        self.maximize(id, target);
+    }
+
+    /// Only the modal Alt+Tab machinery reacts to key presses here —
+    /// every other grabbed combo reaches the binary through this same
+    /// `BackendEvent::KeyPress` and is matched against user config
+    /// there (see `bind_default_keys` for why the line is drawn where
+    /// it is).
+    fn handle_key_press(&mut self, combo: KeyCombo) {
+        match combo.keysym {
+            XK_TAB if self.cycle.as_ref().is_none_or(|cycle| !cycle.applications) => {
+                if combo.modifiers.contains(Modifiers::SHIFT) {
+                    self.cycle_step(-1);
+                } else if combo.modifiers.contains(Modifiers::ALT) {
+                    self.cycle_step(1);
+                }
+            }
+            XK_ESCAPE if self.interactive_drag_active() => self.end_active_drag(),
+            XK_ESCAPE if self.cycle.is_some() => self.cycle_end(false),
+            // Any other key without Alt held means the Alt release was
+            // lost (it can slip into the gap before the modal keyboard
+            // grab activates) — commit rather than leaving the panel
+            // stuck on screen.
+            _ if self.cycle.as_ref().is_some_and(|cycle| !combo.modifiers.contains(cycle.modifier)) => self.cycle_end(true),
+            _ => {}
+        }
+    }
+
+    fn handle_key_release(&mut self, combo: KeyCombo) {
+        if self.cycle.as_ref().is_some_and(|cycle| {
+            if cycle.modifier == Modifiers::SUPER {
+                matches!(combo.keysym, 0xffeb | 0xffec) && !combo.modifiers.contains(Modifiers::SUPER)
+            } else { matches!(combo.keysym, XK_ALT_L | XK_ALT_R) }
+        }) {
+            self.cycle_end(true);
+        }
+    }
+
+    /// Alt+Tab / Alt+Shift+Tab window switching, modal like the classic
+    /// switch panel: the first press opens a session (snapshotting the
+    /// candidates and grabbing the keyboard so the Alt release is
+    /// visible), every further Tab moves the selection, and nothing is
+    /// focused or raised until the session commits —
+    /// `Notification::CycleUpdated` tells the shell to draw its panel
+    /// in the meantime. Candidates are focusable clients in
+    /// most-recently-used order, followed by any that have never held
+    /// focus. That order is stable for the session because it is
+    /// snapshotted (and pruned on client destruction). The workspace
+    /// restriction matters: a client parked on another workspace is
+    /// `Lifecycle::Normal` but its frame is unmapped — cycling onto it
+    /// set input focus on an invisible window, and nothing visibly
+    /// happened.
+    fn cycle_step(&mut self, direction: i32) {
+        if self.cycle.is_none() {
+            // Most-recently-focused first, so index 0 is the window the
+            // user is in and index 1 is the one they were in before it.
+            // This used to be storage order: Alt-Tab was a fixed ring
+            // unrelated to which windows the user had just visited.
+            let order = self.ordered_clients(|id| self.is_switchable(id));
+            if order.is_empty() {
+                return;
+            }
+            // Start one step in rather than on the focused window. A
+            // single Tab is the flip-to-the-last-window gesture, which
+            // is what the key is mostly for; without this the first
+            // press selected the window already focused and committed
+            // to a no-op. `direction` is applied below, so starting at
+            // index 0 makes forward reach the previous window and
+            // backward wrap to the oldest candidate.
+            let selected = if self.focused.is_some() { 0 } else if direction > 0 { order.len() - 1 } else { 0 };
+            self.backend.grab_keyboard();
+            self.cycle = Some(CycleSession { order, selected, modifier: Modifiers::ALT, applications: false });
+        }
+        let session = self.cycle.as_mut().expect("session exists or was just created");
+        session.selected = (session.selected as i32 + direction).rem_euclid(session.order.len() as i32) as usize;
+        self.notifications.push_back(Notification::CycleUpdated);
+    }
+
+    /// Ends the switcher session; `commit` focuses and raises the
+    /// selected client (Alt released), `!commit` leaves focus exactly
+    /// where it was (Escape).
+    fn cycle_end(&mut self, commit: bool) {
+        let Some(session) = self.cycle.take() else {
+            return;
+        };
+        self.backend.ungrab_keyboard();
+        if commit {
+            if let Some(&id) = session.order.get(session.selected) {
+                if session.applications { self.reveal_application(id); }
+                if self.clients.get(id).is_some_and(|c| c.lifecycle == Lifecycle::Miniaturized) {
+                    self.deminiaturize(id);
+                }
+                // The application switcher offers windows from every
+                // workspace, and outside Spaces `reveal_application`
+                // does not switch; the window-order switcher's own
+                // candidates are already on screen, so this is a no-op
+                // for it.
+                self.bring_workspace_into_view(id);
+                if let Some(client) = self.clients.get(id) {
+                    let window = client.window;
+                    let content_size = client.geometry.size;
+                    // Switching to a rolled-up window means "show me
+                    // that window", so the commit unshades. Without
+                    // this, committing to a shaded client set input
+                    // focus on an *unmapped* window and nothing visibly
+                    // happened.
+                    self.unshade(id);
+                    self.focus_client(id);
+                    // Repaint nudge after the raise: the session
+                    // compositor (picom xrender on the reference VM)
+                    // does not reliably refresh a window's region on a
+                    // bare restack — the raised window kept showing
+                    // whatever previously covered it until some later
+                    // damage arrived (a drag "repaired" it, confirmed
+                    // live). A full-window redraw from the client is
+                    // exactly that damage.
+                    self.backend.refresh_client(window, content_size);
+                }
+            }
+        }
+        self.notifications.push_back(Notification::CycleEnded);
+    }
+
+    /// Whether Alt+Tab owns a modal session, without allocating a UI snapshot.
+    pub fn cycle_active(&self) -> bool {
+        self.cycle.is_some()
+    }
+
+    /// The live switcher session for the shell's panel: `(candidates
+    /// as (id, title), selected index)`, `None` when no session is active.
+    pub fn cycle_state(&self) -> Option<(Vec<(ClientId, String)>, usize)> {
+        let session = self.cycle.as_ref()?;
+        let entries = session
+            .order
+            .iter()
+            .map(|&id| (id, if session.applications { self.application_key(id) }
+                else { self.clients.get(id).map(|c| c.title.clone()).unwrap_or_default() }))
+            .collect();
+        Some((entries, session.selected))
+    }
+
+    /// A live thumbnail of a client's current content for the switcher
+    /// panel — captured only while this transient UI needs a preview.
+    pub fn client_preview(&self, id: ClientId) -> Option<DecorationBuffer> {
+        let client = self.clients.get(id)?;
+        self.backend.capture_window_image(client.window, client.geometry.size)
+    }
+
+    /// Drops the maximized state without moving the window: it is
+    /// already exactly where the user is putting it, so there is nothing
+    /// to restore *to* and `restore_geometry` goes with the flags. The
+    /// counterpart to `unmaximize`, which restores geometry precisely
+    /// because the user did not choose the current position.
+    fn break_maximize(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        if !client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V) {
+            return;
+        }
+        client.flags.remove(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V);
+        client.restore_geometry = None;
+        self.restore_title_metrics.remove(&(id, RestoreKind::Maximized));
+        self.bump_protocol_state_revision();
+        self.publish_client_net_state(id);
+        tracing::debug!(?id, "drag broke the maximized state");
+    }
+
+    /// Root followed by its transient descendants, parent before child.
+    /// Both depth and membership are bounded so hostile parent cycles
+    /// cannot turn a lifecycle gesture into an unbounded walk.
+    fn transient_family(&self, root: ClientId) -> Vec<ClientId> {
+        const MAX_TRANSIENT_DEPTH: usize = 8;
+        let mut children_by_parent: HashMap<ClientId, Vec<ClientId>> = HashMap::new();
+        for (id, client) in &self.clients {
+            if let Some(parent) = client.parent {
+                children_by_parent.entry(parent).or_default().push(id);
+            }
+        }
+        let mut family = vec![root];
+        let mut seen = HashSet::from([root]);
+        let mut level = vec![root];
+        for _ in 0..MAX_TRANSIENT_DEPTH {
+            let mut next = Vec::new();
+            for parent in level {
+                for &id in children_by_parent.get(&parent).into_iter().flatten() {
+                    if seen.insert(id) {
+                        family.push(id);
+                        next.push(id);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            level = next;
+        }
+        family
+    }
+
+    /// Topmost live modal descendant that blocks `id`, if any.
+    fn modal_blocker(&self, id: ClientId) -> Option<ClientId> {
+        let family = self.transient_family(id);
+        self.managed_order.iter().rev().find_map(|window| {
+            let candidate = self.window_index.get(window).copied()?;
+            (candidate != id
+                && family.contains(&candidate)
+                && self.clients.get(candidate).is_some_and(|client| {
+                    client.lifecycle == Lifecycle::Normal
+                        && client.flags.contains(ClientFlags::MODAL)
+                }))
+            .then_some(candidate)
+        })
+    }
+
+    /// Focus `id` and bring it to the front — what a click means, and
+    /// what every caller that is not a bare pointer crossing wants.
+    fn focus_client(&mut self, id: ClientId) {
+        self.focus_client_with(id, true);
+    }
+
+    /// Focus `id`, raising it only if `raise`.
+    ///
+    /// The raise used to be welded in here, which made "focus this
+    /// window" and "put this window on top" the same verb and left
+    /// focus-follows-mouse restacking the desktop as the pointer merely
+    /// crossed it. Splitting them costs one parameter and leaves every
+    /// existing caller bit-identical through [`Self::focus_client`].
+    fn focus_client_with(&mut self, id: ClientId, raise: bool) {
+        let id = self.modal_blocker(id).unwrap_or(id);
+        if self.mac_client_hidden(id) { return; }
+        if self
+            .clients
+            .get(id)
+            .is_some_and(|client| client.flags.contains(ClientFlags::NO_FOCUS))
+        {
+            tracing::debug!(?id, "window rule refused focus");
+            return;
+        }
+        if self.separate_spaces() {
+            // A special member is shown by its overlay, not by a Space.
+            if let Some(client) = self.clients.get(id).filter(|client| client.special.is_none()) {
+                let workspace = client.workspace;
+                if !client.flags.contains(ClientFlags::STICKY) && !self.workspace_visible(workspace) {
+                    self.switch_workspace(workspace);
+                }
+                self.select_space_output(workspace);
+            }
+        }
+        // Keyboard focus follows what is on screen, never the other way
+        // round. A window parked on a hidden workspace, or miniaturized,
+        // used to take focus here without anything showing it: the bar
+        // named it as the active window and the user's next keystrokes
+        // went into an application they could not see. Every caller with
+        // a legitimate reason to focus such a window shows it first, the
+        // way `handle_activate_request` and session restore do.
+        if self.clients.get(id).is_some_and(|client| !self.client_on_screen(client)) {
+            tracing::debug!(?id, "refused focus for a window that is not on screen");
+            return;
+        }
+        if self.focused == Some(id) {
+            // Re-assert input focus rather than assume it landed. This
+            // early return is the path a user takes to *repair* focus —
+            // they click the window that already looks focused — so it
+            // is the one place that must not trust `self.focused`. The
+            // two can genuinely disagree: a Wayland window focused
+            // before its `wl_surface` existed, an X11 focus the server
+            // refused. Both backends treat an unchanged focus as a
+            // no-op (Smithay short-circuits it outright), so this is
+            // free whenever they already agree.
+            if let Some(window) = self.clients.get(id).map(|client| client.window) {
+                self.backend.set_input_focus(window);
+                if raise {
+                    self.raise_client(id);
+                }
+            }
+            return;
+        }
+
+        if let Some(prev) = self.focused {
+            self.release_focus(prev);
+        }
+
+        let Some(client) = self.clients.get_mut(id) else {
+            return;
+        };
+        client.flags.insert(ClientFlags::FOCUSED);
+        let window = client.window;
+        self.focused = Some(id);
+        // Remove-then-push, so a client appears exactly once and the
+        // back of the vector is always the most recent. One of the two
+        // writers of `focus_history`; `forget` is the other.
+        self.focus_history.retain(|&other| other != id);
+        self.focus_history.push(id);
+        self.bump_protocol_state_revision();
+        // Ungrab: a focused client's own clicks (placing a text cursor,
+        // clicking a button inside it, ...) should reach it directly,
+        // not detour through the WM on every single click the way an
+        // unfocused client's first click does.
+        self.backend.ungrab_button_passive(window, MouseButton::Left);
+        self.backend.set_input_focus(window);
+        self.backend.publish_active_window(Some(window));
+        if raise {
+            self.raise_client(id);
+        }
+        // Attention asked for, attention given. Nothing else in the
+        // tree ever cleared this: the bell handler and both EWMH routes
+        // only ever *set* it, so before this a window that rang once
+        // stayed urgent for the rest of its life, including while the
+        // user sat in it. An urgency that cannot be dismissed is worse
+        // than none, so the dismissal lives here — beside the focus,
+        // where it applies to Wayland and X11 alike rather than in
+        // either protocol's handler.
+        //
+        // Through `set_urgent` rather than by clearing the flag inline:
+        // the state has to be *published*, or a bar keeps showing the
+        // window as urgent and the next ring is no longer an edge the
+        // event differ can see. It is idempotent, so the ordinary
+        // focus change pays only a flag comparison.
+        self.set_urgent(id, false);
+        self.repaint_decoration(id);
+        if self.is_layout_managed(id)
+            && self.workspace_layout(self.clients[id].workspace) == crate::LayoutMode::Flow
+        {
+            self.reflow_client_workspace(id);
+        }
+    }
+
+    /// The one place a client stops holding focus. Keeps the
+    /// `FOCUSED` bit, `focused`, the click-to-focus grab and the
+    /// chrome in agreement.
+    ///
+    /// Each site that cleared focus used to write this out by hand,
+    /// and only the one in `focus_client_with` re-installed the grab.
+    /// A window that lost focus any other way — sent to another
+    /// workspace alone, left behind on a workspace with nothing to
+    /// hand focus to — stayed ungrabbed, and on X11 a click on its
+    /// content went straight to the client without `wm-core` ever
+    /// seeing it: no focus, no raise, until the user found its
+    /// titlebar.
+    ///
+    /// Publishes nothing, so a caller about to focus a successor does
+    /// not announce "no window" in between; [`Self::clear_focus`] is
+    /// the form for one that leaves nothing focused. Safe on a client
+    /// `forget` has already removed: only `focused` is left to clear.
+    fn release_focus(&mut self, losing: ClientId) {
+        if self.focused == Some(losing) {
+            self.focused = None;
+        }
+        let Some(client) = self.clients.get_mut(losing) else {
+            return;
+        };
+        client.flags.remove(ClientFlags::FOCUSED);
+        // Re-grab now that it's losing focus — its content needs to be
+        // click-to-focus-able again (see `handle_client_button`/
+        // `grab_button_passive`'s doc comments for the full mechanism).
+        // A `NO_FOCUS` window is left alone: the click could not focus
+        // it anyway.
+        if !client.flags.contains(ClientFlags::NO_FOCUS) {
+            self.backend.grab_button_passive(client.window, MouseButton::Left);
+        }
+        self.repaint_decoration(losing);
+    }
+
+    /// [`Self::release_focus`] for a caller with no successor to hand
+    /// focus to: also publishes that no window is active.
+    fn clear_focus(&mut self, losing: ClientId) {
+        self.release_focus(losing);
+        self.backend.publish_active_window(None);
+    }
+
+    /// Pushes a client's current `_NET_WM_STATE`-relevant flags to the
+    /// backend — called from every state transition that changes any of
+    /// them (fullscreen, maximize, shade, miniaturize). The backend is
+    /// a dumb mirror of these authoritative flags, never the other way
+    /// around (see `Backend::publish_net_state`).
+    fn publish_client_net_state(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        self.backend.publish_net_state(client.window, NetStateSnapshot {
+            fullscreen: client.flags.contains(ClientFlags::FULLSCREEN),
+            client_fullscreen: client.flags.contains(ClientFlags::CLIENT_FULLSCREEN),
+            maximized_horizontally: client.flags.contains(ClientFlags::MAXIMIZED_H),
+            maximized_vertically: client.flags.contains(ClientFlags::MAXIMIZED_V),
+            shaded: client.flags.contains(ClientFlags::SHADED),
+            // EWMH `_NET_WM_STATE_HIDDEN` means "would be shown by a
+            // pager's activate request" — exactly this WM's
+            // miniaturized state, and nothing else here qualifies.
+            hidden: client.lifecycle == Lifecycle::Miniaturized,
+            modal: client.flags.contains(ClientFlags::MODAL),
+        });
+    }
+
+    /// Put a managed client on screen, whichever way it is realized.
+    ///
+    /// Exists because "map this window" stopped being one call the day
+    /// a managed window could have no frame. Every caller — workspace
+    /// switch, deminiaturize, unshade — means the same thing and none
+    /// of them should have to know which kind of client it is holding.
+    fn show_client_surface(&mut self, id: ClientId) {
+        if self.mac_client_hidden(id) { return; }
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        match (client.frame, client.window) {
+            (Some(frame), _) => self.backend.map_frame(frame),
+            (None, window) => self.backend.map_frameless(window),
+        }
+    }
+
+    /// The counterpart of [`Self::show_client_surface`]. A frameless
+    /// window that is not hidden here stays visible on every workspace
+    /// and survives being miniaturized, which is exactly the bug the
+    /// `unmap_frameless` backend verb exists to prevent.
+    fn hide_client_surface(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        match (client.frame, client.window) {
+            (Some(frame), _) => self.backend.unmap_frame(frame),
+            (None, window) => self.backend.unmap_frameless(window),
+        }
+    }
+
+    /// A managed client changed its mind about drawing its own chrome:
+    /// add or drop its frame to match, in place, without the window
+    /// blinking out of existence.
+    ///
+    /// This is not a hypothetical. Applications rewrite
+    /// `_MOTIF_WM_HINTS` on a mapped window — a browser leaving
+    /// fullscreen, an application whose "use system title bar" setting
+    /// is toggled — and a window manager that only reads the hint at
+    /// map time gets the answer permanently wrong for every one of
+    /// them.
+    ///
+    /// The content geometry is the fixed point across the transition,
+    /// not the frame: what the user is looking at is the application's
+    /// own pixels, and those must not jump. The frame is created around
+    /// them or taken away from around them — with one exception, when
+    /// the frame would land off the screen; see the framed arm. Between
+    /// edge and full chrome the frame itself is kept and re-laid-out.
+    fn handle_chrome_changed(&mut self, window: B::WindowId) {
+        let Some(&id) = self.window_index.get(&window) else {
+            // Not mapped yet, and that is the common case rather than
+            // an error: a client negotiates decorations before it
+            // commits its first buffer, so most of these events arrive
+            // before `handle_map_request` has put the window in the
+            // index. Nothing is lost by dropping them — the map itself
+            // asks the backend the same question, and reads whatever
+            // the negotiation has settled on by then.
+            return;
+        };
+        let wants = self.backend.client_chrome(window);
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let (current, content, existing_frame) = (client.chrome, client.geometry, client.frame);
+        let shaded = client.flags.contains(ClientFlags::SHADED);
+        // Told even when the chrome stays: the evidence behind it can change
+        // (a client releasing its KDE object), and what the backend derives
+        // from that, such as the tiled states, has to follow.
+        self.backend.set_window_chrome(window, wants);
+        if current == wants {
+            return;
+        }
+        // Shade rolls a window up into our titlebar, and neither edge
+        // chrome nor none has one: unroll first, or the content would
+        // stay hidden inside a frame that refuses to unshade it.
+        if shaded && wants != ClientChrome::Full {
+            self.unshade(id);
+        }
+
+        match wants {
+            ClientChrome::Bare => {
+                // `release_decoration`, never `destroy_decoration`: on
+                // X11 the client is a child of the frame, and destroying
+                // a parent destroys its children.
+                if let Some(frame) = existing_frame {
+                    self.backend.release_decoration(window, frame);
+                    self.frame_index.remove(&frame);
+                }
+                if let Some(client) = self.clients.get_mut(id) {
+                    client.frame = None;
+                    client.chrome = ClientChrome::Bare;
+                }
+            }
+            // Gaining a frame, or trading one kind of frame for the other.
+            // A frame that already exists is kept and re-laid-out rather
+            // than replaced: between edge and full chrome only the frame's
+            // shape and pixels change, and the client never leaves it.
+            ClientChrome::Full | ClientChrome::Edges => {
+                let request = self
+                    .clients
+                    .get(id)
+                    .map(|client| Self::decoration_request(client, None))
+                    .unwrap_or_else(|| Self::decoration_request(&Client::new(window, String::new()), None));
+                let scale = self.backend.decoration_scale(content);
+                let layout = self.chrome_layout(wants, &request, scale);
+                let frame = match existing_frame {
+                    Some(frame) => {
+                        self.backend.set_decoration_layout(frame, &layout);
+                        frame
+                    }
+                    None => self.backend.create_decoration(window, &layout),
+                };
+                // Anchor the *content* where it already is; the frame is
+                // built around it, extending up and left by the chrome's
+                // own offset.
+                let mut frame_geom = Rect {
+                    pos: Point::new(content.pos.x - layout.client_offset.x, content.pos.y - layout.client_offset.y),
+                    size: layout.frame_size,
+                };
+                // ...unless that puts the chrome off the screen. A bare
+                // window sitting in the corner of its output — where a
+                // floating terminal launched without chrome tends to be
+                // — would grow a titlebar into the pixels *above* the
+                // display: a window with a frame it cannot reach is no
+                // better than one with none. So the content does move
+                // in that one case, by exactly as much as it takes to
+                // bring the frame inside the workarea; the fixed point
+                // yields to the reason for having a frame at all.
+                let center = Point::new(
+                    frame_geom.pos.x + frame_geom.size.w as i32 / 2,
+                    frame_geom.pos.y + frame_geom.size.h as i32 / 2,
+                );
+                let within = placement::clamp_to(self.usable_area_at(center), frame_geom.size, frame_geom.pos);
+                let shift = Point::new(within.x - frame_geom.pos.x, within.y - frame_geom.pos.y);
+                if shift != Point::new(0, 0) {
+                    frame_geom.pos = within;
+                    if let Some(client) = self.clients.get_mut(id) {
+                        client.geometry.pos = Point::new(content.pos.x + shift.x, content.pos.y + shift.y);
+                    }
+                    tracing::debug!(?window, ?shift, "moved a window so the frame it just gained is on screen");
+                }
+                self.backend.set_frame_geometry(frame, frame_geom);
+                let surface = self.chrome_surface(wants, &request, &layout, scale);
+                self.backend.paint_decoration(frame, &surface);
+                if existing_frame.is_none() {
+                    self.backend.map_frame(frame);
+                    self.frame_index.insert(frame, id);
+                }
+                if let Some(client) = self.clients.get_mut(id) {
+                    client.frame = Some(frame);
+                    client.chrome = wants;
+                    client.last_decoration_frame_size = layout.frame_size;
+                    client.layout = layout;
+                    client.last_decoration_request = Some(request);
+                    client.last_decoration_scale_bits = scale.to_bits();
+                }
+            }
+        }
+        tracing::info!(?window, ?wants, "client changed its decoration preference");
+        // Chrome itself is not represented by either compatibility
+        // protocol, but adding a frame can clamp the content onto-screen
+        // and therefore change its output membership.
+        self.bump_protocol_state_revision();
+        // A maximized window keeps filling its work area in whatever chrome
+        // it now wears. The plain reflow keeps the content size, so gaining a
+        // titlebar pushed the bottom edge past the work area and losing one
+        // left a titlebar-high gap: measure the new overhead and refit, as a
+        // restyle does.
+        let directions = self.clients.get(id).map_or(MaximizeDirections::empty(), Self::maximize_directions);
+        match self.clients.get(id) {
+            Some(client) if !directions.is_empty() => {
+                let layout = self.chrome_layout(client.chrome, &Self::decoration_request(client, None), self.client_decoration_scale(id));
+                self.refit_maximized_chrome(id, layout, directions, true);
+            }
+            _ => self.reflow_frame(id),
+        }
+        // Whichever direction it went, the window's visibility has to be
+        // restated. Taking a frame away removes the only mapped surface
+        // a framed window had, and creating one maps the frame but says
+        // nothing about a window that should currently be hidden — so
+        // ask what this client's lifecycle and workspace say it should
+        // be, rather than assuming the transition left it right. Caught
+        // by `a_client_that_starts_drawing_its_own_chrome_loses_its_frame_in_place`,
+        // which found the window gone from the screen entirely.
+        let visible = !self.mac_client_hidden(id) && self.client_visible(id);
+        if visible {
+            self.show_client_surface(id);
+        } else {
+            self.hide_client_surface(id);
+        }
+        self.reflow_client_workspace(id);
+    }
+
+    /// Publish `_NET_FRAME_EXTENTS` for `id` from whatever its layout
+    /// currently says.
+    ///
+    /// Derived rather than remembered, and derived in one place, so the
+    /// property cannot drift from the chrome actually on screen: the
+    /// left and top edges are the offset the content sits at inside the
+    /// frame, and the right and bottom are whatever frame is left over
+    /// once the content is accounted for. A frameless window's layout
+    /// makes all four fall out as zero without a special case, and so
+    /// does a fullscreen one.
+    fn publish_frame_extents(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let window = client.window;
+        let left = client.layout.client_offset.x.max(0) as u32;
+        let top = client.layout.client_offset.y.max(0) as u32;
+        let right = client.layout.frame_size.w.saturating_sub(left.saturating_add(client.geometry.size.w));
+        let bottom = client.layout.frame_size.h.saturating_sub(top.saturating_add(client.geometry.size.h));
+        self.backend.publish_frame_extents(window, left, right, top, bottom);
+    }
+
+    /// Bring a managed client to the front, whichever way it is
+    /// realized. The frameless counterpart of `Backend::raise`, and the
+    /// reason no raise site in this file names a frame directly any
+    /// more.
+    fn raise_client(&mut self, id: ClientId) {
+        self.raise_transient_family(id);
+        // `pin` means both sticky and above ordinary windows. Reassert
+        // that invariant after every normal raise, including focus.
+        let pinned: Vec<ClientId> = self
+            .clients
+            .iter()
+            .filter(|(other, client)| {
+                *other != id && client.lifecycle == Lifecycle::Normal && client.flags.contains(ClientFlags::STICKY)
+            })
+            .map(|(other, _)| other)
+            .collect();
+        for pinned in pinned {
+            self.raise_transient_family(pinned);
+        }
+        // A shown special workspace is an overlay: its members sit
+        // above pinned windows too, with the one being raised on top
+        // of the rest of them.
+        let overlay = self.shown_special_members();
+        if overlay.is_empty() {
+            return;
+        }
+        for member in overlay.iter().copied().filter(|member| *member != id) {
+            self.raise_transient_family(member);
+        }
+        if overlay.contains(&id) {
+            self.raise_transient_family(id);
+        }
+    }
+
+    /// Raises `id`, then every window that names it as a parent, so a
+    /// dialog ends up above the window it belongs to.
+    ///
+    /// This is what `WM_TRANSIENT_FOR` and `xdg_toplevel.set_parent`
+    /// have always been for, and this desktop honored neither: a modal
+    /// dialog could sit *behind* its own parent, invisible, while the
+    /// application refused every command the parent was given because a
+    /// modal was open. LibreOffice's "Welcome" dialog does exactly that,
+    /// and the visible symptom is a titlebar close button that appears
+    /// to do nothing — the request is sent, and the application is
+    /// right to refuse it.
+    ///
+    /// The stored parent graph is indexed once for the walk, so a deep
+    /// dialog chain does not re-query the backend or rescan every client
+    /// at each level.
+    fn raise_transient_family(&mut self, id: ClientId) {
+        for member in self.transient_family(id) {
+            let Some(client) = self.clients.get(member) else {
+                continue;
+            };
+            if client.lifecycle != Lifecycle::Normal {
+                continue;
+            }
+            match (client.frame, client.window) {
+                (Some(frame), _) => self.backend.raise(frame),
+                (None, window) => self.backend.raise_frameless(window),
+            }
+        }
+    }
+
+    /// The client asked to be moved — begin an interactive move from
+    /// wherever the pointer currently is.
+    ///
+    /// The grab offset is derived rather than reported: the client's
+    /// request carries no anchor, and the honest anchor is the pointer's
+    /// offset within the frame at the moment the request arrives, which
+    /// is exactly what a titlebar press would have recorded. Refused
+    /// outright while another drag is in flight, and refused when the
+    /// pointer's position is not yet known — a move anchored on a
+    /// guessed pointer position would teleport the window on its first
+    /// motion event.
+    fn handle_move_request(&mut self, window: B::WindowId) {
+        if self.active_move.is_some() || self.active_resize.is_some() {
+            return;
+        }
+        let Some(&id) = self.window_index.get(&window) else {
+            return;
+        };
+        // Asked of the server first: see `Backend::pointer_position`
+        // for why the remembered position is not good enough here.
+        let Some(pointer) = self.backend.pointer_position().or(self.last_pointer) else {
+            return;
+        };
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let origin = Point::new(
+            client.geometry.pos.x - client.layout.client_offset.x,
+            client.geometry.pos.y - client.layout.client_offset.y,
+        );
+        self.active_move =
+            Some(ActiveMove { client: id, grab_offset: Point::new(pointer.x - origin.x, pointer.y - origin.y) });
+        self.remember_drag_start(id);
+        // The grab is what makes this kind of drag finishable at all:
+        // the client asked for it precisely because the pointer is over
+        // its own chrome, so without one every later motion and the
+        // release go to the client and never come back here.
+        self.begin_drag_grab();
+        tracing::debug!(?window, "client asked to be moved — interactive move begun");
+    }
+
+    /// Starts a move (left button) or a resize (right button) from a
+    /// modifier-held press over a window's content, at `local` — a
+    /// point in the client's own coordinates.
+    ///
+    /// The resize edge is chosen from where in the window the press
+    /// landed, thirds on each axis: a press in a corner ninth resizes
+    /// that corner, an edge third resizes that edge, and the middle
+    /// ninth — where there is no nearest edge worth guessing — resizes
+    /// the bottom-right, the corner every resize bar in this theme
+    /// lives in. That is Window Maker's rule and KWin's both, and it
+    /// means the gesture never has to be aimed.
+    fn begin_modifier_drag(&mut self, id: ClientId, local: Point, button: MouseButton) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        // `local` is content-local; both drags are anchored on the
+        // frame, which the content sits `client_offset` inside of.
+        let offset = client.layout.client_offset;
+        let frame_pos = Point::new(client.geometry.pos.x - offset.x, client.geometry.pos.y - offset.y);
+        let frame_size = client.layout.frame_size;
+        let shaded = client.flags.contains(ClientFlags::SHADED);
+        match button {
+            MouseButton::Left => {
+                // Same un-maximize gesture the titlebar drag performs:
+                // a window dragged out of its maximized rect is no
+                // longer maximized, and leaving the flag set makes the
+                // next Maximize pick teleport it somewhere the user
+                // last saw minutes ago.
+                self.break_maximize(id);
+                self.active_move =
+                    Some(ActiveMove { client: id, grab_offset: Point::new(local.x + offset.x, local.y + offset.y) });
+                self.remember_drag_start(id);
+                self.begin_drag_grab();
+                tracing::debug!(?id, "modifier-drag move begun");
+            }
+            // A shaded window has no content to reshape — the same
+            // refusal the resize bars make.
+            MouseButton::Right if !shaded => {
+                let edge = crate::resize::resize_edge_for_point(
+                    frame_size,
+                    Point::new(local.x + offset.x, local.y + offset.y),
+                );
+                self.active_resize =
+                    Some(ActiveResize { client: id, edge, start_frame: Rect { pos: frame_pos, size: frame_size }, start_pointer: None });
+                self.remember_drag_start(id);
+                self.begin_drag_grab();
+                tracing::debug!(?id, ?edge, "modifier-drag resize begun");
+            }
+            _ => {}
+        }
+    }
+
+    /// Takes the pointer for a drag that is starting, if one is not
+    /// already held. Idempotent: a second press mid-drag must not
+    /// strand the first grab.
+    fn begin_drag_grab(&mut self) {
+        if self.drag_grab.is_some() {
+            return;
+        }
+        self.drag_grab = Some(self.backend.grab_pointer_for_drag());
+    }
+
+    /// Asks the shell for the focused window's commands menu, as the
+    /// `window-menu` keybinding does — the route into a window that has
+    /// no titlebar of ours to right-click.
+    ///
+    /// The menu opens at the window's top-left corner rather than under
+    /// the pointer: this gesture came from the keyboard, and the
+    /// pointer may be nowhere near the window it acts on. Silently does
+    /// nothing when no window is focused, which is the same thing every
+    /// other window-targeted keybinding does.
+    pub fn request_window_menu_for_focused(&mut self) {
+        let Some(id) = self.focused else {
+            return;
+        };
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        let at = Point::new(
+            client.geometry.pos.x - client.layout.client_offset.x,
+            client.geometry.pos.y - client.layout.client_offset.y,
+        );
+        self.notifications.push_back(Notification::WindowMenuRequested { id, at });
+    }
+
+    /// Re-asks the backend whether this client draws its own chrome and
+    /// applies the answer, adding or removing the frame in place.
+    ///
+    /// The documented-but-missing method `Client`'s own doc comment has
+    /// referred to for some time. Two things need it and neither had
+    /// it: a config reload that changes a decoration override has to
+    /// reach windows that are already open, and a client whose `app_id`
+    /// arrives *after* it mapped (which is legal, and which Wayland
+    /// clients do) has to be re-judged against it. Without this, both
+    /// cases required closing and reopening the window.
+    pub fn refresh_client_chrome(&mut self, id: ClientId) {
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        self.handle_chrome_changed(client.window);
+    }
+
+    /// [`Self::refresh_client_chrome`] for every managed client — what a
+    /// config reload calls, since a changed rule list can move any
+    /// window in either direction.
+    pub fn refresh_all_client_chrome(&mut self) {
+        let windows: Vec<B::WindowId> = self.clients.iter().map(|(_, client)| client.window).collect();
+        for window in windows {
+            self.handle_chrome_changed(window);
+        }
+    }
+
+    /// Ends any interactive drag and releases the pointer.
+    ///
+    /// The single exit. Every way a drag can stop — the button coming
+    /// up anywhere at all, the client being destroyed under it, a
+    /// workspace switching out from under it — goes through here, so
+    /// that "the drag is over" and "the pointer is free" cannot come
+    /// apart. Safe to call when nothing is dragging.
+    fn commit_active_drag(&mut self) {
+        let placed = self.active_move.as_ref().map(|drag| drag.client)
+            .or_else(|| self.active_resize.as_ref().map(|drag| drag.client));
+        let started = self.drag_started_geometry;
+        self.layout_resize_snapshot = None;
+        self.commit_layout_drop();
+        self.end_active_drag();
+        if let Some(id) = placed {
+            let moved = self.clients.get(id).map(|client| client.geometry) != started;
+            if moved {
+                self.release_evacuated_home(id);
+            }
+        }
+    }
+
+    fn end_active_drag(&mut self) {
+        self.layout_drop = None;
+        self.backend.preview_layout_drop(None, None);
+        let client = self.interactive_drag_client();
+        self.active_move = None;
+        self.active_resize = None;
+        self.drag_started_geometry = None;
+        if let Some(snapshot) = self.layout_resize_snapshot.take() {
+            for (id, weight, width) in snapshot.placements {
+                if let Some(c) = self.clients.get_mut(id) {
+                    c.placement.mosaic_weight = weight;
+                    c.placement.flow_width = width;
+                }
+            }
+            if let Some(layout) = self.layouts.get_mut(snapshot.workspace) {
+                layout.viewports = snapshot.viewports;
+            }
+            self.reflow_workspace(snapshot.workspace);
+        }
+        if let Some(handle) = self.drag_grab.take() {
+            self.backend.ungrab_pointer(handle);
+        }
+        // Settle per-output scale and the last constrained size once, after
+        // dropping the drag flag so this final paint is immediate.
+        if let Some(client) = client {
+            self.reflow_frame(client);
+        }
+    }
+
+    /// The client asked to be resized from `edge` — begin an
+    /// interactive resize exactly as a resizebar drag would have.
+    ///
+    /// Same refusals as [`Self::handle_move_request`], for the same
+    /// reasons: never while another drag is in flight, and never for a
+    /// window this manager does not know. A shaded window refuses too,
+    /// matching the resizebar's own rule — resizing a window whose
+    /// content is rolled up silently reshapes something the user
+    /// cannot see.
+    fn handle_resize_request(&mut self, window: B::WindowId, edge: ResizeEdge) {
+        if self.active_move.is_some() || self.active_resize.is_some() {
+            return;
+        }
+        let Some(&id) = self.window_index.get(&window) else {
+            return;
+        };
+        let Some(pointer) = self.backend.pointer_position().or(self.last_pointer) else {
+            return;
+        };
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        if client.flags.contains(ClientFlags::SHADED) {
+            return;
+        }
+        let start_frame = Rect {
+            pos: Point::new(
+                client.geometry.pos.x - client.layout.client_offset.x,
+                client.geometry.pos.y - client.layout.client_offset.y,
+            ),
+            size: client.layout.frame_size,
+        };
+        self.active_resize = Some(ActiveResize { client: id, edge, start_frame, start_pointer: Some(pointer) });
+        self.remember_drag_start(id);
+        // Without the grab this resize could start but never end — the
+        // client asked precisely because the pointer is over its own
+        // chrome, where neither the motion nor the release reach us.
+        self.begin_drag_grab();
+        tracing::debug!(?window, ?edge, "client asked to be resized — interactive resize begun");
+    }
+
+    fn repaint_decoration(&mut self, id: ClientId) {
+        if self.interactive_drag_client() == Some(id) {
+            self.pending_decorations.insert(id);
+        } else {
+            self.paint_decoration_now(id);
+        }
+    }
+
+    /// Realizes all chrome invalidated during this event-loop pass. Backends
+    /// call this immediately before rendering/presenting, which caps an input
+    /// burst at one raster per client per frame.
+    pub fn flush_decorations(&mut self) {
+        let pending: Vec<_> = self.pending_decorations.drain().collect();
+        for id in pending {
+            self.paint_decoration_now(id);
+        }
+    }
+
+    fn paint_decoration_now(&mut self, id: ClientId) {
+        self.pending_decorations.remove(&id);
+        let Some(client) = self.clients.get(id) else {
+            return;
+        };
+        // A fullscreen frame is entirely covered by the client's own
+        // content — there's no chrome to paint, and the synthetic
+        // fullscreen layout has no decoration geometry to render into
+        // anyway (see `reflow_frame`'s fullscreen branch).
+        if client.flags.contains(ClientFlags::FULLSCREEN) {
+            return;
+        }
+        let Some(frame) = client.frame else {
+            return;
+        };
+        let pressed_button = self.active_button_press.as_ref().filter(|p| p.client == id).map(|p| p.kind);
+        let request = Self::decoration_request(client, pressed_button);
+        // `client.layout` is deliberately kept at its full unshaded
+        // shape while shaded (that is what makes unshading exact), so
+        // every repaint of a shaded frame — a focus change, a title
+        // update, the button release that immediately follows the
+        // shading double-click itself — has to re-derive the shade's
+        // paint inputs rather than hand the theme that layout.
+        let (paint_request, paint_layout) = if client.flags.contains(ClientFlags::SHADED) {
+            let (shaded_request, shaded_layout) = shaded_paint_inputs(&request, &client.layout);
+            (shaded_request, shaded_layout)
+        } else {
+            (request, client.layout.clone())
+        };
+        let scale = self.client_decoration_scale(id);
+        if client.last_decoration_request.as_ref() == Some(&paint_request)
+            && client.last_decoration_frame_size == paint_layout.frame_size
+            && client.last_decoration_scale_bits == scale.to_bits()
+        {
+            return;
+        }
+        let surface = self.chrome_surface(client.chrome, &paint_request, &paint_layout, scale);
+        self.backend.paint_decoration(frame, &surface);
+        if let Some(client) = self.clients.get_mut(id) {
+            client.last_decoration_request = Some(paint_request);
+            client.last_decoration_frame_size = paint_layout.frame_size;
+            client.last_decoration_scale_bits = scale.to_bits();
+        }
+    }
+
+    /// The layout `chrome` wears around `request` at `scale`: the theme's
+    /// full frame, the theme's edge frame, or the frameless layout. The
+    /// one place the three answers become geometry.
+    fn chrome_layout(&self, chrome: ClientChrome, request: &DecorationRequest, scale: f32) -> DecorationLayout {
+        match chrome {
+            ClientChrome::Full => self.theme.layout_at(request, scale),
+            ClientChrome::Edges => self.theme.edges_layout_at(request, scale),
+            ClientChrome::Bare => frameless_layout(request.content_size),
+        }
+    }
+
+    /// The pixels for a [`Self::chrome_layout`] layout. A bare window has
+    /// no frame, so nothing ever asks for its pixels.
+    fn chrome_surface(
+        &self,
+        chrome: ClientChrome,
+        request: &DecorationRequest,
+        layout: &DecorationLayout,
+        scale: f32,
+    ) -> wm_theme_api::DecorationSurface {
+        match chrome {
+            ClientChrome::Edges => self.theme.render_edges_at(request, layout, scale),
+            ClientChrome::Full | ClientChrome::Bare => self.theme.render_surface_at(request, layout, scale),
+        }
+    }
+
+    fn decoration_request(client: &Client<B>, pressed_button: Option<ButtonKind>) -> DecorationRequest {
+        let mut request = DecorationRequest {
+            content_size: client.geometry.size,
+            title: client.title.clone(),
+            focused: client.flags.contains(ClientFlags::FOCUSED),
+            resizable: true,
+            buttons: vec![
+                ButtonRuntimeState {
+                    kind: ButtonKind::Close,
+                    hovered: false,
+                    pressed: pressed_button == Some(ButtonKind::Close),
+                },
+                ButtonRuntimeState {
+                    kind: ButtonKind::Maximize,
+                    hovered: false,
+                    pressed: pressed_button == Some(ButtonKind::Maximize),
+                },
+                ButtonRuntimeState {
+                    kind: ButtonKind::Miniaturize,
+                    hovered: false,
+                    pressed: pressed_button == Some(ButtonKind::Miniaturize),
+                },
+            ],
+        };
+        if pressed_button == Some(ButtonKind::Menu) {
+            request.buttons.push(ButtonRuntimeState { kind: ButtonKind::Menu, hovered: false, pressed: true });
+        }
+        request
+    }
+}
+
+/// The layout a bare window wears.
+///
+/// Every consumer of `Client::layout` — hit-testing, drag math,
+/// placement, the frame geometry the backend is told — reads it
+/// unconditionally, so a frameless window needs a layout that honestly
+/// describes having no chrome rather than an absent one: the frame is
+/// exactly the content, the content sits at the frame's origin, and
+/// there are no hitboxes because there is nothing to hit. That is the
+/// same shape `reflow_frame` already synthesises for a fullscreen
+/// window, and for the same reason.
+///
+/// `shaded_frame_height` is the full height: a client-decorated window
+/// cannot be shaded (there is no titlebar of ours to roll it into), and
+/// a zero here would let any code that shades one collapse it to
+/// nothing.
+fn frameless_layout(content: Size) -> DecorationLayout {
+    DecorationLayout {
+        input_margin: 0,
+        input_exclusion: None,
+        frame_size: content,
+        client_offset: Point::new(0, 0),
+        titlebar_height: 0,
+        button_hitboxes: Vec::new(),
+        resize_hitboxes: Vec::new(),
+        shaded_frame_height: content.h,
+    }
+}
+
+/// The request/layout pair a *shaded* frame's decoration must be
+/// rasterized from, derived from the unshaded pair the theme produced.
+///
+/// Shrinking the frame rect (`Backend::set_frame_geometry`) is only half
+/// of rolling a window up. On X11 it passes for the whole thing by
+/// accident: the frame is a real server window, so shortening it clips
+/// whatever oversized pixmap was last blitted into it and the roll-up
+/// looks right even though the buffer is still full height. A Wayland
+/// frame has no such window — `wm-wayland`'s renderer composites the
+/// decoration buffer at `frame.geometry.pos` at the *buffer's* own size
+/// and never consults `frame.geometry.size` — so there the buffer IS the
+/// frame's outline. Painting the unshaded buffer left the full-size
+/// outline on screen (client area filled opaque black, resizebar and
+/// all) while the unmapped content vanished behind it: exactly the
+/// reported "double-click blanks the window instead of rolling it up".
+///
+/// `resizable: false` is not incidental. A rolled-up window has no
+/// bottom edge to drag — `handle_frame_button_press` already refuses a
+/// resize drag on a `SHADED` client — and `resizable` is precisely what
+/// tells the theme to spend height on a resizebar. Left set, the theme
+/// would still paint one, and at shaded height there is no room below
+/// the titlebar for it to land: it would be drawn straight over the
+/// titlebar's bottom edge. Clearing `resize_hitboxes` keeps the layout
+/// self-consistent with that (hit-testing a shaded frame never reaches
+/// them anyway — they sit below its bottom edge, outside the rect the
+/// backends test against — but a layout that paints no grip must not
+/// claim to have one). Neither of these is stored back on the client:
+/// `Client::layout` deliberately keeps the unshaded shape, which is
+/// what makes unshading exact, so this pair exists only for the length
+/// of one `ThemeEngine::render` call.
+fn shaded_paint_inputs(
+    request: &DecorationRequest,
+    layout: &DecorationLayout,
+) -> (DecorationRequest, DecorationLayout) {
+    let mut request = request.clone();
+    // Sparse themes size the side strips from the painted content height.
+    // Keeping the client's restore height here redraws those strips below
+    // the shortened frame on every repaint; frame_size does not clip them.
+    request.content_size.h = 0;
+    request.resizable = false;
+    let mut layout = layout.clone();
+    layout.frame_size.h = layout.shaded_frame_height;
+    layout.resize_hitboxes.clear();
+    (request, layout)
+}
+
+/// Bounding box of two rects — how the per-monitor workareas collapse
+/// into the one `_NET_WORKAREA` rect (see `publish_workarea_union`).
+/// Not generic over "empty" rects: a monitor is never zero-sized in
+/// practice, so a zero-sized input still contributes its origin rather
+/// than being skipped, which keeps this a plain fold with no
+/// first-non-empty bookkeeping.
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let left = a.pos.x.min(b.pos.x);
+    let top = a.pos.y.min(b.pos.y);
+    let right = (a.pos.x + a.size.w as i32).max(b.pos.x + b.size.w as i32);
+    let bottom = (a.pos.y + a.size.h as i32).max(b.pos.y + b.size.h as i32);
+    Rect { pos: Point::new(left, top), size: Size::new((right - left).max(0) as u32, (bottom - top).max(0) as u32) }
+}
+
+/// Squared distance from `point` to the nearest point of `rect`, `0`
+/// for a point inside it — the ordering `monitor_index_at` picks its
+/// nearest monitor by. Squared because only the ordering matters and a
+/// square root would cost precision for nothing. The sum needs `u128`:
+/// restored coordinates can span the full signed range in both axes.
+fn squared_distance_to(rect: Rect, point: Point) -> u128 {
+    // `Rect::contains` is half-open, so the last pixel actually inside
+    // is one short of the far edge — measuring to the edge itself would
+    // report a one-pixel gap as zero distance.
+    let last_x = rect.pos.x as i64 + rect.size.w as i64 - 1;
+    let last_y = rect.pos.y as i64 + rect.size.h as i64 - 1;
+    let dx = (rect.pos.x as i64 - point.x as i64).max(point.x as i64 - last_x).max(0);
+    let dy = (rect.pos.y as i64 - point.y as i64).max(point.y as i64 - last_y).max(0);
+    (dx as u128) * (dx as u128) + (dy as u128) * (dy as u128)
+}
+
+/// The connected monitor an evacuated window should return to.
+/// A unique EDID wins over the connector name, so a dock that comes
+/// back as a different port still matches. Duplicate EDIDs fall
+/// through to the name, and a name that matches nothing is left alone.
+fn returning_monitor<'a>(monitors: &'a [MonitorInfo], home: &EvacuatedHome) -> Option<&'a MonitorInfo> {
+    if let Some(identity) = home.identity.as_deref() {
+        let matched: Vec<_> = monitors.iter().filter(|monitor| monitor.identity.as_deref() == Some(identity)).collect();
+        if matched.len() == 1 {
+            return Some(matched[0]);
+        }
+    }
+    if home.name.is_empty() {
+        return None;
+    }
+    monitors.iter().find(|monitor| monitor.name == home.name)
+}
+
+/// The root-coordinate rectangle of a managed client's outer frame.
+/// Frameless clients use a zero-offset layout, so this is also their
+/// content rectangle without a special case.
+fn client_frame_rect<B: Backend>(client: &Client<B>) -> Rect {
+    client.visual_geometry()
+}
+
+fn client_input_rect<B: Backend>(client: &Client<B>) -> Rect {
+    Rect {
+        pos: Point::new(
+            client.geometry.pos.x - client.layout.client_offset.x,
+            client.geometry.pos.y - client.layout.client_offset.y,
+        ),
+        size: client.layout.frame_size,
+    }
+}
+
+/// A sortable proximity score when `candidate` lies in `direction`
+/// from `source`; `None` when it lies outside that half-plane.
+///
+/// Centers are doubled so odd-sized frames retain half-pixel precision.
+/// The 13:1 major/perpendicular weighting is intentionally biased toward
+/// progress along the requested axis while still letting a nearby
+/// diagonal window beat a distant aligned one. `u128` keeps adversarial
+/// protocol geometry from overflowing while squared.
+fn directional_score(source: Rect, candidate: Rect, direction: FocusDirection) -> Option<(u128, u128)> {
+    let edges = |rect: Rect| {
+        let left = i64::from(rect.pos.x);
+        let top = i64::from(rect.pos.y);
+        (left, top, left + i64::from(rect.size.w), top + i64::from(rect.size.h))
+    };
+    let (sl, st, sr, sb) = edges(source);
+    let (cl, ct, cr, cb) = edges(candidate);
+    let source_center = (sl + sr, st + sb);
+    let candidate_center = (cl + cr, ct + cb);
+    let eligible = match direction {
+        FocusDirection::Left => candidate_center.0 < source_center.0,
+        FocusDirection::Right => candidate_center.0 > source_center.0,
+        FocusDirection::Up => candidate_center.1 < source_center.1,
+        FocusDirection::Down => candidate_center.1 > source_center.1,
+    };
+    if !eligible {
+        return None;
+    }
+    let interval_gap = |a0: i64, a1: i64, b0: i64, b1: i64| (a0 - b1).max(b0 - a1).max(0) as u128;
+    let (major, perpendicular) = match direction {
+        FocusDirection::Left => ((sl - cr).max(0) as u128, interval_gap(st, sb, ct, cb)),
+        FocusDirection::Right => ((cl - sr).max(0) as u128, interval_gap(st, sb, ct, cb)),
+        FocusDirection::Up => ((st - cb).max(0) as u128, interval_gap(sl, sr, cl, cr)),
+        FocusDirection::Down => ((ct - sb).max(0) as u128, interval_gap(sl, sr, cl, cr)),
+    };
+    let dx = source_center.0.abs_diff(candidate_center.0) as u128;
+    let dy = source_center.1.abs_diff(candidate_center.1) as u128;
+    Some((13 * major * major + perpendicular * perpendicular, dx * dx + dy * dy))
+}
+
+/// Whether a client's state request would turn a state on: the half a
+/// `suppress_event` rule refuses. Leaving a state stays allowed, so a
+/// window the compositor maximized can still restore itself.
+fn request_enters(action: NetStateAction, currently: bool) -> bool {
+    match action {
+        NetStateAction::Remove => false,
+        NetStateAction::Add | NetStateAction::Toggle => !currently,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake_backend::{FakeBackend, FakeFrameId, FakeTheme, FakeWindowId};
+    use crate::types::SizeHints;
+    use wm_theme_api::Size;
+
+    fn wm(backend: FakeBackend) -> WindowManager<FakeBackend> {
+        WindowManager::new(backend, Box::new(FakeTheme))
+    }
+
+    #[derive(Debug)]
+    struct InhibitsIdle;
+
+    impl FloatPolicy for InhibitsIdle {
+        fn decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            None
+        }
+
+        fn window_decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> crate::placement::WindowRuleDecision {
+            crate::placement::WindowRuleDecision { idle_inhibit: IdleInhibitRule::Always, ..Default::default() }
+        }
+    }
+
+    /// An idle rule in one of its conditional modes.
+    #[derive(Debug)]
+    struct InhibitsIdleWhen(IdleInhibitRule);
+
+    impl FloatPolicy for InhibitsIdleWhen {
+        fn decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            None
+        }
+
+        fn window_decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> crate::placement::WindowRuleDecision {
+            crate::placement::WindowRuleDecision { idle_inhibit: self.0, ..Default::default() }
+        }
+    }
+
+    /// A rule that refuses activation — the shape `focus_on_activate =
+    /// false` produces.
+    #[derive(Debug)]
+    struct NoActivate;
+
+    impl FloatPolicy for NoActivate {
+        fn decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            None
+        }
+
+        fn window_decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> crate::placement::WindowRuleDecision {
+            crate::placement::WindowRuleDecision {
+                focus_on_activate: Some(false),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoInitialFocus;
+
+    impl FloatPolicy for NoInitialFocus {
+        fn decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            None
+        }
+
+        fn window_decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> crate::placement::WindowRuleDecision {
+            crate::placement::WindowRuleDecision { no_initial_focus: true, ..Default::default() }
+        }
+    }
+
+    fn alt_tab() -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::KeyPress(KeyCombo { keysym: XK_TAB, modifiers: Modifiers::ALT })
+    }
+
+    fn alt_shift_tab() -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::KeyPress(KeyCombo { keysym: XK_TAB, modifiers: Modifiers::ALT | Modifiers::SHIFT })
+    }
+
+    fn alt_release() -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::KeyRelease(KeyCombo { keysym: XK_ALT_L, modifiers: Modifiers::ALT })
+    }
+
+    fn escape() -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::KeyPress(KeyCombo { keysym: XK_ESCAPE, modifiers: Modifiers::empty() })
+    }
+
+    #[test]
+    fn directional_focus_follows_the_visible_frame_arrangement() {
+        let mut backend = FakeBackend::new();
+        let left = backend.create_window();
+        let right = backend.create_window();
+        let up = backend.create_window();
+        let down = backend.create_window();
+        let source = backend.create_window();
+        for (window, pos) in [
+            (left, Point::new(100, 400)),
+            (right, Point::new(700, 400)),
+            (up, Point::new(400, 100)),
+            (down, Point::new(400, 700)),
+            (source, Point::new(400, 400)),
+        ] {
+            backend.set_geometry(window, Rect { pos, size: Size::new(100, 100) });
+        }
+        let mut wm = wm(backend);
+        for window in [left, right, up, down, source] {
+            wm.dispatch(BackendEvent::MapRequest(window));
+        }
+        let source_id = wm.client_for_window(source).unwrap();
+        for (direction, expected) in [
+            (FocusDirection::Left, left),
+            (FocusDirection::Right, right),
+            (FocusDirection::Up, up),
+            (FocusDirection::Down, down),
+        ] {
+            wm.focus_client(source_id);
+            assert!(wm.focus_direction(direction));
+            assert_eq!(wm.focused_client(), wm.client_for_window(expected), "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn directional_focus_skips_ineligible_windows() {
+        let mut backend = FakeBackend::new();
+        let eligible = backend.create_window();
+        let hidden = backend.create_window();
+        let miniaturized = backend.create_window();
+        let no_focus = backend.create_window();
+        let source = backend.create_window();
+        for (window, x) in [(eligible, 100), (hidden, 350), (miniaturized, 375), (no_focus, 400), (source, 500)] {
+            backend.set_geometry(window, Rect { pos: Point::new(x, 400), size: Size::new(50, 50) });
+        }
+        let mut wm = wm(backend);
+        for window in [eligible, hidden, miniaturized, no_focus, source] {
+            wm.dispatch(BackendEvent::MapRequest(window));
+        }
+        let hidden_id = wm.client_for_window(hidden).unwrap();
+        let miniaturized_id = wm.client_for_window(miniaturized).unwrap();
+        let no_focus_id = wm.client_for_window(no_focus).unwrap();
+        let source_id = wm.client_for_window(source).unwrap();
+        wm.move_client_to_workspace(hidden_id, 1);
+        wm.miniaturize(miniaturized_id);
+        wm.clients.get_mut(no_focus_id).unwrap().flags.insert(ClientFlags::NO_FOCUS);
+        wm.focus_client(source_id);
+
+        assert!(wm.focus_direction(FocusDirection::Left));
+        assert_eq!(wm.focused_client(), wm.client_for_window(eligible));
+        assert!(!wm.focus_direction(FocusDirection::Left), "no destination beyond the eligible window");
+    }
+
+    #[test]
+    fn directional_score_prefers_nearby_diagonal_frames_to_distant_aligned_ones() {
+        let source = Rect { pos: Point::new(400, 400), size: Size::new(100, 100) };
+        let distant = Rect { pos: Point::new(0, 400), size: Size::new(100, 100) };
+        let nearby_diagonal = Rect { pos: Point::new(250, 510), size: Size::new(100, 100) };
+        assert!(
+            directional_score(source, nearby_diagonal, FocusDirection::Left)
+                < directional_score(source, distant, FocusDirection::Left),
+            "a small perpendicular gap must not make a physically nearby window unreachable"
+        );
+        assert_eq!(directional_score(source, source, FocusDirection::Left), None);
+        assert_eq!(directional_score(source, distant, FocusDirection::Right), None);
+    }
+
+    #[test]
+    fn alt_tab_cycles_focus_to_the_next_client_and_raises_it() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+        assert!(wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED), "mapping w2 last should focus it");
+
+        wm.dispatch(alt_tab());
+        // Modal: pressing Tab only moves the switcher selection — focus
+        // must not change until Alt is released.
+        assert!(wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED), "selection alone must not move focus");
+        let (entries, selected) = wm.cycle_state().expect("session should be active");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[selected].0, id1, "first Tab selects the next client");
+
+        wm.dispatch(alt_release());
+
+        assert!(wm.cycle_state().is_none(), "releasing Alt ends the session");
+        assert!(wm.client(id1).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED));
+        let frame1 = wm.client(id1).unwrap().frame.unwrap();
+        assert!(wm.backend().raised_frames.contains(&frame1), "cycling must raise the newly-focused window");
+    }
+
+    #[test]
+    fn committing_to_a_shaded_client_unshades_it() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        wm.shade(id1);
+        assert!(wm.client(id1).unwrap().flags.contains(ClientFlags::SHADED));
+
+        // Focused is w2; one Tab selects w1 (shaded), commit.
+        wm.dispatch(alt_tab());
+        wm.dispatch(alt_release());
+
+        let client = wm.client(id1).unwrap();
+        assert!(!client.flags.contains(ClientFlags::SHADED), "cycling to a shaded window must unroll it");
+        assert!(client.flags.contains(ClientFlags::FOCUSED));
+    }
+
+    #[test]
+    fn escape_cancels_the_switcher_without_moving_focus() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id2 = wm.client_for_window(w2).unwrap();
+
+        wm.dispatch(alt_tab());
+        assert!(wm.cycle_state().is_some());
+        wm.dispatch(escape());
+
+        assert!(wm.cycle_state().is_none(), "Escape ends the session");
+        assert!(wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED), "cancelling must leave focus untouched");
+    }
+
+    #[test]
+    fn alt_tab_wraps_around_past_the_last_client() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+
+        wm.dispatch(alt_tab()); // selection: w2 -> w1
+        wm.dispatch(alt_tab()); // selection: w1 -> wraps to w2
+        wm.dispatch(alt_release());
+        let _ = id1;
+        assert!(
+            wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "cycling forward from the last client must wrap to the first"
+        );
+    }
+
+    #[test]
+    fn alt_shift_tab_cycles_backward() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+
+        // Focused is w2; Alt+Tab (forward) goes to w1; Alt+Shift+Tab
+        // (backward) from w1 must go back to w2, not onward to w1 again.
+        wm.dispatch(alt_tab());
+        wm.dispatch(alt_shift_tab());
+        wm.dispatch(alt_release());
+        let _ = id1;
+        assert!(wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED));
+    }
+
+    #[test]
+    fn minimizing_and_cancelling_switcher_never_capture_or_restore_a_tile() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let captures = wm.backend().capture_calls.get();
+        wm.miniaturize(id);
+        assert_eq!(wm.backend().capture_calls.get(), captures);
+        wm.dispatch(alt_tab());
+        wm.cycle_end(false);
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Miniaturized);
+        assert_eq!(wm.focused_client(), None);
+        wm.dispatch(alt_tab());
+        wm.dispatch(alt_release());
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Normal);
+        assert_eq!(wm.focused_client(), Some(id));
+    }
+
+    #[test]
+    fn alt_tab_restores_miniaturized_clients_only_on_commit() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let w3 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        wm.dispatch(BackendEvent::MapRequest(w3));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+        let id3 = wm.client_for_window(w3).unwrap();
+        wm.miniaturize(id2);
+
+        wm.dispatch(alt_tab());
+        assert_eq!(wm.client(id2).unwrap().lifecycle, Lifecycle::Miniaturized);
+        assert!(wm.client(id3).unwrap().flags.contains(ClientFlags::FOCUSED));
+        wm.dispatch(alt_release());
+        assert_eq!(wm.client(id2).unwrap().lifecycle, Lifecycle::Normal);
+        assert!(wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.client(id1).unwrap().flags.contains(ClientFlags::FOCUSED));
+
+    }
+
+    /// Clicking the window that already looks focused is how a user
+    /// tries to *repair* focus, so that path must re-assert it rather
+    /// than trust `self.focused`. Regression test for a live Wayland
+    /// bug: an XWayland window focused before its `wl_surface` existed
+    /// left `wm-core` focused and the seat empty, and every click on
+    /// the window hit the "already focused" early return without
+    /// re-sending focus — so it stayed keyboard-dead until the user
+    /// focused a different window and came back.
+    #[test]
+    fn clicking_the_already_focused_window_reasserts_input_focus() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        assert_eq!(wm.focused_client(), Some(id));
+        assert_eq!(wm.backend().focused_window, Some(window));
+
+        // Stands in for the display server never taking the focus the
+        // WM believes it set.
+        wm.backend_mut().focused_window = None;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: Point::new(200, 5),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+
+        assert_eq!(wm.focused_client(), Some(id), "the WM's own focus is unchanged");
+        assert_eq!(
+            wm.backend().focused_window,
+            Some(window),
+            "input focus must be re-asserted on the early-return path, not assumed"
+        );
+    }
+
+    /// Regression test: clicking a window's own *content* (not just its
+    /// titlebar) must be able to focus it. This depends on a passive
+    /// button grab existing on every unfocused client — without one, a
+    /// click on unfocused content never reaches `wm-core` at all (the
+    /// client itself receives it directly, unintercepted), and only
+    /// clicking the frame/titlebar (which `wm-core` always sees, being
+    /// its own window) ever changed focus.
+    #[test]
+    fn clicking_an_unfocused_clients_content_focuses_it() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+
+        // w2 was mapped last, so it's focused — meaning w1, now
+        // unfocused, must have a passive grab so a content click on it
+        // can be seen at all, and w2 (focused) must not have one, so
+        // its own clicks go straight to it.
+        assert!(wm.backend().passively_grabbed.contains(&w1), "unfocused client must be passively grabbed");
+        assert!(!wm.backend().passively_grabbed.contains(&w2), "focused client must not be grabbed");
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(w1),
+            local: Point::new(50, 50),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+
+        assert!(wm.client(id1).unwrap().flags.contains(ClientFlags::FOCUSED), "clicking content must focus the client");
+        assert!(!wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.backend().passively_grabbed.contains(&w1), "now focused, w1 must be ungrabbed");
+        assert!(wm.backend().passively_grabbed.contains(&w2), "now unfocused, w2 must become grabbed");
+        assert_eq!(wm.backend().replay_pointer_calls, 1, "the triggering click must be replayed through to the client");
+    }
+
+    fn content_press(window: FakeWindowId) -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(50, 50),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        }
+    }
+
+    /// The focus state's two halves, checked together: `FOCUSED` marks
+    /// exactly `focused`, and a client holds the click-to-focus grab
+    /// exactly when a content click could focus it and it does not
+    /// already have focus. A client parked on another workspace or
+    /// miniaturized counts: the grab is inert until it is shown, and
+    /// has to be there when it is.
+    fn assert_focus_invariants(wm: &WindowManager<FakeBackend>, context: &str) {
+        let flagged: Vec<_> = wm
+            .clients
+            .iter()
+            .filter(|(_, client)| client.flags.contains(ClientFlags::FOCUSED))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(flagged, wm.focused_client().into_iter().collect::<Vec<_>>(), "{context}");
+        for (id, client) in wm.clients.iter() {
+            let wants_grab = wm.focused_client() != Some(id) && !client.flags.contains(ClientFlags::NO_FOCUS);
+            assert_eq!(
+                wm.backend().passively_grabbed.contains(&client.window),
+                wants_grab,
+                "{context}: {id:?} grabbed should be {wants_grab}"
+            );
+        }
+    }
+
+    /// Sending the only window on a workspace away clears focus rather
+    /// than handing it on, and that clear used to be written out by
+    /// hand without the re-grab `focus_client_with` gives a window it
+    /// takes focus from. Two windows sent away like that and then
+    /// visited left the older one on screen, unfocused and ungrabbed:
+    /// on X11 a click on its content went straight to the client, and
+    /// only its titlebar could focus it.
+    #[test]
+    fn a_window_sent_away_alone_is_still_focused_by_a_content_click() {
+        let mut backend = FakeBackend::new();
+        let a_window = backend.create_window();
+        let b_window = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(a_window));
+        let a = wm.client_for_window(a_window).unwrap();
+        assert_focus_invariants(&wm, "A mapped");
+        wm.move_client_to_workspace(a, 1);
+        assert_eq!(wm.focused_client(), None, "nothing is left on workspace 0 to take focus");
+        assert_focus_invariants(&wm, "A sent away");
+
+        wm.dispatch(BackendEvent::MapRequest(b_window));
+        let b = wm.client_for_window(b_window).unwrap();
+        assert_eq!(wm.focused_client(), Some(b));
+        assert_focus_invariants(&wm, "B mapped");
+        wm.move_client_to_workspace(b, 1);
+        assert_focus_invariants(&wm, "B sent away");
+
+        wm.switch_workspace(1);
+        assert_eq!(wm.focused_client(), Some(b), "the most recently focused window takes focus");
+        assert_focus_invariants(&wm, "workspace 1 shown");
+        assert!(wm.backend().passively_grabbed.contains(&a_window), "A is on screen and unfocused");
+
+        wm.dispatch(content_press(a_window));
+        assert_eq!(wm.focused_client(), Some(a), "a click on A's content focuses it");
+        assert_focus_invariants(&wm, "A clicked");
+    }
+
+    /// A `no_initial_focus` window never passes through `focus_client`
+    /// at map, so it never lost focus either, and the grab used to be
+    /// installed only on losing it. It has to be grabbed from the
+    /// moment it is managed.
+    #[test]
+    fn a_window_mapped_without_initial_focus_is_focused_by_a_content_click() {
+        let mut backend = FakeBackend::new();
+        let first = backend.create_window();
+        let fresh = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(first));
+        wm.set_float_policy(Some(std::sync::Arc::new(NoInitialFocus)));
+        wm.dispatch(BackendEvent::MapRequest(fresh));
+        let first_id = wm.client_for_window(first).unwrap();
+        let fresh_id = wm.client_for_window(fresh).unwrap();
+        assert_eq!(wm.focused_client(), Some(first_id), "the rule leaves focus where it was");
+        assert!(wm.backend().passively_grabbed.contains(&fresh), "the fresh window is grabbed from map");
+        assert_focus_invariants(&wm, "mapped without focus");
+
+        wm.dispatch(content_press(fresh));
+        assert_eq!(wm.focused_client(), Some(fresh_id));
+        assert_focus_invariants(&wm, "clicked");
+    }
+
+    /// The other gestures that clear focus from a window with no
+    /// successor to give it to: switching away from its workspace and
+    /// miniaturizing it. Both go through `focus_successor_of`.
+    #[test]
+    fn a_window_left_without_a_successor_keeps_its_click_to_focus_grab() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(!wm.backend().passively_grabbed.contains(&window), "the focused window is not grabbed");
+
+        wm.switch_workspace(1);
+        assert_eq!(wm.focused_client(), None);
+        assert_focus_invariants(&wm, "switched away");
+
+        wm.switch_workspace(0);
+        assert_eq!(wm.focused_client(), Some(id), "coming back refocuses it");
+        assert_focus_invariants(&wm, "switched back");
+
+        wm.miniaturize(id);
+        assert_eq!(wm.focused_client(), None);
+        assert_focus_invariants(&wm, "miniaturized");
+    }
+
+    /// Regression test: hovering a resize corner/edge must set a
+    /// distinct cursor there (the visual half of the resize affordance —
+    /// `render_decoration`'s grip marks are the other half), and it
+    /// must revert to the default the moment the pointer moves off the
+    /// hitbox onto plain frame area, not stick.
+    #[test]
+    fn hovering_a_resize_corner_sets_a_distinct_cursor() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let se_corner = wm
+            .client(id)
+            .unwrap()
+            .layout
+            .resize_hitboxes
+            .iter()
+            .find(|(e, _)| *e == ResizeEdge::SouthEast)
+            .unwrap()
+            .1
+            .pos;
+
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(0, 0),
+            surface_local: Some((SurfaceRef::Frame(frame), se_corner)),
+        });
+        assert_eq!(
+            wm.backend().frame_cursor.get(&frame),
+            Some(&Some(ResizeEdge::SouthEast)),
+            "hovering the SE corner must set the SE resize cursor"
+        );
+
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(0, 0),
+            surface_local: Some((SurfaceRef::Frame(frame), Point::new(5, 5))), // plain titlebar area
+        });
+        assert_eq!(
+            wm.backend().frame_cursor.get(&frame),
+            Some(&None),
+            "moving off the hitbox must revert to the default cursor"
+        );
+    }
+
+    #[test]
+    fn pointer_enter_is_ignored_under_the_default_click_to_focus_policy() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let frame1 = wm.client(id1).unwrap().frame.unwrap();
+
+        wm.dispatch(BackendEvent::PointerEnter { surface: SurfaceRef::Frame(frame1) });
+
+        assert!(
+            !wm.client(id1).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "click-to-focus must not react to a bare pointer-enter"
+        );
+    }
+
+    #[test]
+    fn focus_follows_mouse_focuses_on_pointer_enter() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_focus_policy(FocusPolicy::FocusFollowsMouse);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+        let frame1 = wm.client(id1).unwrap().frame.unwrap();
+        assert!(wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED), "mapping w2 last should focus it");
+
+        wm.dispatch(BackendEvent::PointerEnter { surface: SurfaceRef::Frame(frame1) });
+
+        assert!(wm.client(id1).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED));
+    }
+
+    /// The incident, in three windows: a palette on top of an editor,
+    /// and a pointer travelling past the editor on its way elsewhere.
+    /// With `autoraise` off the crossing must move the keyboard and
+    /// nothing else — the stack the user arranged stays arranged.
+    #[test]
+    fn sloppy_focus_without_autoraise_moves_focus_without_restacking() {
+        let mut backend = FakeBackend::new();
+        let editor = backend.create_window();
+        let palette = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_focus_policy(FocusPolicy::FocusFollowsMouse);
+        wm.set_raise_on_focus(false);
+        wm.dispatch(BackendEvent::MapRequest(editor));
+        wm.dispatch(BackendEvent::MapRequest(palette));
+        let editor_id = wm.client_for_window(editor).unwrap();
+        let editor_frame = wm.client(editor_id).unwrap().frame.unwrap();
+        let palette_id = wm.client_for_window(palette).unwrap();
+        let palette_frame = wm.client(palette_id).unwrap().frame.unwrap();
+        wm.backend_mut().raised_frames.clear();
+
+        wm.dispatch(BackendEvent::PointerEnter { surface: SurfaceRef::Frame(editor_frame) });
+
+        assert!(
+            wm.client(editor_id).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "the crossing must still hand over the keyboard"
+        );
+        assert!(
+            wm.backend().raised_frames.is_empty(),
+            "no window may be restacked by a pointer merely crossing it: {:?}",
+            wm.backend().raised_frames
+        );
+        // And the palette is still the front window, which is the whole
+        // point: it is what the user would otherwise have to fish out.
+        assert_ne!(editor_frame, palette_frame);
+    }
+
+    /// The default is unchanged, so a session that sets nothing behaves
+    /// exactly as every release before this one did.
+    #[test]
+    fn sloppy_focus_raises_on_crossing_by_default() {
+        let mut backend = FakeBackend::new();
+        let editor = backend.create_window();
+        let palette = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_focus_policy(FocusPolicy::FocusFollowsMouse);
+        wm.dispatch(BackendEvent::MapRequest(editor));
+        wm.dispatch(BackendEvent::MapRequest(palette));
+        let editor_id = wm.client_for_window(editor).unwrap();
+        let editor_frame = wm.client(editor_id).unwrap().frame.unwrap();
+        wm.backend_mut().raised_frames.clear();
+
+        wm.dispatch(BackendEvent::PointerEnter { surface: SurfaceRef::Frame(editor_frame) });
+
+        assert_eq!(
+            wm.backend().raised_frames,
+            vec![editor_frame],
+            "autoraise defaults to on, and on means the crossing raises"
+        );
+    }
+
+    /// The raise belongs to the click, not to the focus. `autoraise`
+    /// governs pointer crossings only, and must not disarm a click.
+    #[test]
+    fn a_click_still_raises_with_autoraise_off() {
+        let mut backend = FakeBackend::new();
+        let editor = backend.create_window();
+        let palette = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_focus_policy(FocusPolicy::FocusFollowsMouse);
+        wm.set_raise_on_focus(false);
+        wm.dispatch(BackendEvent::MapRequest(editor));
+        wm.dispatch(BackendEvent::MapRequest(palette));
+        let editor_id = wm.client_for_window(editor).unwrap();
+        let editor_frame = wm.client(editor_id).unwrap().frame.unwrap();
+        wm.backend_mut().raised_frames.clear();
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(editor),
+            local: Point::new(20, 20),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 100,
+            mods: Modifiers::empty(),
+        });
+
+        assert_eq!(
+            wm.backend().raised_frames,
+            vec![editor_frame],
+            "a click raises what it lands on whatever autoraise says"
+        );
+    }
+
+    /// The counterpart to `raise_client_to_top`, which had no opposite
+    /// number before: keyboard without stack.
+    #[test]
+    fn focus_client_without_raising_is_focus_without_stack() {
+        let mut backend = FakeBackend::new();
+        let editor = backend.create_window();
+        let palette = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(editor));
+        wm.dispatch(BackendEvent::MapRequest(palette));
+        let editor_id = wm.client_for_window(editor).unwrap();
+        let palette_id = wm.client_for_window(palette).unwrap();
+        wm.backend_mut().raised_frames.clear();
+
+        assert!(wm.focus_client_without_raising(editor_id));
+
+        assert!(wm.client(editor_id).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.client(palette_id).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(
+            wm.backend().raised_frames.is_empty(),
+            "asking for focus by name must not move the stack: {:?}",
+            wm.backend().raised_frames
+        );
+        // A dead id is refused rather than panicking, exactly as
+        // `raise_client_to_top` refuses one.
+        wm.dispatch(BackendEvent::Destroyed(palette));
+        assert!(!wm.focus_client_without_raising(palette_id));
+    }
+
+    /// `_NET_WM_STATE_ABOVE` / `_NET_WM_STATE_STICKY` reach the one
+    /// pinned concept this desktop has. Both atoms arrive as
+    /// `NetState::Pinned`, so this covers either spelling.
+    #[test]
+    fn a_client_can_ask_to_be_pinned_and_unpinned() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::Pinned,
+            second: None,
+        });
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::STICKY));
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Toggle,
+            first: NetState::Pinned,
+            second: None,
+        });
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::STICKY), "toggle is not add");
+    }
+
+    /// Pinning puts a window above ordinary ones on every workspace, so
+    /// it is stacking-adjacent and answers to the same rule the
+    /// activation path does.
+    #[test]
+    fn a_no_activate_window_cannot_pin_itself() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(NoActivate)));
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::NO_ACTIVATE));
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::Pinned,
+            second: None,
+        });
+
+        assert!(
+            !wm.client(id).unwrap().flags.contains(ClientFlags::STICKY),
+            "a rule that refuses activation must also refuse the top of every workspace"
+        );
+    }
+
+    /// The EWMH and ICCCM halves of the attention story both land here.
+    #[test]
+    fn a_client_can_demand_attention_and_withdraw_it() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let other = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::MapRequest(other));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::DemandsAttention,
+            second: None,
+        });
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::URGENT));
+
+        // A client that clears its own `WM_HINTS` urgency bit arrives
+        // as Remove, and the flag has to go.
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Remove,
+            first: NetState::DemandsAttention,
+            second: None,
+        });
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::URGENT));
+    }
+
+    /// `_NET_WM_STATE_SHADED` drives the titlebar's own shade, so a
+    /// pager that finds the atom in `_NET_SUPPORTED` is not answered
+    /// with silence.
+    #[test]
+    fn a_client_can_ask_to_be_shaded_and_unshaded() {
+        let (mut wm, id, window) = shadeable_window();
+        let request = |action| BackendEvent::NetStateRequested { window, action, first: NetState::Shaded, second: None };
+
+        wm.dispatch(request(NetStateAction::Add));
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        assert_eq!(wm.backend().client_mapped.get(&window), Some(&false), "shading rolls the content away");
+
+        wm.dispatch(request(NetStateAction::Toggle));
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "toggle is not add");
+
+        wm.dispatch(request(NetStateAction::Toggle));
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+
+        wm.dispatch(request(NetStateAction::Remove));
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        assert_eq!(wm.backend().client_mapped.get(&window), Some(&true));
+    }
+
+    /// The request goes through `shade`, refusals included: a
+    /// fullscreen window has no titlebar to roll up into.
+    #[test]
+    fn a_shade_request_cannot_roll_up_a_fullscreen_window() {
+        let (mut wm, id, window) = shadeable_window();
+        wm.fullscreen(id);
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::Shaded,
+            second: None,
+        });
+
+        let flags = wm.client(id).unwrap().flags;
+        assert!(flags.contains(ClientFlags::FULLSCREEN));
+        assert!(!flags.contains(ClientFlags::SHADED));
+    }
+
+    /// Before this, nothing in the tree ever called `set_urgent(_,
+    /// false)`: a window that rang once stayed urgent for the rest of
+    /// its life, including while the user sat in it.
+    #[test]
+    fn focusing_an_urgent_window_dismisses_the_urgency() {
+        let mut backend = FakeBackend::new();
+        let noisy = backend.create_window();
+        let other = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(noisy));
+        wm.dispatch(BackendEvent::MapRequest(other));
+        let noisy_id = wm.client_for_window(noisy).unwrap();
+        let other_id = wm.client_for_window(other).unwrap();
+        // `other` mapped last and holds focus, so `noisy` is genuinely
+        // in the background when it asks.
+        assert!(wm.client(other_id).unwrap().flags.contains(ClientFlags::FOCUSED));
+        wm.set_urgent(noisy_id, true);
+        assert!(wm.client(noisy_id).unwrap().flags.contains(ClientFlags::URGENT));
+
+        wm.dispatch(BackendEvent::ActivateRequested(noisy));
+
+        assert!(wm.client(noisy_id).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(
+            !wm.client(noisy_id).unwrap().flags.contains(ClientFlags::URGENT),
+            "attention was asked for and given; an urgency that cannot be dismissed is worse than none"
+        );
+    }
+
+    /// `XRaiseWindow` asks for the front and nothing else. Answering
+    /// it with an activation would hand over the keyboard the client
+    /// never asked for.
+    #[test]
+    fn a_raise_request_raises_without_taking_focus() {
+        let mut backend = FakeBackend::new();
+        let lower = backend.create_window();
+        let upper = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(lower));
+        wm.dispatch(BackendEvent::MapRequest(upper));
+        let lower_id = wm.client_for_window(lower).unwrap();
+        let lower_frame = wm.client(lower_id).unwrap().frame.unwrap();
+        let upper_id = wm.client_for_window(upper).unwrap();
+        assert!(wm.client(upper_id).unwrap().flags.contains(ClientFlags::FOCUSED));
+        wm.backend_mut().raised_frames.clear();
+
+        wm.dispatch(BackendEvent::RaiseRequest(lower));
+
+        assert_eq!(
+            wm.backend().raised_frames,
+            vec![lower_frame],
+            "the window that asked must come to the front"
+        );
+        assert!(
+            wm.client(upper_id).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "a raise is not an activation; the keyboard must not move"
+        );
+        assert!(!wm.client(lower_id).unwrap().flags.contains(ClientFlags::FOCUSED));
+    }
+
+    /// A stale id is ignored rather than panicking, the same way every
+    /// other backend-request arm treats one.
+    #[test]
+    fn a_raise_request_for_an_unknown_window_is_ignored() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::Destroyed(window));
+        wm.backend_mut().raised_frames.clear();
+
+        wm.dispatch(BackendEvent::RaiseRequest(window));
+
+        assert!(wm.backend().raised_frames.is_empty());
+    }
+
+    #[test]
+    fn new_clients_map_onto_the_current_workspace() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.switch_workspace(2);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().workspace, 2);
+    }
+
+    #[test]
+    fn switching_workspace_hides_clients_not_on_it_and_shows_clients_that_are() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1)); // lands on workspace 0
+        let id1 = wm.client_for_window(w1).unwrap();
+        let frame1 = wm.client(id1).unwrap().frame.unwrap();
+        wm.switch_workspace(1);
+        wm.dispatch(BackendEvent::MapRequest(w2)); // lands on workspace 1
+        let id2 = wm.client_for_window(w2).unwrap();
+        let frame2 = wm.client(id2).unwrap().frame.unwrap();
+        assert!(wm.backend().mapped_frames.contains(&frame2));
+
+        wm.switch_workspace(0);
+
+        assert!(wm.backend().mapped_frames.contains(&frame1), "workspace 0's client must be shown again");
+        assert!(wm.backend().unmapped_frames.contains(&frame2), "workspace 1's client must be hidden");
+        assert_eq!(wm.current_workspace(), 0);
+    }
+
+    /// Regression test: same bug as `deminiaturize_repaints_the_frame_
+    /// after_remapping`, different trigger — switching back to a
+    /// workspace remapped its clients' frames via `map_frame` alone,
+    /// with no repaint, so a frame without backing-store could come back
+    /// blank instead of showing its titlebar again.
+    #[test]
+    fn switching_back_to_a_workspace_repaints_its_remapped_frames() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1)); // lands on workspace 0
+        let id1 = wm.client_for_window(w1).unwrap();
+        let frame1 = wm.client(id1).unwrap().frame.unwrap();
+        wm.switch_workspace(1);
+        let paints_before = wm.backend().paint_count.get(&frame1).copied().unwrap_or(0);
+
+        wm.switch_workspace(0);
+
+        let paints_after = wm.backend().paint_count.get(&frame1).copied().unwrap_or(0);
+        assert!(
+            paints_after > paints_before,
+            "switching back onto a workspace must repaint the frames it just remapped"
+        );
+    }
+
+    #[test]
+    fn switching_workspace_grows_the_row_on_demand() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+        assert_eq!(wm.workspace_count(), 1);
+
+        wm.switch_workspace(3);
+
+        assert_eq!(wm.workspace_count(), 4, "switching to index 3 means 4 workspaces (0..=3) now exist");
+    }
+
+    #[test]
+    fn removing_any_workspace_preserves_focus_windows_and_compacts_memberships() {
+        for removed in 0..4 {
+            for active in 0..4 {
+                let mut wm = wm(FakeBackend::new());
+                let mut ids = Vec::new();
+                for workspace in 0..4 {
+                    wm.switch_workspace(workspace);
+                    let window = wm.backend_mut().create_window();
+                    wm.dispatch(BackendEvent::MapRequest(window));
+                    ids.push(wm.client_for_window(window).unwrap());
+                }
+                let window = wm.backend_mut().create_window();
+                wm.dispatch(BackendEvent::MapRequest(window));
+                let minimized = wm.client_for_window(window).unwrap();
+                wm.miniaturize(minimized);
+                wm.move_client_to_workspace(minimized, removed);
+                let mini_frame = wm.client(minimized).unwrap().frame.unwrap();
+                wm.switch_workspace(active);
+                wm.focus_client(ids[active]);
+                let before = wm.clients.len();
+                wm.backend_mut().mapped_frames.clear();
+                wm.backend_mut().unmapped_frames.clear();
+
+                assert!(wm.remove_workspace(removed));
+                let expected = |index: usize| if index == removed {
+                    removed.saturating_sub(1)
+                } else {
+                    index - usize::from(index > removed)
+                };
+                assert_eq!(wm.workspace_count(), 3);
+                assert_eq!(wm.current_workspace(), expected(active));
+                assert_eq!(wm.focused_client(), Some(ids[active]));
+                assert_eq!(wm.clients.len(), before, "closing a desktop never closes an application");
+                for (old, id) in ids.iter().enumerate() {
+                    let client = wm.client(*id).unwrap();
+                    assert_eq!(client.workspace, expected(old));
+                    let newly_visible = old != active && expected(old) == expected(active);
+                    assert_eq!(wm.backend().mapped_frames.contains(&client.frame.unwrap()), newly_visible);
+                    if old != expected(old) {
+                        assert!(wm.backend().published_window_desktops.contains(&(client.window, expected(old))));
+                    }
+                }
+                assert!(wm.backend().unmapped_frames.is_empty(), "visible windows never blink during a merge");
+                assert!(!wm.backend().mapped_frames.contains(&mini_frame));
+                assert_eq!(wm.client(minimized).unwrap().lifecycle, Lifecycle::Miniaturized);
+                assert_eq!(wm.client(minimized).unwrap().workspace, removed.saturating_sub(1));
+                assert_eq!(wm.backend().published_workspaces.last(), Some(&(3, expected(active))));
+                assert_eq!(wm.backend().published_workareas.last().unwrap().1, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn removing_empty_desktops_restores_focus_and_cannot_remove_the_last() {
+        let mut wm = wm(FakeBackend::new());
+        assert!(!wm.workspace_has_windows(0));
+        assert!(!wm.remove_workspace(0));
+        let window = wm.backend_mut().create_window();
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.workspace_has_windows(0));
+        wm.miniaturize(id);
+        assert!(wm.workspace_has_windows(0), "minimized windows still occupy a desktop");
+        wm.deminiaturize(id);
+        wm.switch_workspace(7);
+        assert!(!wm.remove_workspace(8));
+        assert!(!wm.remove_workspace(usize::MAX));
+        for index in (1..8).rev() {
+            assert!(wm.remove_workspace(index));
+            assert_eq!((wm.workspace_count(), wm.current_workspace()), (index, index - 1));
+        }
+        assert_eq!(wm.focused_client(), Some(id));
+        assert!(!wm.remove_workspace(0));
+        assert_eq!(wm.workspace_count(), 1);
+    }
+
+    #[test]
+    fn removing_a_desktop_keeps_frameless_dialogs_together_and_pinned_windows_visible() {
+        let mut backend = FakeBackend::new();
+        let parent = backend.create_window();
+        let dialog = backend.create_window();
+        backend.set_client_draws_own_chrome(parent, true);
+        backend.set_client_draws_own_chrome(dialog, true);
+        backend.set_window_parent(dialog, parent);
+        let mut wm = wm(backend);
+        wm.switch_workspace(1);
+        wm.dispatch(BackendEvent::MapRequest(parent));
+        wm.dispatch(BackendEvent::MapRequest(dialog));
+        let parent_id = wm.client_for_window(parent).unwrap();
+        let dialog_id = wm.client_for_window(dialog).unwrap();
+        wm.switch_workspace(0);
+        assert!(!wm.backend().mapped_frameless.contains(&parent));
+        assert!(!wm.backend().mapped_frameless.contains(&dialog));
+        assert!(wm.remove_workspace(1));
+        assert!(wm.backend().mapped_frameless.contains(&parent));
+        assert!(wm.backend().mapped_frameless.contains(&dialog));
+        assert_eq!(wm.client(dialog_id).unwrap().parent, Some(parent_id));
+        assert_eq!(wm.client(dialog_id).unwrap().workspace, wm.client(parent_id).unwrap().workspace);
+        wm.set_client_pinned(parent_id, true);
+        wm.switch_workspace(2);
+        assert!(wm.remove_workspace(0));
+        assert!(wm.backend().mapped_frameless.contains(&parent));
+        assert!(wm.client(parent_id).unwrap().flags.contains(ClientFlags::STICKY));
+    }
+
+    /// Three mapped windows on the current workspace, focused in the
+    /// order returned: `a`, then `b`, then `c` — so `c` holds focus and
+    /// `b` is "the last window I was in".
+    fn three_focused_in_order() -> (WindowManager<FakeBackend>, ClientId, ClientId, ClientId) {
+        let mut backend = FakeBackend::new();
+        let windows: Vec<_> = (0..3).map(|_| backend.create_window()).collect();
+        let mut wm = wm(backend);
+        let mut ids = Vec::new();
+        for window in windows {
+            wm.dispatch(BackendEvent::MapRequest(window));
+            ids.push(wm.client_for_window(window).unwrap());
+        }
+        // Mapping focuses each in turn, so the history is already
+        // a, b, c — but say so explicitly rather than depend on it.
+        for &id in &ids {
+            wm.focus_client(id);
+        }
+        (wm, ids[0], ids[1], ids[2])
+    }
+
+    #[test]
+    fn closing_the_focused_window_hands_the_keyboard_to_the_previous_one() {
+        // The headline symptom: on a click-to-focus desktop this read
+        // as "I closed a window and my keyboard stopped working".
+        let (mut wm, a, b, c) = three_focused_in_order();
+        let window = wm.client(c).unwrap().window;
+
+        wm.dispatch(BackendEvent::Destroyed(window));
+
+        assert_eq!(wm.focused_client(), Some(b), "focus goes to the most recently used survivor");
+        assert!(wm.client(b).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.focus_history().contains(&c), "a destroyed client leaves the history");
+        assert!(wm.client(a).is_some(), "and the older window is untouched");
+    }
+
+    #[test]
+    fn miniaturizing_the_focused_window_hands_the_keyboard_on() {
+        let (mut wm, _a, b, c) = three_focused_in_order();
+
+        wm.miniaturize(c);
+
+        assert_eq!(wm.focused_client(), Some(b));
+        assert_eq!(wm.client(c).unwrap().lifecycle, Lifecycle::Miniaturized);
+        assert!(
+            !wm.client(c).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "a miniaturized window must not stay marked focused"
+        );
+    }
+
+    #[test]
+    fn switching_to_a_workspace_focuses_something_that_is_actually_on_it() {
+        // The one that most changes the felt behaviour: a workspace you
+        // return to should come back the way you left it, not with its
+        // windows on screen and none of them holding the keyboard.
+        let (mut wm, a, _b, c) = three_focused_in_order();
+        wm.move_client_to_workspace(a, 1);
+        wm.switch_workspace(1);
+
+        assert_eq!(wm.focused_client(), Some(a), "the window on the destination takes focus");
+
+        // And back again, to the window that was focused here.
+        wm.switch_workspace(0);
+        assert_eq!(wm.focused_client(), Some(c), "returning restores the workspace's own last focus");
+    }
+
+    #[test]
+    fn returning_from_an_empty_workspace_restores_its_most_recent_window() {
+        let (mut wm, _a, _b, c) = three_focused_in_order();
+        for _ in 0..10 {
+            wm.switch_workspace(1);
+            assert_eq!(wm.focused_client(), None);
+            wm.switch_workspace(0);
+            assert_eq!(wm.focused_client(), Some(c),
+                "a previously empty desk has no old focus to nominate a successor");
+            assert!(wm.client(c).unwrap().flags.contains(ClientFlags::FOCUSED));
+        }
+    }
+
+    #[test]
+    fn single_successor_matches_cycle_order_across_visibility_and_focus_restrictions() {
+        for mask in 0..512u32 {
+            let (mut wm, a, b, c) = three_focused_in_order();
+            for (index, id) in [a, b, c].into_iter().enumerate() {
+                let bits = mask >> (index * 3);
+                let client = wm.clients.get_mut(id).unwrap();
+                client.workspace = usize::from(bits & 1 != 0);
+                client.flags.set(ClientFlags::NO_FOCUS, bits & 2 != 0);
+                if bits & 4 != 0 {
+                    client.lifecycle = Lifecycle::Miniaturized;
+                }
+            }
+            for excluding in [None, Some(a), Some(b), Some(c)] {
+                let expected = wm.focus_order().into_iter().find(|id| Some(*id) != excluding);
+                assert_eq!(wm.focus_successor(excluding), expected,
+                    "mask {mask}, exclusion {excluding:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_destination_workspace_still_clears_focus() {
+        // The successor search must not invent one. This is the
+        // behaviour `switching_away_defocuses_a_client_left_behind`
+        // pins for a single window; asserted here for the flag *and*
+        // the field together.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.switch_workspace(1);
+
+        assert_eq!(wm.focused_client(), None);
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED));
+    }
+
+    #[test]
+    fn one_alt_tab_flips_to_the_previous_window() {
+        // The single most common use of the key, and the one that did
+        // not exist: cycling walked creation order, so the first press
+        // selected whatever opened first and pressing twice advanced
+        // two along that ring instead of coming back.
+        let (mut wm, _a, b, c) = three_focused_in_order();
+
+        wm.dispatch(alt_tab());
+        wm.dispatch(alt_release());
+        assert_eq!(wm.focused_client(), Some(b), "one Tab lands on the previous window");
+
+        // And again returns to where it started: the flip.
+        wm.dispatch(alt_tab());
+        wm.dispatch(alt_release());
+        assert_eq!(wm.focused_client(), Some(c), "a second flip returns");
+    }
+
+    #[test]
+    fn one_initial_alt_shift_tab_moves_backward_through_three_windows() {
+        let (mut wm, a, _b, _c) = three_focused_in_order();
+
+        wm.dispatch(alt_shift_tab());
+        wm.dispatch(alt_release());
+
+        assert_eq!(wm.focused_client(), Some(a), "a fresh backward cycle wraps from current to oldest");
+    }
+
+    #[test]
+    fn a_never_focused_window_is_still_reachable_by_cycling() {
+        // Ordering by focus history must not make a window that has
+        // never held focus unreachable — that would be a worse bug than
+        // the one being fixed.
+        let (mut wm, _a, _b, c) = three_focused_in_order();
+        wm.set_float_policy(Some(std::sync::Arc::new(NoInitialFocus)));
+        let fresh = wm.backend_mut().create_window();
+        wm.dispatch(BackendEvent::MapRequest(fresh));
+        let fresh_id = wm.client_for_window(fresh).unwrap();
+        assert_eq!(wm.focused_client(), Some(c), "the rule leaves focus on the existing client");
+        assert!(
+            !wm.focus_history().contains(&fresh_id),
+            "the fallback is only tested if the fresh client truly never held focus"
+        );
+
+        let order = wm.focus_order();
+        assert!(order.contains(&fresh_id), "every focusable window is reachable: {order:?}");
+        assert_eq!(order.first(), Some(&c), "and the focused one leads");
+
+        // The modal path snapshots that order. Walk past the two
+        // previously focused survivors and commit the never-focused
+        // tail, proving the fallback is reachable through the gesture
+        // rather than only present in a private helper's return value.
+        for _ in 0..3 {
+            wm.dispatch(alt_tab());
+        }
+        wm.dispatch(alt_release());
+        assert_eq!(wm.focused_client(), Some(fresh_id));
+    }
+
+    #[test]
+    fn the_focus_history_holds_each_live_client_exactly_once() {
+        // The two invariants the vector has, and the reason it has only
+        // two writers. Refocusing must not duplicate, and a destroyed
+        // client must not linger — a stale id would make the successor
+        // search hand focus to a window that no longer exists.
+        let (mut wm, a, b, c) = three_focused_in_order();
+        for _ in 0..3 {
+            wm.focus_client(a);
+            wm.focus_client(b);
+        }
+        let history = wm.focus_history().to_vec();
+        let mut unique = history.clone();
+        unique.sort_by_key(|id| format!("{id:?}"));
+        unique.dedup();
+        assert_eq!(unique.len(), history.len(), "a client appears at most once: {history:?}");
+        for &id in &history {
+            assert!(wm.client(id).is_some(), "the history names a client that no longer exists");
+        }
+        assert_eq!(history.last(), Some(&b), "the back of the vector is the focused client");
+
+        let window = wm.client(c).unwrap().window;
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert!(!wm.focus_history().contains(&c));
+        for &id in wm.focus_history() {
+            assert!(wm.client(id).is_some());
+        }
+    }
+
+    #[test]
+    fn switching_away_defocuses_a_client_left_behind() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED));
+
+        wm.switch_workspace(1);
+
+        assert!(
+            !wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "a client hidden by a workspace switch must not stay marked focused"
+        );
+    }
+
+    #[test]
+    fn miniaturized_clients_are_unaffected_by_workspace_switching() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        wm.miniaturize(id);
+
+        wm.switch_workspace(1);
+        wm.switch_workspace(0);
+
+        // Still miniaturized, not silently remapped by the round trip.
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Miniaturized);
+    }
+
+    /// Regression test: a window miniaturized on workspace 0 and
+    /// restored while viewing workspace 1 stayed *assigned* to 0 — it
+    /// appeared over workspace 1 (the map is unconditional) but
+    /// lingered on 0 after the next switch back and vanished from 1,
+    /// because `deminiaturize` never updated the client's workspace.
+    /// Restoring must adopt the workspace that's active at restore
+    /// time: explicit activation means "bring it here".
+    #[test]
+    fn deminiaturize_restores_onto_the_active_workspace() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        wm.miniaturize(id);
+        wm.switch_workspace(1);
+        wm.deminiaturize(id);
+
+        assert_eq!(wm.client(id).unwrap().workspace, 1, "restore must adopt the active workspace");
+        assert!(wm.backend().mapped_frames.contains(&frame), "restored window must be visible here");
+        assert_eq!(
+            wm.backend().published_window_desktops.last(),
+            Some(&(window, 1)),
+            "pagers must hear the new workspace via _NET_WM_DESKTOP"
+        );
+
+        // The exact ghost the bug produced: back on workspace 0 the
+        // window must be gone, and on workspace 1 it must be present.
+        wm.switch_workspace(0);
+        assert!(wm.backend().unmapped_frames.contains(&frame), "the old workspace must not keep the window");
+        wm.switch_workspace(1);
+        assert!(wm.backend().mapped_frames.contains(&frame), "the adopting workspace keeps the window");
+    }
+
+    /// Restoring on the same workspace the window was miniaturized on
+    /// must not churn state: no workspace change, no `_NET_WM_DESKTOP`
+    /// republish.
+    #[test]
+    fn deminiaturize_on_the_same_workspace_republishes_nothing() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.miniaturize(id);
+        let publishes_before = wm.backend().published_window_desktops.len();
+        wm.deminiaturize(id);
+
+        assert_eq!(wm.client(id).unwrap().workspace, 0);
+        assert_eq!(
+            wm.backend().published_window_desktops.len(),
+            publishes_before,
+            "a same-workspace restore must not republish the desktop property"
+        );
+    }
+
+    #[test]
+    fn move_client_to_workspace_hides_it_when_not_on_the_active_workspace() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        wm.move_client_to_workspace(id, 1);
+
+        assert_eq!(wm.client(id).unwrap().workspace, 1);
+        assert!(wm.backend().unmapped_frames.contains(&frame));
+        assert_eq!(wm.current_workspace(), 0, "moving a client must not itself change the active workspace");
+    }
+
+    #[test]
+    fn moving_the_focused_client_away_focuses_the_exposed_client() {
+        let mut backend = FakeBackend::new();
+        let remaining_window = backend.create_window();
+        let departing_window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(remaining_window));
+        wm.dispatch(BackendEvent::MapRequest(departing_window));
+        let remaining = wm.client_for_window(remaining_window).unwrap();
+        let departing = wm.client_for_window(departing_window).unwrap();
+        assert_eq!(wm.focused_client(), Some(departing));
+
+        wm.move_client_to_workspace(departing, 1);
+
+        assert_eq!(wm.current_workspace(), 0, "a silent send must leave the user on the current workspace");
+        assert_eq!(wm.client(departing).unwrap().workspace, 1);
+        assert_eq!(wm.focused_client(), Some(remaining), "the exposed window should receive keyboard focus");
+        assert_eq!(wm.backend().published_active_windows.last(), Some(&Some(remaining_window)));
+    }
+
+    #[test]
+    fn moving_a_pinned_client_does_not_take_focus_from_it() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.set_client_pinned(id, true));
+
+        wm.move_client_to_workspace(id, 1);
+
+        assert_eq!(wm.focused_client(), Some(id));
+        assert_eq!(wm.client(id).unwrap().workspace, 1);
+    }
+
+    // Workspace keybindings are config-driven from the binary now
+    // (see `bind_default_keys`), so the public methods ARE the
+    // dispatch path a bound key takes — these tests exercise them
+    // directly instead of synthesizing hardcoded arrow-key presses.
+
+    #[test]
+    fn switch_workspace_round_trips() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+
+        wm.switch_workspace(1);
+        assert_eq!(wm.current_workspace(), 1);
+
+        wm.switch_workspace(0);
+        assert_eq!(wm.current_workspace(), 0);
+    }
+
+    #[test]
+    fn switching_to_the_current_workspace_is_a_complete_no_op() {
+        // The "don't go below zero" guard lives with the keybinding
+        // driver in the binary; what wm-core itself guarantees is that
+        // a same-index switch changes nothing and publishes nothing —
+        // a pager re-sending the current desktop must not trigger a
+        // spurious remap/republish storm.
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+        let publishes_before = wm.backend().published_workspaces.len();
+
+        wm.switch_workspace(0);
+
+        assert_eq!(wm.current_workspace(), 0);
+        assert_eq!(
+            wm.backend().published_workspaces.len(),
+            publishes_before,
+            "a same-workspace switch must not re-publish"
+        );
+    }
+
+    /// The carry gesture (formerly hardcoded Alt+Shift+arrows) is
+    /// driven from the binary now as move + switch + re-focus through
+    /// the public API. This locks in that the sequence works end to
+    /// end — in particular that focus can be re-established after
+    /// `move_client_to_workspace` deliberately drops it (the client
+    /// leaves the active workspace mid-sequence), since carrying one
+    /// window across several workspaces in repeated presses depends on
+    /// it ending up focused after every hop.
+    #[test]
+    fn carrying_a_client_via_public_calls_moves_switches_and_refocuses() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        assert_eq!(
+            wm.backend().published_window_desktops.last(),
+            Some(&(window, 0)),
+            "manage time must publish the window's initial workspace"
+        );
+
+        wm.move_client_to_workspace(id, 1);
+        assert!(
+            !wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "focus drops the moment the client leaves the active workspace"
+        );
+        wm.switch_workspace(1);
+        wm.dispatch(BackendEvent::ActivateRequested(window));
+
+        assert_eq!(wm.current_workspace(), 1, "the switch must follow the carried client (growing the row on demand)");
+        assert_eq!(wm.client(id).unwrap().workspace, 1);
+        assert!(wm.backend().mapped_frames.contains(&frame), "the carried client must be visible on arrival");
+        assert!(
+            wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "the carried client must end up focused, so a repeated carry keeps carrying it"
+        );
+        assert_eq!(
+            wm.backend().published_window_desktops.last(),
+            Some(&(window, 1)),
+            "the move must re-publish _NET_WM_DESKTOP"
+        );
+    }
+
+    /// The same sequence as one verb — what the `workspace-carry <n>`
+    /// binding runs, and what an external controller asking for
+    /// "move this window to workspace 4 and take me with it" gets.
+    /// Asserted against exactly the outcomes the hand-rolled sequence
+    /// above asserts, so the verb cannot quietly drift from the
+    /// gesture it replaced.
+    #[test]
+    fn the_carry_verb_moves_switches_and_refocuses_in_one_call() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        wm.carry_focused_to_workspace(1);
+
+        assert_eq!(wm.current_workspace(), 1, "the desk must follow the window it carried");
+        assert_eq!(wm.client(id).unwrap().workspace, 1);
+        assert!(wm.backend().mapped_frames.contains(&frame), "the carried client must be visible on arrival");
+        assert!(
+            wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "the carried client must end up focused, so a repeated carry keeps carrying it"
+        );
+        assert_eq!(wm.backend().published_window_desktops.last(), Some(&(window, 1)));
+
+        // The point of ending focused: press it again and the same
+        // window keeps going, rather than being stranded one along.
+        wm.carry_focused_to_workspace(2);
+        assert_eq!((wm.current_workspace(), wm.client(id).unwrap().workspace), (2, 2));
+    }
+
+    /// Carrying past the end of the row grows it, exactly as
+    /// `switch_workspace` and `move_client_to_workspace` each do
+    /// alone — `super+shift+7` on a desk with one workspace is a
+    /// request for seven, not an error.
+    #[test]
+    fn carrying_past_the_end_of_the_row_grows_it() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.workspace_count(), 1);
+
+        wm.carry_focused_to_workspace(6);
+
+        assert_eq!(wm.workspace_count(), 7, "carrying to index 6 means 7 workspaces (0..=6) now exist");
+        assert_eq!(wm.current_workspace(), 6);
+        assert_eq!(wm.client(id).unwrap().workspace, 6);
+        assert_eq!(wm.backend().published_workspaces.last(), Some(&(7, 6)), "a pager must hear the grown row");
+    }
+
+    /// Carrying a window to the workspace it is already on is the
+    /// keypress a user makes by habit — `super+shift+1` while already
+    /// on the first workspace. It must cost nothing visible: no
+    /// unmap-remap flicker, no `_NET_WM_DESKTOP` churn, no workspace
+    /// re-publish, and the window still focused afterwards.
+    #[test]
+    fn carrying_to_the_workspace_it_is_already_on_changes_nothing() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let desktops_before = wm.backend().published_window_desktops.len();
+        let workspaces_before = wm.backend().published_workspaces.len();
+
+        wm.carry_focused_to_workspace(0);
+
+        assert_eq!(wm.current_workspace(), 0);
+        assert_eq!(wm.client(id).unwrap().workspace, 0);
+        assert!(!wm.backend().unmapped_frames.contains(&frame), "a carry that changes nothing must not hide the frame");
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert_eq!(wm.backend().published_window_desktops.len(), desktops_before, "no _NET_WM_DESKTOP re-publish");
+        assert_eq!(wm.backend().published_workspaces.len(), workspaces_before, "no workspace re-publish");
+    }
+
+    /// Carry is a *window* verb, so with no window focused it does
+    /// nothing at all — and "nothing" includes not switching the
+    /// workspace. Switching anyway would make the carry chords into a
+    /// second, silently different set of switch chords whenever the
+    /// desk happened to be empty.
+    #[test]
+    fn carrying_with_nothing_focused_leaves_the_workspace_alone() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+        let workspaces_before = wm.backend().published_workspaces.len();
+
+        wm.carry_focused_to_workspace(3);
+
+        assert_eq!(wm.current_workspace(), 0, "an empty desk must not travel");
+        assert_eq!(wm.workspace_count(), 1, "...nor grow the row on a verb that did nothing");
+        assert_eq!(wm.backend().published_workspaces.len(), workspaces_before);
+    }
+
+    /// A shaded window carried to another workspace arrives usable
+    /// rather than arriving as a title bar. The carry routes through
+    /// the same activate path a pager's `_NET_ACTIVE_WINDOW` takes,
+    /// which is where unshading lives; this pins that it keeps doing
+    /// so, since the alternative (move + switch + `focus_client`)
+    /// looks identical until the window you carried is rolled up.
+    #[test]
+    fn a_shaded_window_arrives_unshaded_from_a_carry() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        wm.toggle_shade(id);
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+
+        wm.carry_focused_to_workspace(1);
+
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "a carried window must arrive usable");
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED));
+    }
+
+    /// Carrying onto a workspace that already has windows: the
+    /// resident stays where it is and stays visible, and the arrival
+    /// takes the focus. Workspace-scoped focus is the thing at risk
+    /// here — the switch half of the carry drops focus when the
+    /// focused client is not on the target, and the activate half has
+    /// to put it back on the *carried* window rather than leaving the
+    /// resident to inherit it.
+    #[test]
+    fn a_carried_window_takes_focus_from_the_workspace_it_arrives_on() {
+        let mut backend = FakeBackend::new();
+        let traveller = backend.create_window();
+        let resident = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(traveller));
+        let travelling = wm.client_for_window(traveller).unwrap();
+        wm.switch_workspace(1);
+        wm.dispatch(BackendEvent::MapRequest(resident)); // lands on workspace 1
+        let staying = wm.client_for_window(resident).unwrap();
+        let resident_frame = wm.client(staying).unwrap().frame.unwrap();
+        wm.switch_workspace(0);
+        // A bare workspace switch deliberately leaves nothing focused
+        // when the window that had focus stayed behind, so the
+        // traveller is picked up the way a click or a pager would pick
+        // it up. A carry with nothing in hand is the separate case
+        // above.
+        wm.dispatch(BackendEvent::ActivateRequested(traveller));
+
+        wm.carry_focused_to_workspace(1);
+
+        assert_eq!(wm.focused_client(), Some(travelling), "the window that just arrived is the one in hand");
+        assert!(!wm.client(staying).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert_eq!(wm.client(staying).unwrap().workspace, 1, "the resident must not be moved by someone else's carry");
+        assert!(wm.backend().mapped_frames.contains(&resident_frame), "...nor hidden by it");
+    }
+
+    /// A window miniaturized on this workspace is not something a
+    /// carry can pick up — it is not focused, and `switch_workspace` deliberately leaves
+    /// miniaturized clients alone. Carrying the *other* window must
+    /// therefore leave it exactly as it was: still miniaturized, still
+    /// on its own workspace, and still not focused.
+    #[test]
+    fn a_carry_leaves_miniaturized_windows_where_they_are() {
+        let mut backend = FakeBackend::new();
+        let sleeping = backend.create_window();
+        let carried = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(sleeping));
+        let asleep = wm.client_for_window(sleeping).unwrap();
+        wm.miniaturize(asleep);
+        wm.dispatch(BackendEvent::MapRequest(carried));
+        let travelling = wm.client_for_window(carried).unwrap();
+
+        wm.carry_focused_to_workspace(2);
+
+        assert_eq!(wm.focused_client(), Some(travelling));
+        assert_eq!(wm.client(travelling).unwrap().workspace, 2);
+        assert_eq!(
+            wm.client(asleep).unwrap().lifecycle,
+            Lifecycle::Miniaturized,
+            "a carry must not wake a sleeping window"
+        );
+        assert_eq!(wm.client(asleep).unwrap().workspace, 0, "...nor take it along");
+    }
+
+    #[test]
+    fn moving_a_client_to_its_own_workspace_is_a_no_op() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let desktops_before = wm.backend().published_window_desktops.len();
+
+        wm.move_client_to_workspace(id, 0);
+
+        assert_eq!(wm.client(id).unwrap().workspace, 0);
+        assert!(!wm.backend().unmapped_frames.contains(&frame), "a move that changes nothing must not hide the frame");
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED), "a no-op move must not drop focus");
+        assert_eq!(
+            wm.backend().published_window_desktops.len(),
+            desktops_before,
+            "no _NET_WM_DESKTOP re-publish for a move that changes nothing"
+        );
+    }
+
+    #[test]
+    fn desktop_switch_request_switches_the_workspace() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+
+        // A pager's `_NET_CURRENT_DESKTOP` message — must behave
+        // exactly like the keyboard switch, growth on demand included.
+        wm.dispatch(BackendEvent::DesktopSwitchRequested(2));
+
+        assert_eq!(wm.current_workspace(), 2);
+        assert_eq!(wm.workspace_count(), 3, "switching to index 2 means 3 workspaces (0..=2) now exist");
+    }
+
+    #[test]
+    fn out_of_range_switch_leaves_workspace_state_unchanged() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.dispatch(BackendEvent::DesktopSwitchRequested(MAX_WORKSPACES));
+
+        assert_eq!(wm.current_workspace(), 0);
+        assert_eq!(wm.client(id).unwrap().workspace, 0);
+        assert_eq!(wm.workspace_count(), 1);
+    }
+
+    #[test]
+    fn out_of_range_move_leaves_workspace_state_unchanged() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.move_client_to_workspace(id, usize::MAX);
+
+        assert_eq!(wm.current_workspace(), 0);
+        assert_eq!(wm.client(id).unwrap().workspace, 0);
+        assert_eq!(wm.workspace_count(), 1);
+    }
+
+    #[test]
+    fn window_desktop_request_moves_the_window_and_hides_it() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        // A pager's `_NET_WM_DESKTOP` message: move the window, but —
+        // unlike the Alt+Shift keyboard combos — never follow it.
+        wm.dispatch(BackendEvent::WindowDesktopRequested { window, desktop: 1 });
+
+        assert_eq!(wm.client(id).unwrap().workspace, 1);
+        assert!(wm.backend().unmapped_frames.contains(&frame), "a window sent off the active workspace must be hidden");
+        assert_eq!(wm.current_workspace(), 0, "a pager moving a window must not switch the active workspace");
+        assert_eq!(wm.backend().published_window_desktops.last(), Some(&(window, 1)));
+    }
+
+    #[test]
+    fn alt_tab_skips_clients_parked_on_other_workspaces() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let w3 = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        wm.dispatch(BackendEvent::MapRequest(w3));
+        let id1 = wm.client_for_window(w1).unwrap();
+        let id2 = wm.client_for_window(w2).unwrap();
+        let id3 = wm.client_for_window(w3).unwrap();
+        wm.move_client_to_workspace(id2, 1);
+
+        // Focused is w3 (mapped last); Alt+Tab must skip w2 — still
+        // `Lifecycle::Normal`, but parked on workspace 1 with its frame
+        // unmapped — and land on w1. Cycling onto it would set input
+        // focus on a window that isn't visible anywhere on screen.
+        wm.dispatch(alt_tab());
+        wm.dispatch(alt_release());
+
+        assert!(wm.client(id1).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.client(id3).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(
+            !wm.client(id2).unwrap().flags.contains(ClientFlags::FOCUSED),
+            "a client on another workspace must never be cycled to"
+        );
+    }
+
+    #[test]
+    fn alt_tab_with_no_mapped_clients_does_not_panic() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+
+        wm.dispatch(alt_tab());
+
+        assert_eq!(wm.client_count(), 0);
+    }
+
+    #[test]
+    fn map_request_tracks_a_new_client() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        assert_eq!(wm.client_count(), 1);
+        assert!(wm.client_for_window(window).is_some());
+    }
+
+    /// Regression test: a client mapping at (0, 0) — the extremely
+    /// common "don't care, WM decides" placeholder position most toolkits
+    /// use — must not end up with its frame (and titlebar) pushed to
+    /// negative coordinates, off-screen. Caught visually: a real xterm's
+    /// titlebar was rendering entirely above the top edge of the screen.
+    #[test]
+    fn mapping_at_origin_keeps_the_frame_on_screen() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(0, 0), size: Size::new(300, 200) });
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let frame_pos = wm.backend().last_frame_geometry.get(&frame).unwrap().pos;
+        assert!(frame_pos.x >= 0 && frame_pos.y >= 0, "frame should stay on-screen, got {frame_pos:?}");
+    }
+
+    #[test]
+    fn a_client_that_draws_its_own_chrome_is_managed_but_never_framed() {
+        // The two-titlebar bug, stated as an assertion. Edge and
+        // LibreOffice ask not to be decorated; before this, the window
+        // manager framed them anyway and they wore both.
+        //
+        // "Managed but not framed" is the whole point: the window still
+        // has to be tracked, focused and workspaced like any other, so
+        // asserting the absence of a frame is only half of it.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(40, 30), size: Size::new(800, 600) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).expect("a client-decorated window is still managed");
+        let client = wm.client(id).unwrap();
+        assert!(client.frame.is_none(), "a client that drew its own chrome must not be framed");
+        assert_eq!(client.chrome, ClientChrome::Bare);
+        assert!(wm.backend().mapped_frameless.contains(&window), "it still has to be shown");
+        // Its layout must describe having no chrome rather than being
+        // left at whatever the theme would have said: every hit-test and
+        // drag calculation reads these.
+        assert_eq!(client.layout.titlebar_height, 0);
+        assert_eq!(client.layout.client_offset, Point::new(0, 0));
+        assert_eq!(client.layout.frame_size, Size::new(800, 600));
+        // And it must publish four zeros rather than nothing at all. A
+        // client born undecorated never goes through `create_decoration`
+        // or `release_decoration`, so if the property were published by
+        // the backend's decoration verbs alone it would never appear for
+        // exactly the windows it matters most to. It is published from
+        // here, at the end of the map, for both kinds of window.
+        assert_eq!(
+            wm.backend().frame_extents.get(&window),
+            Some(&(0, 0, 0, 0)),
+            "a window born frameless must still publish its (zero) extents"
+        );
+    }
+
+    #[test]
+    fn a_client_that_starts_drawing_its_own_chrome_loses_its_frame_in_place() {
+        // Applications rewrite `_MOTIF_WM_HINTS` on a mapped window —
+        // a browser leaving fullscreen, a "use system title bar"
+        // setting being toggled. What must not happen is the content
+        // jumping: the user is looking at the application's pixels, and
+        // only the frame around them is going away.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(40, 30), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        let framed = wm.client(id).unwrap();
+        let frame = framed.frame.expect("it starts framed");
+        let content_before = framed.geometry;
+
+        wm.backend_mut().set_client_draws_own_chrome(window, true);
+        wm.dispatch(BackendEvent::ChromeChanged(window));
+
+        let client = wm.client(id).unwrap();
+        assert!(client.frame.is_none());
+        assert_eq!(client.chrome, ClientChrome::Bare);
+        assert_eq!(client.geometry, content_before, "the content must not move when the frame goes");
+        // `release_decoration`, not `destroy_decoration`: on X11 the
+        // client is a child of the frame, and destroying a parent
+        // destroys its children. Getting this wrong closes the
+        // application.
+        assert!(wm.backend().released_frames.contains(&frame), "the frame must be released, not destroyed");
+        assert!(wm.backend().mapped_frameless.contains(&window), "the window stays on screen throughout");
+    }
+
+    #[test]
+    fn a_client_that_stops_drawing_its_own_chrome_gains_a_frame_around_its_content() {
+        // The same transition in reverse, and the same fixed point: the
+        // frame is built around the content where it already is, which
+        // means the frame's own origin moves up and left by the chrome
+        // offset rather than the content moving down and right.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(40, 30), size: Size::new(800, 600) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        let content_before = wm.client(id).unwrap().geometry;
+
+        wm.backend_mut().set_client_draws_own_chrome(window, false);
+        wm.dispatch(BackendEvent::ChromeChanged(window));
+
+        let client = wm.client(id).unwrap();
+        let frame = client.frame.expect("it must be framed again");
+        assert_eq!(client.chrome, ClientChrome::Full);
+        assert_eq!(client.geometry, content_before, "the content must not move when the frame arrives");
+        assert!(client.layout.titlebar_height > 0, "it wears real chrome now");
+        assert!(wm.backend().mapped_frames.contains(&frame));
+        // The frame must be reachable by id again, or every later click
+        // on this window's chrome resolves to no client.
+        assert_eq!(wm.client_for_frame(frame), Some(id));
+    }
+
+    /// Maps a 400x300 window at (100, 100) whose client asks for `chrome`.
+    fn map_with_chrome(chrome: ClientChrome) -> (WindowManager<FakeBackend>, FakeWindowId, ClientId) {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_chrome(window, chrome);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        (wm, window, id)
+    }
+
+    #[test]
+    fn a_header_bar_client_wears_edges_with_resize_handles_but_no_titlebar() {
+        // A header-bar application draws its own titlebar and nothing a
+        // pointer can resize it by once it is tiled. Bare, it had one
+        // titlebar and no edges; framed in full, two titlebars. Edge
+        // chrome is the frame between.
+        let (wm, window, id) = map_with_chrome(ClientChrome::Edges);
+
+        let client = wm.client(id).unwrap();
+        let frame = client.frame.expect("edge chrome is a real frame");
+        assert_eq!(client.chrome, ClientChrome::Edges);
+        assert_eq!(client.layout.titlebar_height, 0, "the client's titlebar is the only one");
+        assert!(client.layout.button_hitboxes.is_empty(), "and its buttons are the only ones");
+        assert!(!client.layout.resize_hitboxes.is_empty(), "the frame is what resizes it");
+        // The frame goes where the client asked to be, and the content
+        // sits one border inside it.
+        assert_eq!(client.geometry, Rect { pos: Point::new(104, 104), size: Size::new(400, 300) });
+        assert_eq!(
+            wm.backend().frame_extents.get(&window),
+            Some(&(4, 4, 4, 4)),
+            "borders only, the top one exactly like the others"
+        );
+        assert!(wm.backend().mapped_frames.contains(&frame));
+        assert!(!wm.backend().mapped_frameless.contains(&window));
+        assert_eq!(wm.client_for_frame(frame), Some(id));
+        assert_eq!(
+            wm.backend().window_chrome.get(&window),
+            Some(&ClientChrome::Edges),
+            "the backend is told, so it can tell the client it is tiled"
+        );
+    }
+
+    #[test]
+    fn dragging_an_edge_frame_border_resizes_the_window() {
+        let (mut wm, _, id) = map_with_chrome(ClientChrome::Edges);
+        let client = wm.client(id).unwrap();
+        let frame = client.frame.unwrap();
+        let before = client.geometry;
+        let frame_right = before.pos.x - client.layout.client_offset.x + client.layout.frame_size.w as i32;
+        let east = client.layout.resize_hitboxes.iter().find(|(edge, _)| *edge == ResizeEdge::East).unwrap().1;
+
+        wm.dispatch(frame_press(frame, Point::new(east.pos.x + 1, east.pos.y + east.size.h as i32 / 2)));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(frame_right + 50, 250), surface_local: None });
+        wm.dispatch(frame_release(frame, Point::new(0, 0)));
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry.size, Size::new(450, 300), "the border grows the window by the drag");
+        assert_eq!(client.geometry.pos, before.pos, "an east drag leaves the west edge where it was");
+        assert_eq!(client.layout.titlebar_height, 0, "and the reflowed frame is still edges");
+    }
+
+    #[test]
+    fn an_edge_framed_window_cannot_be_shaded() {
+        // Shade rolls a window up into its titlebar, and the only one
+        // this window has is part of the client content shading hides.
+        let (mut wm, window, id) = map_with_chrome(ClientChrome::Edges);
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let frame_size = wm.client(id).unwrap().layout.frame_size;
+
+        wm.shade(id);
+
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        assert_ne!(wm.backend().client_mapped.get(&window), Some(&false), "the content must stay on screen");
+        assert_eq!(wm.backend().last_frame_geometry[&frame].size, frame_size, "the frame keeps its full height");
+    }
+
+    #[test]
+    fn a_maximized_window_keeps_filling_its_work_area_when_its_chrome_changes() {
+        // A chrome change anchors the content where it is. For a maximized
+        // window that is wrong both ways: a titlebar gained on reload pushed
+        // the bottom edge past the work area, and losing it again left a
+        // titlebar-high gap above the content.
+        let (mut wm, window, id) = map_with_chrome(ClientChrome::Edges);
+        wm.maximize(id, MaximizeDirections::HORIZONTAL | MaximizeDirections::VERTICAL);
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let visible = |wm: &WindowManager<FakeBackend>| {
+            let margin = wm.client(id).unwrap().layout.input_margin;
+            let outer = wm.backend().last_frame_geometry[&frame];
+            Rect {
+                pos: Point::new(outer.pos.x + margin as i32, outer.pos.y + margin as i32),
+                size: Size::new(outer.size.w - 2 * margin, outer.size.h - 2 * margin),
+            }
+        };
+        let filled = visible(&wm);
+        let edges_content = wm.client(id).unwrap().geometry.size;
+
+        wm.backend_mut().set_client_chrome(window, ClientChrome::Full);
+        wm.dispatch(BackendEvent::ChromeChanged(window));
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_V) && client.layout.titlebar_height > 0);
+        assert_eq!(visible(&wm), filled, "the full frame fills the same work area");
+        assert!(client.geometry.size.h < edges_content.h, "its content gives up the titlebar's height");
+
+        wm.backend_mut().set_client_chrome(window, ClientChrome::Edges);
+        wm.dispatch(BackendEvent::ChromeChanged(window));
+        assert_eq!(visible(&wm), filled, "edges fill it again, with no gap where the titlebar was");
+        assert_eq!(wm.client(id).unwrap().geometry.size, edges_content);
+    }
+
+    #[test]
+    fn chrome_moves_between_full_edges_and_bare_without_moving_the_content() {
+        let (mut wm, window, id) = map_with_chrome(ClientChrome::Full);
+        let content = wm.client(id).unwrap().geometry;
+        let full_frame = wm.client(id).unwrap().frame.expect("an ordinary window starts with full chrome");
+        let change = |wm: &mut WindowManager<FakeBackend>, chrome: ClientChrome| {
+            wm.backend_mut().set_client_chrome(window, chrome);
+            wm.dispatch(BackendEvent::ChromeChanged(window));
+            let client = wm.client(id).unwrap();
+            assert_eq!(client.chrome, chrome);
+            assert_eq!(client.geometry, content, "{chrome:?}: the content is the fixed point");
+            assert_eq!(wm.backend().window_chrome.get(&window), Some(&chrome), "{chrome:?}: the backend hears it");
+        };
+
+        // Full to edges keeps the very same frame and only reshapes it.
+        change(&mut wm, ClientChrome::Edges);
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.frame, Some(full_frame), "the frame is re-laid-out in place, not replaced");
+        assert_eq!(client.layout.titlebar_height, 0);
+        assert!(!wm.backend().released_frames.contains(&full_frame));
+        assert_eq!(wm.backend().frame_extents.get(&window), Some(&(4, 4, 4, 4)));
+        assert_eq!(wm.client_for_frame(full_frame), Some(id));
+
+        // Edges to bare lets the frame go without closing the window.
+        change(&mut wm, ClientChrome::Bare);
+        assert!(wm.client(id).unwrap().frame.is_none());
+        assert!(wm.backend().released_frames.contains(&full_frame));
+        assert!(wm.backend().mapped_frameless.contains(&window), "the window stays on screen");
+        assert_eq!(wm.backend().frame_extents.get(&window), Some(&(0, 0, 0, 0)));
+
+        // Bare to edges builds a frame around the content where it is.
+        change(&mut wm, ClientChrome::Edges);
+        let edge_frame = wm.client(id).unwrap().frame.expect("edges are a frame again");
+        assert_eq!(wm.client(id).unwrap().layout.titlebar_height, 0);
+        assert!(wm.backend().mapped_frames.contains(&edge_frame));
+        assert_eq!(wm.client_for_frame(edge_frame), Some(id));
+
+        // And edges back to full grows a titlebar on that same frame.
+        change(&mut wm, ClientChrome::Full);
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.frame, Some(edge_frame));
+        assert!(client.layout.titlebar_height > 0, "full chrome has our titlebar");
+        assert!(!client.layout.button_hitboxes.is_empty(), "and our buttons");
+        assert_eq!(wm.backend().frame_extents.get(&window).map(|extents| extents.2), Some(client.layout.titlebar_height));
+    }
+
+    #[test]
+    fn a_bare_window_in_the_corner_is_nudged_so_the_frame_it_gains_is_on_screen() {
+        // The one case where the content does move. Omarchy's floating
+        // terminal maps bare at the output's origin; when a config
+        // reload gives it this desktop's chrome, a frame built around
+        // content at (0,0) has its titlebar above the top edge of the
+        // display — chrome the user can see none of and grab none of.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().geometry.pos, Point::new(0, 0), "bare, it sits where it asked to");
+
+        wm.backend_mut().set_client_draws_own_chrome(window, false);
+        wm.dispatch(BackendEvent::ChromeChanged(window));
+
+        let client = wm.client(id).unwrap();
+        assert!(client.frame.is_some(), "it is framed now");
+        let offset = client.layout.client_offset;
+        assert!(offset.y > 0, "the fake theme's chrome has a titlebar to put somewhere");
+        assert_eq!(client.geometry.pos, offset, "the content moved down and right by exactly the chrome's offset");
+        assert_eq!(client.geometry.size, Size::new(800, 600), "and kept its size");
+        assert_eq!(
+            frame_rect(&wm, window).pos,
+            Point::new(0, 0),
+            "so the frame — titlebar first — begins at the corner the window was in"
+        );
+    }
+
+    // ---- transient (dialog) stacking ---------------------------------
+
+    /// A modal dialog must never end up behind the window it belongs
+    /// to. Reported as "the close button on LibreOffice doesn't work":
+    /// the close request was sent and the application refused it,
+    /// correctly, because a "Welcome" dialog was open — and that dialog
+    /// was invisible underneath the document window, so the refusal
+    /// looked like a broken button.
+    #[test]
+    fn raising_a_window_brings_its_dialog_with_it() {
+        let mut backend = FakeBackend::new();
+        let parent = backend.create_window();
+        let dialog = backend.create_window();
+        backend.set_geometry(parent, Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        backend.set_geometry(dialog, Rect { pos: Point::new(100, 100), size: Size::new(300, 200) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(parent));
+        wm.dispatch(BackendEvent::MapRequest(dialog));
+        // Parented after mapping, which is what LibreOffice does.
+        let parent_id = wm.client_for_window(parent).unwrap();
+        wm.backend_mut().set_window_parent(dialog, parent);
+        wm.dispatch(BackendEvent::ParentChanged(dialog));
+        let dialog_frame = wm
+            .client(wm.client_for_window(dialog).unwrap())
+            .unwrap()
+            .frame
+            .unwrap();
+        let parent_frame = wm.client(parent_id).unwrap().frame.unwrap();
+
+        wm.backend_mut().raised_frames.clear();
+        wm.focus_client(parent_id);
+
+        let raises = &wm.backend().raised_frames;
+        let parent_at = raises.iter().position(|f| *f == parent_frame).expect("the parent was raised");
+        let dialog_at = raises.iter().position(|f| *f == dialog_frame).expect("its dialog was raised too");
+        assert!(dialog_at > parent_at, "the dialog must be raised after — and so above — its parent: {raises:?}");
+    }
+
+    #[test]
+    fn a_transient_is_centered_on_its_parent_and_follows_its_lifecycle() {
+        let mut backend = FakeBackend::new();
+        let parent = backend.create_window();
+        let dialog = backend.create_window();
+        backend.set_geometry(
+            parent,
+            Rect {
+                pos: Point::new(500, 300),
+                size: Size::new(600, 400),
+            },
+        );
+        backend.set_geometry(
+            dialog,
+            Rect {
+                pos: Point::new(0, 0),
+                size: Size::new(260, 140),
+            },
+        );
+        backend.set_window_parent(dialog, parent);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(parent));
+        wm.dispatch(BackendEvent::MapRequest(dialog));
+        let parent_id = wm.client_for_window(parent).unwrap();
+        let dialog_id = wm.client_for_window(dialog).unwrap();
+
+        let parent_frame = client_frame_rect(wm.client(parent_id).unwrap());
+        let dialog_frame = client_frame_rect(wm.client(dialog_id).unwrap());
+        assert_eq!(
+            Point::new(
+                dialog_frame.pos.x + dialog_frame.size.w as i32 / 2,
+                dialog_frame.pos.y + dialog_frame.size.h as i32 / 2,
+            ),
+            Point::new(
+                parent_frame.pos.x + parent_frame.size.w as i32 / 2,
+                parent_frame.pos.y + parent_frame.size.h as i32 / 2,
+            ),
+            "a transient belongs visually to the parent, not the pointer's output"
+        );
+
+        wm.move_client_to_workspace(parent_id, 2);
+        assert_eq!(wm.client(parent_id).unwrap().workspace, 2);
+        assert_eq!(wm.client(dialog_id).unwrap().workspace, 2);
+        wm.miniaturize(parent_id);
+        assert_eq!(
+            wm.client(parent_id).unwrap().lifecycle,
+            Lifecycle::Miniaturized
+        );
+        assert_eq!(
+            wm.client(dialog_id).unwrap().lifecycle,
+            Lifecycle::Miniaturized
+        );
+        wm.deminiaturize(parent_id);
+        assert_eq!(wm.client(parent_id).unwrap().lifecycle, Lifecycle::Normal);
+        assert_eq!(wm.client(dialog_id).unwrap().lifecycle, Lifecycle::Normal);
+    }
+
+    #[test]
+    fn a_modal_child_redirects_parent_focus_drag_and_close() {
+        let mut backend = FakeBackend::new();
+        let parent = backend.create_window();
+        let dialog = backend.create_window();
+        backend.set_geometry(
+            parent,
+            Rect {
+                pos: Point::new(100, 100),
+                size: Size::new(500, 350),
+            },
+        );
+        backend.set_geometry(
+            dialog,
+            Rect {
+                pos: Point::new(0, 0),
+                size: Size::new(240, 120),
+            },
+        );
+        backend.set_window_parent(dialog, parent);
+        backend.set_window_modal(dialog, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(parent));
+        wm.dispatch(BackendEvent::MapRequest(dialog));
+        let parent_id = wm.client_for_window(parent).unwrap();
+        let dialog_id = wm.client_for_window(dialog).unwrap();
+        let before = wm.client(parent_id).unwrap().geometry;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(parent),
+            local: Point::new(30, 30),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 1,
+            mods: DEFAULT_DRAG_MODIFIER,
+        });
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(700, 500),
+            surface_local: None,
+        });
+        assert_eq!(
+            wm.client(parent_id).unwrap().geometry,
+            before,
+            "a modal parent cannot be dragged"
+        );
+        assert!(wm
+            .client(dialog_id)
+            .unwrap()
+            .flags
+            .contains(ClientFlags::FOCUSED));
+
+        wm.close_client(parent_id);
+        assert!(wm.backend().close_requests.contains(&dialog));
+        assert!(!wm.backend().close_requests.contains(&parent));
+    }
+
+    /// A client is free to declare a parent chain that loops. The
+    /// honest response is to stop, not to recurse until the stack goes.
+    #[test]
+    fn a_looping_parent_chain_terminates() {
+        let mut backend = FakeBackend::new();
+        let a = backend.create_window();
+        let b = backend.create_window();
+        backend.set_geometry(a, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_geometry(b, Rect { pos: Point::new(50, 50), size: Size::new(400, 300) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(a));
+        wm.dispatch(BackendEvent::MapRequest(b));
+        wm.backend_mut().set_window_parent(a, b);
+        wm.backend_mut().set_window_parent(b, a);
+        wm.dispatch(BackendEvent::ParentChanged(a));
+        wm.dispatch(BackendEvent::ParentChanged(b));
+
+        // Terminating at all is the assertion.
+        let a_id = wm.client_for_window(a).unwrap();
+        wm.focus_client(a_id);
+    }
+
+    // ---- the modifier-drag: the floor under the decoration policy ----
+
+    /// A window whose client draws its own chrome has no titlebar to
+    /// grab and no resize bar to pull. Before this gesture existed
+    /// there was no way to move one at all — and a comment in the
+    /// compositor claimed there was, which is part of how honoring a
+    /// client's request to decorate itself came to look safe.
+    #[test]
+    fn a_frameless_window_moves_by_modifier_drag() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.client(id).unwrap().frame.is_none(), "the premise: no chrome of ours to grab");
+
+        // Press with the modifier held, 20px into the content, then
+        // drag 60px right and 40px down.
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(20, 20),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: DEFAULT_DRAG_MODIFIER,
+        });
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(180, 160), surface_local: None });
+
+        assert_eq!(
+            wm.client(id).unwrap().geometry.pos,
+            Point::new(160, 140),
+            "the window follows the pointer, anchored where it was grabbed"
+        );
+    }
+
+    /// Right button resizes, and the edge comes from where in the
+    /// window the press landed rather than from a border the user would
+    /// have to hit.
+    #[test]
+    fn a_frameless_window_resizes_by_modifier_drag() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(300, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        // Bottom-right ninth: pull the south-east corner.
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(290, 290),
+            button: MouseButton::Right,
+            pressed: true,
+            time_ms: 0,
+            mods: DEFAULT_DRAG_MODIFIER,
+        });
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(500, 450), surface_local: None });
+
+        let size = wm.client(id).unwrap().geometry.size;
+        assert!(size.w > 300 && size.h > 300, "dragging away from the origin grows the window, got {size:?}");
+    }
+
+    /// The gesture is not the only thing Alt does. Alt+Shift is this
+    /// desktop's binding prefix for eleven window commands, so a
+    /// gesture that fired on any superset of the modifier would turn
+    /// every one of those chords into a latent drag.
+    #[test]
+    fn a_superset_of_the_modifier_is_not_the_gesture() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let before = wm.client(id).unwrap().geometry.pos;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(20, 20),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: DEFAULT_DRAG_MODIFIER | Modifiers::SHIFT,
+        });
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(400, 400), surface_local: None });
+
+        assert_eq!(wm.client(id).unwrap().geometry.pos, before, "an ordinary click must not move the window");
+    }
+
+    /// A framed window answers to it too — the gesture's job is to not
+    /// depend on chrome, not to be a consolation prize for lacking it.
+    #[test]
+    fn a_framed_window_answers_to_the_gesture_as_well() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let before = wm.client(id).unwrap().geometry.pos;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(10, 10),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: DEFAULT_DRAG_MODIFIER,
+        });
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(300, 300), surface_local: None });
+
+        assert_ne!(wm.client(id).unwrap().geometry.pos, before);
+    }
+
+    /// Turning the gesture off must actually turn it off, or the
+    /// config knob is a lie to a user whose application needs Alt.
+    #[test]
+    fn the_gesture_can_be_disabled() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.set_drag_modifier(None);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let before = wm.client(id).unwrap().geometry.pos;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(20, 20),
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: DEFAULT_DRAG_MODIFIER,
+        });
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(400, 400), surface_local: None });
+
+        assert_eq!(wm.client(id).unwrap().geometry.pos, before);
+    }
+
+    /// Shading a window with no titlebar of ours unmapped its content
+    /// and left nothing on screen at all: `reflow_frame` returns early
+    /// for a client-decorated window, before the shaded-frame branch,
+    /// so the window went invisible and unclickable.
+    #[test]
+    fn shading_a_frameless_window_does_not_make_it_vanish() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.shade(id);
+
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "there is no titlebar to roll up into");
+        assert_ne!(wm.backend().client_mapped.get(&window), Some(&false), "the content must still be on screen");
+    }
+
+    /// The identity a decoration rule matches on is not guaranteed to
+    /// arrive before the window maps, and nothing used to re-ask.
+    #[test]
+    fn a_chrome_refresh_re_asks_the_backend() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(40, 30), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.client(id).unwrap().frame.is_some());
+
+        // The answer changes after the fact — a late `app_id`, or a
+        // reloaded config naming this application.
+        wm.backend_mut().set_client_draws_own_chrome(window, true);
+        wm.refresh_client_chrome(id);
+
+        assert!(wm.client(id).unwrap().frame.is_none(), "the frame must come off without closing the window");
+        assert_eq!(wm.client(id).unwrap().chrome, ClientChrome::Bare);
+    }
+
+    #[test]
+    fn a_frameless_window_follows_its_workspace_off_and_on_screen() {
+        // The `unmap_frameless` backend verb exists for exactly this:
+        // with the no-op default, a client-decorated window stays
+        // visible on every workspace at once.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        assert!(wm.backend().mapped_frameless.contains(&window));
+
+        wm.switch_workspace(1);
+        assert!(!wm.backend().mapped_frameless.contains(&window), "it must leave with its workspace");
+
+        wm.switch_workspace(0);
+        assert!(wm.backend().mapped_frameless.contains(&window), "and come back with it");
+    }
+
+    #[test]
+    fn frame_extents_describe_the_chrome_and_go_to_zero_when_it_does() {
+        // `_NET_FRAME_EXTENTS` is how a client learns how much bigger
+        // than its content the thing on screen is. Publishing zeros for
+        // a frameless window is not a degenerate case to skip: it is
+        // the message that the frame has gone.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(40, 30), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        let (left, right, top, bottom) = wm.backend().frame_extents[&window];
+        let layout = wm.client(id).unwrap().layout.clone();
+        assert_eq!(top, layout.client_offset.y as u32, "the top extent is the titlebar");
+        assert!(top > 0, "a framed window has chrome above its content");
+        assert_eq!(left, layout.client_offset.x as u32);
+        // The four must add up to the frame the window actually wears,
+        // or a client reasoning from them lands off by the difference.
+        assert_eq!(left + 800 + right, layout.frame_size.w);
+        assert_eq!(top + 600 + bottom, layout.frame_size.h);
+
+        wm.fullscreen(id);
+        assert_eq!(wm.backend().frame_extents[&window], (0, 0, 0, 0),
+            "fullscreen must publish the removal of every border; SDL waits for it before resizing");
+        wm.unfullscreen(id);
+        assert_eq!(wm.backend().frame_extents[&window], (left, right, top, bottom),
+            "leaving fullscreen restores the actual decoration extents");
+
+        wm.backend_mut().set_client_draws_own_chrome(window, true);
+        wm.dispatch(BackendEvent::ChromeChanged(window));
+        assert_eq!(
+            wm.backend().frame_extents[&window],
+            (0, 0, 0, 0),
+            "losing the frame must be published, not just done"
+        );
+    }
+
+    #[test]
+    fn focusing_a_frameless_window_raises_it() {
+        // Every raise in this crate used to name a `FrameId`, guarded by
+        // `if let Some(frame)`. A client-decorated window has none, so
+        // it mapped at one depth and stayed there for the rest of its
+        // life: clicking it focused it and did not bring it forward.
+        // The bug is invisible in testing precisely because it only
+        // affects applications that draw their own titlebars.
+        let mut backend = FakeBackend::new();
+        let under = backend.create_window();
+        let over = backend.create_window();
+        backend.set_geometry(under, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_geometry(over, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(over, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(under));
+        wm.dispatch(BackendEvent::MapRequest(over));
+
+        let over_id = wm.client_for_window(over).unwrap();
+        let under_id = wm.client_for_window(under).unwrap();
+        wm.focus_client(under_id);
+        wm.backend_mut().raised_frameless.clear();
+
+        wm.focus_client(over_id);
+        assert_eq!(
+            wm.backend().raised_frameless.last(),
+            Some(&over),
+            "focusing a client-decorated window must bring it forward, not only focus it"
+        );
+    }
+
+    #[test]
+    fn a_client_decorated_window_can_still_be_moved_by_asking() {
+        // Taking our titlebar away takes away the only handle this
+        // window manager offered for dragging the window. If the
+        // client's own `_NET_WM_MOVERESIZE` is dropped as well — as
+        // both backends used to — the window becomes pinned wherever it
+        // first mapped, which is a worse outcome than the spare
+        // titlebar removing the chrome was meant to fix.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        // The pointer has to be somewhere known before a client can ask
+        // to be dragged by it.
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(150, 120), surface_local: None });
+        wm.dispatch(BackendEvent::MoveRequest(window));
+        // Grab offset is (50, 20) into the window; dragging the pointer
+        // to (250, 220) must put the window's origin at (200, 200).
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(250, 220), surface_local: None });
+
+        assert_eq!(
+            wm.backend().last_client_position.get(&window),
+            Some(&Point::new(200, 200)),
+            "the window must follow the pointer with the offset it was grabbed at"
+        );
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().geometry.pos, Point::new(200, 200), "and the core must agree where it is");
+    }
+
+    #[test]
+    fn a_drag_on_a_frameless_window_ends_when_the_button_comes_up() {
+        // The bug this guards, reported from a real session dragging
+        // LibreOffice: the window followed the cursor with no button
+        // held. A window whose client draws its own chrome has no frame
+        // for the release to land on, so the release arrives against
+        // the *client* — and the old code only ended a drag on a frame
+        // release. The pointer grab has to come back too, because a
+        // leaked one freezes the pointer for every client on the
+        // session.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(150, 120), surface_local: None });
+        wm.dispatch(BackendEvent::MoveRequest(window));
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 1, "a drag must take the pointer");
+
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(250, 220), surface_local: None });
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().geometry.pos, Point::new(200, 200), "it tracks while held");
+
+        // Released over the client, which is where the pointer is.
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(0, 0),
+            button: MouseButton::Left,
+            pressed: false,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 0, "and gives the pointer back");
+
+        // Moving afterwards must not move the window any more.
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(600, 600), surface_local: None });
+        assert_eq!(
+            wm.client(id).unwrap().geometry.pos,
+            Point::new(200, 200),
+            "the window must stay where it was dropped, not follow the cursor"
+        );
+    }
+
+    #[test]
+    fn a_client_decorated_window_can_be_resized_by_asking() {
+        // The resize sibling of the move test above. A frameless window
+        // has no resizebar of ours, so its client's own grips — which
+        // arrive here as a ResizeRequest — are the only way it can ever
+        // be resized. Dragging the south-east grip outward must grow
+        // the window and stop growing it on release.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(500, 400), surface_local: None });
+        wm.dispatch(BackendEvent::ResizeRequest { window, edge: ResizeEdge::SouthEast });
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 1, "a resize is a drag and takes the pointer");
+
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(600, 500), surface_local: None });
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(500, 400), "the south-east drag grows both axes");
+        assert_eq!(wm.client(id).unwrap().geometry.pos, Point::new(100, 100), "the anchored corner stays put");
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Client(window),
+            local: Point::new(0, 0),
+            button: MouseButton::Left,
+            pressed: false,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 0);
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(900, 900), surface_local: None });
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(500, 400), "released means done");
+    }
+
+    #[test]
+    fn client_resize_preserves_the_grab_offset_at_every_edge() {
+        use ResizeEdge::*;
+        for framed in [false, true] {
+            for gap in [-6, 12] {
+                for edge in [North, NorthEast, East, SouthEast, South, SouthWest, West, NorthWest] {
+                    let mut backend = FakeBackend::new();
+                    let window = backend.create_window();
+                    backend.set_geometry(window, Rect::new(Point::new(100, 100), Size::new(400, 300)));
+                    backend.set_client_draws_own_chrome(window, !framed);
+                    let mut wm = wm(backend);
+                    wm.dispatch(BackendEvent::MapRequest(window));
+                    let id = wm.client_for_window(window).unwrap();
+                    let before = wm.client(id).unwrap().geometry;
+                    let frame = client_frame_rect(wm.client(id).unwrap());
+                    let west = matches!(edge, West | NorthWest | SouthWest);
+                    let east = matches!(edge, East | NorthEast | SouthEast);
+                    let north = matches!(edge, North | NorthWest | NorthEast);
+                    let south = matches!(edge, South | SouthWest | SouthEast);
+                    let pointer = Point::new(
+                        frame.pos.x + if west { -gap } else if east { frame.size.w as i32 + gap } else { 100 },
+                        frame.pos.y + if north { -gap } else if south { frame.size.h as i32 + gap } else { 100 },
+                    );
+                    wm.dispatch(BackendEvent::PointerMotion { root: pointer, surface_local: None });
+                    wm.dispatch(BackendEvent::ResizeRequest { window, edge });
+                    wm.dispatch(BackendEvent::PointerMotion { root: pointer, surface_local: None });
+                    assert_eq!(wm.client(id).unwrap().geometry, before, "no jump: {edge:?}, gap={gap}, framed={framed}");
+                    wm.dispatch(BackendEvent::PointerMotion {
+                        root: Point::new(pointer.x + 30, pointer.y + 20), surface_local: None,
+                    });
+                    let expected = Rect::new(
+                        Point::new(before.pos.x + if west { 30 } else { 0 }, before.pos.y + if north { 20 } else { 0 }),
+                        Size::new(
+                            (before.size.w as i32 + if west { -30 } else if east { 30 } else { 0 }) as u32,
+                            (before.size.h as i32 + if north { -20 } else if south { 20 } else { 0 }) as u32,
+                        ),
+                    );
+                    assert_eq!(wm.client(id).unwrap().geometry, expected, "{edge:?}, gap={gap}, framed={framed}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn client_resize_without_a_pointer_position_cannot_start() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::ResizeRequest { window, edge: ResizeEdge::SouthEast });
+        assert!(!wm.interactive_drag_active());
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 0);
+    }
+
+    #[test]
+    fn a_drag_whose_window_disappears_gives_the_pointer_back() {
+        // The other way a leaked grab happens: the dragged client dies
+        // mid-drag. A pointer grab with nothing left to move is a
+        // frozen desktop.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(10, 10), surface_local: None });
+        wm.dispatch(BackendEvent::MoveRequest(window));
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 1);
+
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert_eq!(wm.backend().outstanding_pointer_grabs, 0, "the grab must not outlive the window");
+    }
+
+    #[test]
+    fn a_clients_own_minimize_button_miniaturizes_it() {
+        // A client-decorated window's minimize button is the only
+        // miniaturize gesture it has — this desktop draws no chrome
+        // for it. The request must land as the full NeXTSTEP gesture:
+        // frameless surface hidden, lifecycle Miniaturized, the
+        // minimization notification pushed.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_client_draws_own_chrome(window, true);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        wm.dispatch(BackendEvent::MinimizeRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Miniaturized);
+        assert!(!wm.backend().mapped_frameless.contains(&window), "the window must leave the screen");
+        assert!(matches!(wm.take_notification(), Some(Notification::Mapped(_))), "map notification first");
+        assert!(
+            matches!(wm.take_notification(), Some(Notification::Miniaturized(got)) if got == id),
+            "and the minimization notification is published"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_client_is_still_framed() {
+        // The regression guard for the fix itself: the default answer
+        // to "does this client draw its own chrome" is no, and every
+        // ordinary X11 application depends on that staying true.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(10, 10), size: Size::new(300, 200) });
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let client = wm.client(wm.client_for_window(window).unwrap()).unwrap();
+        assert_eq!(client.chrome, ClientChrome::Full);
+        assert!(client.frame.is_some());
+    }
+
+    #[test]
+    fn map_request_creates_and_maps_a_decorated_frame() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(10, 10), size: Size::new(300, 200) });
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        let client = wm.client(id).unwrap();
+        let frame = client.frame.expect("frame should have been created");
+        assert!(wm.backend().mapped_frames.contains(&frame));
+        assert!(wm.backend().painted_frames.contains(&frame));
+    }
+
+    #[test]
+    fn mapping_a_window_focuses_it() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.focused_client(), Some(id));
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::FOCUSED));
+    }
+
+    #[test]
+    fn duplicate_map_request_is_ignored() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        assert_eq!(wm.client_count(), 1);
+    }
+
+    #[test]
+    fn unmap_stops_tracking_the_client_and_destroys_its_frame() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        wm.dispatch(BackendEvent::Unmapped(window));
+
+        assert_eq!(wm.client_count(), 0);
+        assert!(wm.client_for_window(window).is_none());
+        assert!(wm.backend().destroyed_frames.contains(&frame));
+    }
+
+    #[test]
+    fn destroy_stops_tracking_the_client() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::Destroyed(window));
+
+        assert_eq!(wm.client_count(), 0);
+    }
+
+    #[test]
+    fn map_request_captures_window_title() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_title(window, "xterm");
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().title, "xterm");
+    }
+
+    #[test]
+    fn title_changed_after_map_updates_the_client_and_repaints() {
+        // Regression test: many real apps (a terminal whose shell sets
+        // its title only once the prompt is ready) set `WM_NAME` well
+        // after their first `MapRequest`, not before it — a WM that only
+        // reads the title once at map time would show a permanently
+        // blank titlebar for them.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().title, "", "no WM_NAME was set yet at map time");
+
+        wm.backend_mut().set_title(window, "user@host:~/chonkstep");
+        wm.dispatch(BackendEvent::TitleChanged(window));
+
+        assert_eq!(wm.client(id).unwrap().title, "user@host:~/chonkstep");
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        assert!(wm.backend().painted_frames.contains(&frame));
+    }
+
+    #[test]
+    fn title_changed_on_an_unmanaged_window_is_ignored() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+
+        // Never mapped — must not panic or create tracking state.
+        wm.dispatch(BackendEvent::TitleChanged(window));
+
+        assert!(wm.client_for_window(window).is_none());
+    }
+
+    #[test]
+    fn poll_event_driven_dispatch_matches_direct_dispatch() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.push_event(BackendEvent::MapRequest(window));
+        let mut wm = wm(backend);
+
+        while let Some(event) = wm.backend_mut().poll_event() {
+            wm.dispatch(event);
+        }
+
+        assert_eq!(wm.client_count(), 1);
+    }
+
+    #[test]
+    fn close_button_click_sends_close_to_the_client() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let close_point = wm.client(id).unwrap().layout.button_hitboxes[0].1.pos;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: close_point,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+        // Pressing alone must not fire the action yet — only committed
+        // on release-while-still-over (see `press_arms_but_does_not_commit_the_close_action`).
+        assert!(!wm.backend().close_requests.contains(&window));
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: close_point,
+            button: MouseButton::Left,
+            pressed: false,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+
+        assert!(wm.backend().close_requests.contains(&window));
+    }
+
+    #[test]
+    fn press_arms_but_does_not_commit_the_close_action() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let close_point = wm.client(id).unwrap().layout.button_hitboxes[0].1.pos;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: close_point,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+
+        assert!(!wm.backend().close_requests.contains(&window), "close must not fire on press alone");
+        assert!(wm.backend().painted_frames.contains(&frame), "the pressed/sunken visual should have been painted");
+    }
+
+    #[test]
+    fn releasing_away_from_the_button_cancels_the_action() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let close_point = wm.client(id).unwrap().layout.button_hitboxes[0].1.pos;
+
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: close_point,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+        // Release somewhere clearly outside the close button's hitbox.
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: Point::new(close_point.x + 500, close_point.y + 500),
+            button: MouseButton::Left,
+            pressed: false,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+
+        assert!(!wm.backend().close_requests.contains(&window), "dragging off the button should cancel, not close");
+    }
+
+    #[test]
+    fn miniaturize_button_click_unmaps_the_frame() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let miniaturize_point = wm.client(id).unwrap().layout.button_hitboxes[1].1.pos;
+
+        for pressed in [true, false] {
+            wm.dispatch(BackendEvent::PointerButton {
+                surface: SurfaceRef::Frame(frame),
+                local: miniaturize_point,
+                button: MouseButton::Left,
+                pressed,
+                time_ms: 0,
+                mods: Modifiers::empty(),
+            });
+        }
+
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Miniaturized);
+        assert!(wm.backend().unmapped_frames.contains(&frame));
+    }
+
+    #[test]
+    fn miniaturize_and_deminiaturize_notify_the_shell() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.take_notification(), Some(Notification::Mapped(id)));
+
+        wm.miniaturize(id);
+        assert_eq!(wm.take_notification(), Some(Notification::Miniaturized(id)));
+        assert_eq!(wm.take_notification(), None);
+
+        wm.deminiaturize(id);
+        assert_eq!(wm.take_notification(), Some(Notification::Deminiaturized(id)));
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Normal);
+    }
+
+    /// Regression test: `deminiaturize` remapped the frame via
+    /// `map_frame` but never repainted it, relying entirely on an
+    /// `Expose` reply to restore its content — not guaranteed, since a
+    /// frame without backing-store isn't required to retain its pixel
+    /// content while unmapped. On real hardware this showed up as a
+    /// window's titlebar coming back solid black (buttons still in the
+    /// right place, since the frame itself was fine — just never
+    /// repainted) after being miniaturized and restored.
+    #[test]
+    fn deminiaturize_repaints_the_frame_after_remapping() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let paints_before = wm.backend().paint_count.get(&frame).copied().unwrap_or(0);
+
+        wm.miniaturize(id);
+        wm.deminiaturize(id);
+
+        let paints_after = wm.backend().paint_count.get(&frame).copied().unwrap_or(0);
+        assert!(
+            paints_after > paints_before,
+            "deminiaturize must repaint the frame it just remapped, not rely on Expose"
+        );
+    }
+
+    #[test]
+    fn closing_a_miniaturized_client_notifies_removal() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.take_notification(), Some(Notification::Mapped(id)));
+
+        wm.miniaturize(id);
+        assert_eq!(wm.take_notification(), Some(Notification::Miniaturized(id)));
+
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert_eq!(wm.take_notification(), Some(Notification::Removed(id)));
+    }
+
+    #[test]
+    fn dragging_a_shaded_window_keeps_it_shaded_instead_of_unrolling() {
+        // Regression test: `handle_pointer_motion` used to push the
+        // client's full unshaded `frame_size` to the backend on every
+        // drag motion event, regardless of the `SHADED` flag — so
+        // dragging a rolled-up window visibly "unrolled" it back to
+        // full height the instant you moved it.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        wm.shade(id);
+        let shaded_height = wm.client(id).unwrap().layout.shaded_frame_height;
+
+        wm.dispatch(titlebar_press(frame, Point::new(30, 2), 0, Modifiers::empty()));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(130, 130), surface_local: None });
+
+        let frame_geom = wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(
+            frame_geom.size.h, shaded_height,
+            "the frame pushed to the backend mid-drag must stay at shaded height"
+        );
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "the client must still be flagged shaded");
+    }
+
+    #[test]
+    fn titlebar_drag_moves_the_frame() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        // Grab a point inside the titlebar drag region (not on a button).
+        let grab = Point::new(30, 2);
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: grab,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(130, 130), surface_local: None });
+
+        let last_geom = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(last_geom.pos, Point::new(100, 128));
+    }
+
+    /// Regression test: a client's post-map `ConfigureRequest` (e.g.
+    /// xterm resizing itself once it knows its font metrics) reports
+    /// x/y relative to its new parent — the frame — not root. Treating
+    /// that as a root-relative reposition previously shot the frame
+    /// (and its titlebar) off-screen while the client itself stayed
+    /// roughly in place, a bug only caught by an actual screenshot.
+    #[test]
+    fn post_map_configure_request_does_not_move_the_frame() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let frame_pos_before = wm.backend().last_frame_geometry.get(&frame).unwrap().pos;
+
+        // xterm-style resize: x/y = (0, 0) (frame-relative, meaningless
+        // as root coordinates), only the size is a real request.
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(0, 0), size: Size::new(120, 110) },
+        });
+
+        let frame_pos_after = wm.backend().last_frame_geometry.get(&frame).unwrap().pos;
+        assert_eq!(frame_pos_after, frame_pos_before, "frame must not move from a client's own configure request");
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(120, 110));
+    }
+
+    /// Session restore's one demand on the core: put a mapped client's
+    /// content at an exact remembered root-relative rectangle. Position
+    /// is otherwise WM-managed (a client cannot request it once
+    /// framed), so this is the API restore rides — the frame must
+    /// follow the content to the new position with the theme's offset
+    /// intact, exactly as a reflow after an interactive move would.
+    #[test]
+    fn set_client_content_geometry_moves_and_resizes_through_the_frame() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        let target = Rect { pos: Point::new(300, 200), size: Size::new(500, 400) };
+        wm.set_client_content_geometry(id, target);
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry, target, "the client's tracked geometry is exactly the record");
+        let frame_geom = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(
+            frame_geom.pos,
+            Point::new(target.pos.x - client.layout.client_offset.x, target.pos.y - client.layout.client_offset.y),
+            "the frame follows the content, offset by the theme's chrome"
+        );
+    }
+
+    /// Regression test: a size-locked client's own `ConfigureRequest`
+    /// must be ignored outright — not raced against, not applied and
+    /// then corrected on the next tick. Exists for exactly one real
+    /// case found in practice: a terminal emulator whose own startup
+    /// self-corrects to a stale computed size shortly after the WM sets
+    /// a real one, undoing it every time — see `ClientFlags::
+    /// SIZE_LOCKED`'s doc comment.
+    #[test]
+    fn size_locked_client_ignores_its_own_configure_request() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.resize_client_content(id, Size::new(500, 400));
+        wm.set_size_locked(id, true);
+
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(0, 0), size: Size::new(100, 100) },
+        });
+
+        assert_eq!(
+            wm.client(id).unwrap().geometry.size,
+            Size::new(500, 400),
+            "a locked client's own resize attempt must not apply"
+        );
+
+        wm.set_size_locked(id, false);
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(0, 0), size: Size::new(100, 100) },
+        });
+        assert_eq!(
+            wm.client(id).unwrap().geometry.size,
+            Size::new(100, 100),
+            "unlocking must restore normal configure-request handling"
+        );
+    }
+
+    fn titlebar_press(
+        frame: FakeFrameId,
+        local: Point,
+        time_ms: u32,
+        mods: Modifiers,
+    ) -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms,
+            mods,
+        }
+    }
+
+    fn frame_press(frame: FakeFrameId, local: Point) -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        }
+    }
+
+    fn frame_release(frame: FakeFrameId, local: Point) -> BackendEvent<FakeWindowId, FakeFrameId> {
+        BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local,
+            button: MouseButton::Left,
+            pressed: false,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        }
+    }
+
+    /// Sets up a fresh client (content 100x100 at root (50,70), matching
+    /// `FakeTheme`'s frame at root (50,50) size 100x120) and returns its
+    /// id/frame — every resize test starts from exactly this geometry.
+    fn client_for_resize(backend: FakeBackend) -> (WindowManager<FakeBackend>, ClientId, FakeFrameId) {
+        let mut backend = backend;
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        (wm, id, frame)
+    }
+
+    #[test]
+    fn resize_from_southeast_grows_width_and_height_without_moving_the_frame() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+
+        wm.dispatch(frame_press(frame, Point::new(95, 115))); // inside the SE handle
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(200, 220), surface_local: None });
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry.size, Size::new(150, 150));
+        assert_eq!(client.geometry.pos, Point::new(50, 70), "growing from the SE corner must not move the frame");
+    }
+
+    #[test]
+    fn top_bar_stops_moves_even_without_snapping_and_releases_when_hidden() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+        wm.set_snap_threshold(0);
+        wm.set_workarea(Rect::new(Point::new(0, 40), Size::new(800, 560)));
+        wm.dispatch(frame_press(frame, Point::new(30, 2)));
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(150, 0),
+            surface_local: None,
+        });
+        assert_eq!(
+            wm.backend().last_frame_geometry[&frame].pos,
+            Point::new(120, 40)
+        );
+        assert_eq!(
+            wm.client(id).unwrap().geometry.pos.y,
+            60,
+            "the whole titlebar stays below the bar"
+        );
+        wm.set_workarea(Rect::new(Point::new(0, 0), Size::new(800, 600)));
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(150, 0),
+            surface_local: None,
+        });
+        assert_eq!(
+            wm.backend().last_frame_geometry[&frame].pos.y,
+            -2,
+            "no reservation, no hard boundary"
+        );
+    }
+
+    #[test]
+    fn top_bar_stops_north_resize_without_moving_the_bottom_edge() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+        wm.set_workarea(Rect::new(Point::new(0, 40), Size::new(800, 560)));
+        let window = wm.client(id).unwrap().window;
+        let before = wm.backend().last_frame_geometry[&frame];
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(100, before.pos.y - 12),
+            surface_local: None,
+        });
+        wm.dispatch(BackendEvent::ResizeRequest {
+            window,
+            edge: ResizeEdge::North,
+        });
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(100, 0),
+            surface_local: None,
+        });
+        let after = wm.backend().last_frame_geometry[&frame];
+        assert_eq!(after.pos.y, 40);
+        assert_eq!(
+            after.pos.y + after.size.h as i32,
+            before.pos.y + before.size.h as i32
+        );
+    }
+
+    #[test]
+    fn late_bar_and_session_restore_keep_normal_and_frameless_windows_reachable() {
+        for frameless in [false, true] {
+            let mut backend = FakeBackend::new();
+            let window = backend.create_window();
+            if frameless {
+                backend.set_client_draws_own_chrome(window, true);
+            }
+            backend.set_geometry(window, Rect::new(Point::new(50, 5), Size::new(200, 100)));
+            let mut wm = wm(backend);
+            wm.dispatch(BackendEvent::MapRequest(window));
+            let id = wm.client_for_window(window).unwrap();
+            wm.set_workarea(Rect::new(Point::new(0, 40), Size::new(800, 560)));
+            assert_eq!(client_frame_rect(wm.client(id).unwrap()).pos.y, 40);
+            wm.set_client_content_geometry(id, Rect::new(Point::new(50, 0), Size::new(200, 100)));
+            assert_eq!(client_frame_rect(wm.client(id).unwrap()).pos.y, 40);
+        }
+    }
+
+    #[test]
+    fn top_reservations_follow_destination_output_including_negative_coordinates() {
+        let mut backend = FakeBackend::new();
+        let left = Rect::new(Point::new(-800, -200), Size::new(800, 600));
+        let right = Rect::new(Point::new(0, 0), Size::new(800, 600));
+        backend.set_monitors(vec![
+            MonitorInfo {
+                geometry: left,
+                name: "left".into(),
+                identity: None,
+                primary: true,
+            },
+            MonitorInfo {
+                geometry: right,
+                name: "right".into(),
+                identity: None,
+                primary: false,
+            },
+        ]);
+        let (mut wm, _, frame) = client_for_resize(backend);
+        wm.set_snap_threshold(0);
+        wm.set_workareas(vec![
+            Rect::new(Point::new(-800, -160), Size::new(800, 560)),
+            right,
+        ]);
+        wm.dispatch(frame_press(frame, Point::new(30, 2)));
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(-200, -200),
+            surface_local: None,
+        });
+        assert_eq!(
+            wm.backend().last_frame_geometry[&frame].pos,
+            Point::new(-230, -160)
+        );
+        wm.dispatch(BackendEvent::PointerMotion {
+            root: Point::new(200, 0),
+            surface_local: None,
+        });
+        assert_eq!(
+            wm.backend().last_frame_geometry[&frame].pos,
+            Point::new(170, -2)
+        );
+    }
+
+    #[test]
+    fn decoration_cache_keys_the_requested_layout_even_if_a_theme_returns_different_extents() {
+        struct InsetTheme;
+        impl ThemeEngine for InsetTheme {
+            fn layout(&self, request: &DecorationRequest) -> DecorationLayout {
+                FakeTheme.layout(request)
+            }
+            fn render(&self, request: &DecorationRequest, layout: &DecorationLayout) -> DecorationBuffer {
+                FakeTheme.render(request, layout)
+            }
+            fn render_surface(&self, request: &DecorationRequest, layout: &DecorationLayout) -> wm_theme_api::DecorationSurface {
+                let mut surface = FakeTheme.render_surface(request, layout);
+                surface.frame_size.w -= 1;
+                surface
+            }
+        }
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = WindowManager::new(backend, Box::new(InsetTheme));
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let count = wm.backend().paint_count[&frame];
+        wm.paint_decoration_now(id);
+        wm.paint_decoration_now(id);
+        assert_eq!(wm.backend().paint_count[&frame], count, "identical inputs must reuse the existing raster");
+        wm.clients.get_mut(id).unwrap().title.push_str(" changed");
+        wm.paint_decoration_now(id);
+        assert_eq!(wm.backend().paint_count[&frame], count + 1);
+    }
+
+    #[test]
+    fn resize_chrome_is_rasterized_once_at_the_frame_boundary_and_identical_work_is_skipped() {
+        let (mut wm, _id, frame) = client_for_resize(FakeBackend::new());
+        let initial = wm.backend().paint_count.get(&frame).copied().unwrap_or(0);
+        wm.dispatch(frame_press(frame, Point::new(95, 115)));
+        for point in [Point::new(160, 170), Point::new(180, 190), Point::new(200, 220)] {
+            wm.dispatch(BackendEvent::PointerMotion { root: point, surface_local: None });
+        }
+        assert_eq!(
+            wm.backend().paint_count.get(&frame).copied().unwrap_or(0),
+            initial,
+            "input events only invalidate chrome"
+        );
+        wm.flush_decorations();
+        assert_eq!(wm.backend().paint_count.get(&frame).copied().unwrap_or(0), initial + 1);
+
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(200, 220), surface_local: None });
+        wm.flush_decorations();
+        assert_eq!(wm.backend().paint_count.get(&frame).copied().unwrap_or(0), initial + 1);
+    }
+
+    #[test]
+    fn synthetic_125_hz_resize_tracks_sixty_hz_frame_boundaries_not_input_rate() {
+        let (mut wm, _id, frame) = client_for_resize(FakeBackend::new());
+        let initial = wm.backend().paint_count.get(&frame).copied().unwrap_or(0);
+        wm.dispatch(frame_press(frame, Point::new(95, 115)));
+
+        // 125 distinct samples over a synthetic second, flushed on the
+        // nearest integer approximation of sixty presentation boundaries.
+        for sample in 0..125 {
+            wm.dispatch(BackendEvent::PointerMotion {
+                root: Point::new(150 + sample, 170 + sample),
+                surface_local: None,
+            });
+            if (sample + 1) * 60 / 125 != sample * 60 / 125 {
+                wm.flush_decorations();
+            }
+        }
+        wm.flush_decorations();
+
+        let rasters = wm.backend().paint_count.get(&frame).copied().unwrap_or(0) - initial;
+        assert_eq!(rasters, 60, "one raster per synthetic frame, never one per input sample");
+    }
+
+    #[test]
+    fn real_decoration_styles_keep_title_damage_local_and_coalesce_resizes() {
+        let fonts = wm_theme::FontState::new();
+        for &style in wm_theme::SUPPORTED_DECORATION_STYLES {
+            let mut backend = FakeBackend::new();
+            backend.record_paint_parts = true;
+            let window = backend.create_window();
+            backend.set_geometry(window, Rect::new(Point::new(100, 100), Size::new(800, 600)));
+            backend.set_title(window, "Original title");
+            let engine = wm_theme::RasterThemeEngine::with_fonts(
+                wm_theme::default_theme::nextstep_classic(), fonts.clone(),
+            ).with_style(style).unwrap();
+            let mut wm = WindowManager::new(backend, Box::new(engine));
+            wm.dispatch(BackendEvent::MapRequest(window));
+            wm.flush_decorations();
+            let id = wm.client_for_window(window).unwrap();
+            let frame = wm.client(id).unwrap().frame.unwrap();
+            for transition in 0..3 {
+                if transition == 2 {
+                    // Measure a button-state change independently of the
+                    // preceding focus-loss transition.
+                    wm.focus_client(id);
+                    wm.flush_decorations();
+                }
+                let before = wm.backend().last_paint_parts[&frame].clone();
+                let count = wm.backend().paint_count[&frame];
+                match transition {
+                    0 => {
+                        wm.backend_mut().set_title(window, "Updated title");
+                        wm.dispatch(BackendEvent::TitleChanged(window));
+                    }
+                    1 => {
+                        let other = wm.backend_mut().create_window();
+                        wm.backend_mut().set_geometry(other,
+                            Rect::new(Point::new(1000, 100), Size::new(300, 200)));
+                        wm.dispatch(BackendEvent::MapRequest(other));
+                    }
+                    _ => {
+                        let close = wm.client(id).unwrap().layout.button_hitboxes.iter()
+                            .find(|(kind, _)| *kind == ButtonKind::Close).unwrap().1;
+                        wm.dispatch(frame_press(frame, Point::new(close.pos.x + 2, close.pos.y + 2)));
+                    }
+                }
+                wm.flush_decorations();
+                assert_eq!(wm.backend().paint_count[&frame], count + 1, "{style:?} transition {transition}");
+                let after = &wm.backend().last_paint_parts[&frame];
+                assert_eq!(before.frame_size, after.frame_size);
+                if style == wm_theme::DecorationStyle::Modern {
+                    assert_ne!(&before, after, "the visible transition must change chrome");
+                    // Modern may recolor the perimeter on focus, as its theme
+                    // requests. Text/control transitions must still leave the
+                    // non-title perimeter unchanged; solids have no pixel upload.
+                    if transition != 1 {
+                        let top = wm.client(id).unwrap().layout.client_offset.y;
+                        let outside = |surface: &wm_theme_api::DecorationSurface| surface.solids.iter()
+                            .filter(|solid| solid.rect.pos.y >= top).copied().collect::<Vec<_>>();
+                        assert_eq!(outside(&before), outside(after));
+                    }
+                } else {
+                    assert_ne!(before.parts[0], after.parts[0], "title pixels must actually change");
+                    if style == wm_theme::DecorationStyle::BeOS && transition == 1 {
+                        assert_ne!(before.parts[1..], after.parts[1..], "BeOS lightens its frame when inactive");
+                    } else {
+                        // BeOS's separately stored tab joins the top frame
+                        // band; its join grows with a changed title.
+                        let first = if style == wm_theme::DecorationStyle::BeOS && transition == 0 { 2 } else { 1 };
+                        assert_eq!(before.parts[first..], after.parts[first..], "non-title pixels must remain unchanged");
+                    }
+                }
+            }
+            // Cancel the held close box by releasing outside it.
+            wm.dispatch(frame_release(frame, Point::new(100, 100)));
+            wm.flush_decorations();
+            wm.backend_mut().record_paint_parts = false;
+            let initial = wm.backend().paint_count[&frame];
+            let geometry = wm.backend().last_frame_geometry[&frame];
+            wm.dispatch(BackendEvent::PointerMotion {
+                root: Point::new(geometry.pos.x + geometry.size.w as i32 - 2,
+                                 geometry.pos.y + geometry.size.h as i32 - 2),
+                surface_local: None,
+            });
+            wm.dispatch(BackendEvent::ResizeRequest { window, edge: ResizeEdge::SouthEast });
+            for sample in 0..125 {
+                wm.dispatch(BackendEvent::PointerMotion {
+                    root: Point::new(geometry.pos.x + geometry.size.w as i32 + sample,
+                                     geometry.pos.y + geometry.size.h as i32 + sample),
+                    surface_local: None,
+                });
+                if (sample + 1) * 60 / 125 != sample * 60 / 125 {
+                    wm.flush_decorations();
+                }
+            }
+            wm.flush_decorations();
+            let rasters = wm.backend().paint_count[&frame] - initial;
+            assert_eq!(rasters, 60, "{style:?}: 125 input samples must produce 60 rasters");
+            eprintln!("{style:?}: 125 resize samples / 60 synthetic frames / {rasters} rasters; title-only changes preserve other bands");
+        }
+    }
+
+    #[test]
+    fn resize_from_southwest_grows_width_leftward_and_moves_the_frame() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+
+        wm.dispatch(frame_press(frame, Point::new(5, 115))); // inside the SW handle
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(0, 220), surface_local: None });
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry.size, Size::new(150, 150));
+        assert_eq!(
+            client.geometry.pos,
+            Point::new(0, 70),
+            "the SW corner's own edge must move as the frame grows leftward"
+        );
+    }
+
+    #[test]
+    fn resize_from_south_only_changes_height() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+
+        wm.dispatch(frame_press(frame, Point::new(50, 115))); // inside the South handle
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(999, 250), surface_local: None }); // x is irrelevant for South
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry.size, Size::new(100, 180), "width must stay exactly as it was");
+        assert_eq!(client.geometry.pos, Point::new(50, 70));
+    }
+
+    #[test]
+    fn resize_never_shrinks_past_the_min_size_hint() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_size_hints(
+            window,
+            SizeHints { min_size: Some(Size::new(200, 200)), max_size: None, resize_increment: None },
+        );
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        wm.dispatch(frame_press(frame, Point::new(95, 115)));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(60, 60), surface_local: None }); // a shrink attempt
+
+        assert_eq!(
+            wm.client(id).unwrap().geometry.size,
+            Size::new(200, 200),
+            "must clamp to min_size, not shrink below it"
+        );
+    }
+
+    #[test]
+    fn a_shaded_window_cannot_be_resized() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+        wm.shade(id);
+        let original_size = wm.client(id).unwrap().geometry.size;
+
+        wm.dispatch(frame_press(frame, Point::new(95, 115)));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(200, 220), surface_local: None });
+
+        assert_eq!(wm.client(id).unwrap().geometry.size, original_size, "a shaded window has no content to resize");
+    }
+
+    #[test]
+    fn releasing_ends_the_resize_so_further_motion_has_no_effect() {
+        let (mut wm, id, frame) = client_for_resize(FakeBackend::new());
+        wm.dispatch(frame_press(frame, Point::new(95, 115)));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(200, 220), surface_local: None });
+        let sized_at_release = wm.client(id).unwrap().geometry.size;
+
+        wm.dispatch(frame_release(frame, Point::new(200, 220)));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(400, 400), surface_local: None });
+
+        assert_eq!(
+            wm.client(id).unwrap().geometry.size,
+            sized_at_release,
+            "motion after release must not keep resizing"
+        );
+    }
+
+    /// Regression test for the reported "maximize just snaps it to the
+    /// top-left" bug. A toolkit re-asking for its pre-maximize size
+    /// used to have that size adopted while the window kept the
+    /// maximized origin — a small window parked in the work area's
+    /// corner, still flagged maximized.
+    #[test]
+    fn a_maximized_client_that_asks_for_its_old_size_stays_maximized() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.maximize(id, MaximizeDirections::FULL);
+        let maximized = wm.client(id).unwrap().geometry.size;
+
+        // The client asks for its old, small size — as toolkits do on a
+        // font or DPI change, or simply late in startup.
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(50, 50), size: Size::new(100, 100) },
+        });
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry.size, maximized, "a maximized window keeps its extent on both axes");
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+    }
+
+    /// The clamp is per axis, not a blanket veto: a half-maximized
+    /// window must still be resizable along the axis it does not own.
+    #[test]
+    fn a_vertically_maximized_client_still_adopts_a_new_width() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.maximize(id, MaximizeDirections::VERTICAL);
+        let maximized_h = wm.client(id).unwrap().geometry.size.h;
+
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(50, 50), size: Size::new(321, 100) },
+        });
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry.size.w, 321, "the free axis still honors the client");
+        assert_eq!(client.geometry.size.h, maximized_h, "the maximized axis does not");
+    }
+
+    #[test]
+    fn client_geometry_is_bounded_on_initial_map_and_later_configure_requests() {
+        let mut backend = FakeBackend::new();
+        let first = backend.create_window();
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        backend.set_geometry(
+            first,
+            Rect { pos: Point::new(0, 0), size: Size::new(u32::MAX, u32::MAX) },
+        );
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(first));
+        let first_id = wm.client_for_window(first).unwrap();
+        let limit = wm_theme_api::client_size_limit(wm.backend().screen_size());
+        assert_eq!(wm.client(first_id).unwrap().geometry.size, limit);
+
+        let second = wm.backend_mut().create_window();
+        wm.backend_mut().set_geometry(
+            second,
+            Rect { pos: Point::new(20, 20), size: Size::new(320, 240) },
+        );
+        wm.dispatch(BackendEvent::MapRequest(second));
+        let second_id = wm.client_for_window(second).unwrap();
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window: second,
+            requested: Rect {
+                pos: Point::new(20, 20),
+                size: Size::new(u32::MAX, 100_000),
+            },
+        });
+        let client = wm.client(second_id).unwrap();
+        assert_eq!(client.geometry.size, limit);
+        assert!(client.geometry_clamp_logged);
+    }
+
+    /// The clamp must not grow into a general veto of client resizes.
+    #[test]
+    fn an_unmaximized_client_configure_is_still_adopted_verbatim() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(50, 50), size: Size::new(640, 480) },
+        });
+
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(640, 480));
+    }
+
+    #[test]
+    fn maximize_fills_the_usable_area_and_saves_restore_geometry() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        wm.maximize(id, MaximizeDirections::FULL);
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert_eq!(client.restore_geometry, Some(original_geometry));
+        let frame_geom = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(
+            frame_geom,
+            Rect { pos: Point::new(0, 0), size: Size::new(800, 600) },
+            "frame should fill the monitor edge-to-edge"
+        );
+    }
+
+    #[test]
+    fn every_workarea_publication_advances_its_revision() {
+        let mut wm = wm(FakeBackend::new());
+        let area = Rect { pos: Point::new(0, 40), size: Size::new(800, 560) };
+
+        assert_eq!(wm.workarea_revision(), 0);
+        wm.set_workarea(area);
+        assert_eq!(wm.workarea_revision(), 1);
+        wm.set_workarea(area);
+        assert_eq!(wm.workarea_revision(), 2, "an equal baseline publication is still an invalidation edge");
+    }
+
+    #[test]
+    fn protocol_revision_ignores_an_ordinary_click_on_the_focused_client() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let after_map = wm.protocol_state_revision();
+        assert!(after_map > 0, "mapping and initial focus are publishable transitions");
+
+        for pressed in [true, false] {
+            wm.dispatch(BackendEvent::PointerButton {
+                surface: SurfaceRef::Client(window),
+                local: Point::new(20, 20),
+                button: MouseButton::Left,
+                pressed,
+                time_ms: 100,
+                mods: Modifiers::empty(),
+            });
+        }
+
+        assert_eq!(
+            wm.protocol_state_revision(),
+            after_map,
+            "input shape alone must not invalidate protocol snapshots"
+        );
+    }
+
+    #[test]
+    fn protocol_revision_tracks_semantic_changes_and_ignores_no_ops() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_title(window, "before");
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        let mut revision = wm.protocol_state_revision();
+        wm.set_urgent(id, true);
+        assert_ne!(wm.protocol_state_revision(), revision);
+        revision = wm.protocol_state_revision();
+        wm.set_urgent(id, true);
+        assert_eq!(wm.protocol_state_revision(), revision, "setting an equal flag is silent");
+        assert!(wm.set_client_pinned(id, false), "an already-satisfied valid request still succeeds");
+        assert!(wm.set_client_tag(id, "absent", false), "an already-satisfied valid request still succeeds");
+        assert_eq!(wm.protocol_state_revision(), revision, "satisfied flag and tag requests are silent");
+
+        let geometry = wm.client(id).unwrap().geometry;
+        wm.set_client_content_geometry(id, geometry);
+        assert_eq!(wm.protocol_state_revision(), revision, "setting equal geometry is silent");
+        wm.set_client_content_geometry(
+            id,
+            Rect { pos: Point::new(geometry.pos.x + 1, geometry.pos.y), ..geometry },
+        );
+        assert_ne!(wm.protocol_state_revision(), revision);
+        revision = wm.protocol_state_revision();
+
+        wm.switch_workspace(0);
+        assert_eq!(wm.protocol_state_revision(), revision, "selecting the active workspace is silent");
+        wm.switch_workspace(1);
+        assert_ne!(wm.protocol_state_revision(), revision);
+        revision = wm.protocol_state_revision();
+
+        wm.backend_mut().set_title(window, "after");
+        wm.dispatch(BackendEvent::TitleChanged(window));
+        assert_ne!(wm.protocol_state_revision(), revision);
+        revision = wm.protocol_state_revision();
+        wm.dispatch(BackendEvent::TitleChanged(window));
+        assert_eq!(wm.protocol_state_revision(), revision, "an unchanged property notification is silent");
+    }
+
+    #[test]
+    fn idle_rule_index_follows_visibility_and_window_lifetime() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(InhibitsIdle)));
+
+        assert!(!wm.rule_idle_inhibited());
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.rule_idle_inhibited(), "the mapped rule holder inhibits");
+
+        wm.miniaturize(id);
+        assert!(!wm.rule_idle_inhibited(), "a miniaturized rule holder is not visible");
+        wm.deminiaturize(id);
+        assert!(wm.rule_idle_inhibited(), "restoring it restores inhibition");
+
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert!(!wm.rule_idle_inhibited(), "destroying it removes the sparse index entry");
+    }
+
+    #[test]
+    fn a_fullscreen_mode_idle_rule_inhibits_only_while_its_window_is_fullscreen() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(InhibitsIdleWhen(IdleInhibitRule::Fullscreen))));
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(!wm.rule_idle_inhibited(), "a visible windowed launcher does not hold the session awake");
+        assert!(!wm.client_inhibits_idle(id));
+
+        wm.fullscreen(id);
+        assert!(wm.rule_idle_inhibited(), "the same window inhibits once fullscreen");
+        assert!(wm.client_inhibits_idle(id));
+
+        wm.miniaturize(id);
+        assert!(!wm.rule_idle_inhibited(), "a hidden fullscreen window does not inhibit");
+        wm.deminiaturize(id);
+        wm.unfullscreen(id);
+        assert!(!wm.rule_idle_inhibited(), "leaving fullscreen ends inhibition");
+    }
+
+    #[test]
+    fn a_focus_mode_idle_rule_inhibits_only_while_its_window_holds_focus() {
+        let mut backend = FakeBackend::new();
+        let first = backend.create_window();
+        let second = backend.create_window();
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(InhibitsIdleWhen(IdleInhibitRule::Focus))));
+
+        wm.dispatch(BackendEvent::MapRequest(first));
+        let first = wm.client_for_window(first).unwrap();
+        wm.dispatch(BackendEvent::MapRequest(second));
+        let second = wm.client_for_window(second).unwrap();
+        wm.focus_client(second);
+        assert!(!wm.client_inhibits_idle(first), "a visible but unfocused window does not inhibit");
+        assert!(wm.client_inhibits_idle(second));
+
+        wm.focus_client(first);
+        assert!(wm.client_inhibits_idle(first), "focus moves inhibition with it");
+        assert!(!wm.client_inhibits_idle(second));
+    }
+
+    /// A `scroll_touchpad` rule — the shape Omarchy's terminal rules take.
+    #[derive(Debug)]
+    struct ScrollsFaster;
+
+    impl FloatPolicy for ScrollsFaster {
+        fn decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            None
+        }
+
+        fn window_decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> crate::placement::WindowRuleDecision {
+            crate::placement::WindowRuleDecision { touchpad_scroll_factor: Some(1.5), ..Default::default() }
+        }
+    }
+
+    #[test]
+    fn a_touchpad_scroll_rule_lives_exactly_as_long_as_its_window() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        assert!(!wm.has_touchpad_scroll_rules());
+        wm.set_float_policy(Some(std::sync::Arc::new(ScrollsFaster)));
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        assert!(wm.has_touchpad_scroll_rules());
+        assert_eq!(wm.client_touchpad_scroll_factor(id), Some(1.5));
+
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert!(!wm.has_touchpad_scroll_rules(), "destroying the window drops its rule");
+    }
+
+    #[test]
+    fn a_client_window_menu_request_opens_the_menu_only_for_a_normal_window() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        while wm.take_notification().is_some() {}
+
+        let at = Point::new(120, 45);
+        wm.dispatch(BackendEvent::WindowMenuRequested { window, at });
+        let opened: Vec<_> = std::iter::from_fn(|| wm.take_notification())
+            .filter_map(|notification| match notification {
+                Notification::WindowMenuRequested { id, at } => Some((id, at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, vec![(id, at)]);
+
+        wm.miniaturize(id);
+        while wm.take_notification().is_some() {}
+        wm.dispatch(BackendEvent::WindowMenuRequested { window, at });
+        assert!(
+            std::iter::from_fn(|| wm.take_notification())
+                .all(|notification| !matches!(notification, Notification::WindowMenuRequested { .. })),
+            "a miniaturized window opens no menu"
+        );
+    }
+
+    #[test]
+    fn a_workarea_change_refits_maximized_windows_and_keeps_their_restore_geometry() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+        wm.maximize(id, MaximizeDirections::FULL);
+
+        // A bar comes up after the window did and claims 40px of the
+        // top: the maximized window moves out of its strip.
+        let under_bar = Rect { pos: Point::new(0, 40), size: Size::new(800, 560) };
+        wm.set_workarea(under_bar);
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&frame),
+            Some(&under_bar),
+            "a maximized window follows the workarea"
+        );
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V), "and is still maximized");
+        assert_eq!(
+            client.restore_geometry,
+            Some(original_geometry),
+            "the refit does not overwrite where the user left it"
+        );
+
+        // The bar exits: the strip comes back, and so does the window.
+        let whole = Rect { pos: Point::new(0, 0), size: Size::new(800, 600) };
+        wm.set_workarea(whole);
+        assert_eq!(wm.backend().last_frame_geometry.get(&frame), Some(&whole));
+
+        // Unmaximizing after all that lands where the user had it.
+        wm.unmaximize(id);
+        assert_eq!(wm.client(id).unwrap().geometry, original_geometry);
+    }
+
+    #[test]
+    fn a_vertically_maximized_window_refits_along_its_axis_only() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        wm.maximize(id, MaximizeDirections::VERTICAL);
+        let before = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+
+        wm.set_workarea(Rect { pos: Point::new(0, 40), size: Size::new(800, 560) });
+
+        let after = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!((after.pos.y, after.size.h), (40, 560), "the maximized axis follows the workarea");
+        assert_eq!((after.pos.x, after.size.w), (before.pos.x, before.size.w), "the free axis is untouched");
+    }
+
+    #[test]
+    fn a_fullscreen_window_ignores_workarea_changes() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        wm.maximize(id, MaximizeDirections::FULL);
+        wm.fullscreen(id);
+        let fullscreen = wm.client(id).unwrap().geometry;
+
+        wm.set_workarea(Rect { pos: Point::new(0, 40), size: Size::new(800, 560) });
+
+        assert_eq!(
+            wm.client(id).unwrap().geometry,
+            fullscreen,
+            "fullscreen never followed the workarea and must not start now"
+        );
+    }
+
+    #[test]
+    fn unmaximize_restores_the_original_geometry() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        wm.maximize(id, MaximizeDirections::FULL);
+        wm.unmaximize(id);
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.geometry, original_geometry);
+        assert!(!client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert_eq!(client.restore_geometry, None);
+    }
+
+    #[test]
+    fn unmaximize_after_vertical_only_maximize_restores_the_whole_original_rect() {
+        // `restore_geometry` snapshots the whole pre-maximize `Rect` once,
+        // not per-axis — this locks in that a direction-only maximize
+        // still restores the untouched axis (x/width here) correctly,
+        // not just the axis that was actually maximized.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        wm.maximize(id, MaximizeDirections::VERTICAL);
+        wm.unmaximize(id);
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(
+            client.geometry, original_geometry,
+            "x/width must be restored even though only height was ever maximized"
+        );
+        assert!(!client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+    }
+
+    #[test]
+    fn toggling_between_maximize_directions_does_not_clobber_the_original_restore_geometry() {
+        // `toggle_maximize` always fully unmaximizes before re-maximizing
+        // along a different direction set, so the second maximize's
+        // `restore_geometry` snapshot must come from the *true* original
+        // geometry, not the intermediate full-maximized one.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        wm.toggle_maximize(id, MaximizeDirections::FULL);
+        wm.toggle_maximize(id, MaximizeDirections::VERTICAL);
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_V));
+        assert!(!client.flags.contains(ClientFlags::MAXIMIZED_H));
+        assert_eq!(
+            client.restore_geometry,
+            Some(original_geometry),
+            "restore_geometry must still point at the pre-maximize original, not the intermediate full-maximized state"
+        );
+
+        wm.unmaximize(id);
+        assert_eq!(
+            wm.client(id).unwrap().geometry,
+            original_geometry,
+            "unmaximizing after the direction switch must land on the true original"
+        );
+    }
+
+    #[test]
+    fn toggle_maximize_full_round_trips_geometry() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        wm.toggle_maximize_full(id);
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&frame),
+            Some(&Rect { pos: Point::new(0, 0), size: Size::new(800, 600) }),
+            "the first toggle must fill the monitor edge-to-edge"
+        );
+
+        wm.toggle_maximize_full(id);
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(
+            client.geometry, original_geometry,
+            "the second toggle must restore the pre-maximize geometry exactly"
+        );
+        assert!(!client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert_eq!(client.restore_geometry, None, "the restore snapshot must be consumed, not left to go stale");
+    }
+
+    #[test]
+    fn toggle_maximize_full_over_a_partial_maximize_goes_full_not_restored() {
+        // `toggle_maximize`'s clean-slate semantics, reached through the
+        // keybinding entry point: vertical-only is not "full", so the
+        // toggle must complete the maximize (from the true original
+        // geometry), and only the next toggle restores.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+        wm.maximize(id, MaximizeDirections::VERTICAL);
+
+        wm.toggle_maximize_full(id);
+
+        let client = wm.client(id).unwrap();
+        assert!(
+            client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+            "a partial maximize must be completed, not toggled off"
+        );
+        assert_eq!(
+            client.restore_geometry,
+            Some(original_geometry),
+            "the restore snapshot must still be the true original"
+        );
+
+        wm.toggle_maximize_full(id);
+        assert_eq!(wm.client(id).unwrap().geometry, original_geometry);
+    }
+
+    #[test]
+    fn titlebar_double_click_toggles_shade() {
+        // Matches the classic titlebar double-click default exactly:
+        // a plain double-click (no modifiers) shades, not maximizes —
+        // full maximize needs both Ctrl and Shift held together (see
+        // `ctrl_shift_double_click_toggles_full_maximize`).
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let drag_point = Point::new(30, 2);
+
+        wm.dispatch(titlebar_press(frame, drag_point, 0, Modifiers::empty()));
+        wm.dispatch(titlebar_press(frame, drag_point, 150, Modifiers::empty()));
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::SHADED));
+        assert!(
+            !client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+            "plain double-click must not maximize"
+        );
+
+        // A fresh double-click (two more presses within the window of
+        // each other) toggles back off, same as maximize's toggle.
+        wm.dispatch(titlebar_press(frame, drag_point, 600, Modifiers::empty()));
+        wm.dispatch(titlebar_press(frame, drag_point, 650, Modifiers::empty()));
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+    }
+
+    #[test]
+    fn ctrl_shift_double_click_toggles_full_maximize() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let drag_point = Point::new(30, 2);
+        let both = Modifiers::CONTROL | Modifiers::SHIFT;
+
+        wm.dispatch(titlebar_press(frame, drag_point, 0, Modifiers::empty()));
+        wm.dispatch(titlebar_press(frame, drag_point, 150, both));
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert!(!client.flags.contains(ClientFlags::SHADED));
+    }
+
+    /// Picking a shaded window in Overview focuses its strip without
+    /// unrolling it; an application's activation still shows the whole
+    /// window.
+    #[test]
+    fn an_overview_pick_keeps_a_shaded_window_rolled_up() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let other = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_geometry(other, Rect { pos: Point::new(300, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.dispatch(BackendEvent::MapRequest(other));
+        let id = wm.client_for_window(window).unwrap();
+        let other_id = wm.client_for_window(other).unwrap();
+        wm.shade(id);
+        wm.focus_client(other_id);
+
+        wm.activate_from_overview(window);
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "an Overview pick must not unroll");
+        assert_eq!(wm.focused_client(), Some(id), "the picked strip takes focus");
+        assert_eq!(wm.backend().client_mapped.get(&window), Some(&false), "its content stays hidden");
+
+        wm.focus_client(other_id);
+        wm.dispatch(BackendEvent::ActivateRequested(window));
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "an application's activation still unrolls");
+    }
+
+    #[test]
+    fn shade_hides_the_content_and_shrinks_the_frame_to_the_titlebar() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+        let shaded_height = wm.client(id).unwrap().layout.shaded_frame_height;
+
+        wm.shade(id);
+
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        assert_eq!(wm.client(id).unwrap().geometry, original_geometry, "content geometry must be untouched by shading");
+        let frame_geom = wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(frame_geom.size.h, shaded_height, "frame should shrink to just the titlebar");
+        assert_eq!(
+            wm.backend().client_mapped.get(&window),
+            Some(&false),
+            "content window must be unmapped while shaded"
+        );
+    }
+
+    /// A window mapped on an 800x600 monitor, ready to have its states
+    /// combined. Shared by the two orderings below so the assertions,
+    /// not the setup, are what differ between them.
+    fn shadeable_window() -> (WindowManager<FakeBackend>, ClientId, FakeWindowId) {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        (wm, id, window)
+    }
+
+    #[test]
+    fn a_fullscreen_client_cannot_resize_itself_out_of_the_fullscreen_rectangle() {
+        // A browser still presenting its windowed buffer, or a fixed-size
+        // game, commits a size other than the fullscreen rectangle. Adopting
+        // it made the fullscreen reflow resize the window straight back; that
+        // resize deduplicated against the configure already sent, and the
+        // backend answered it with the same commit, about twenty times a
+        // second. The geometry always ended fullscreen, so the loop shows
+        // only as the resize it sends.
+        let (mut wm, id, window) = shadeable_window();
+        let windowed = wm.client(id).unwrap().geometry;
+        wm.fullscreen(id);
+        let fullscreen = wm.client(id).unwrap().geometry;
+        assert_ne!(fullscreen.size, windowed.size);
+        let resizes = |wm: &WindowManager<FakeBackend>| wm.backend().client_resize_count.get(&window).copied().unwrap_or(0);
+        let before = resizes(&wm);
+
+        wm.dispatch(BackendEvent::ClientSizeCommitted { window, size: Size::new(60, 40) });
+        assert_eq!(resizes(&wm), before, "a committed buffer smaller than fullscreen must not start a resize");
+        assert_eq!(wm.client(id).unwrap().geometry, fullscreen);
+        wm.dispatch(BackendEvent::ConfigureRequest { window, requested: Rect::new(Point::new(0, 0), Size::new(70, 50)) });
+        assert_eq!(resizes(&wm), before, "nor may a configure request resize a fullscreen window");
+        assert_eq!(wm.client(id).unwrap().geometry, fullscreen);
+
+        wm.unfullscreen(id);
+        assert_eq!(wm.client(id).unwrap().geometry.size, windowed.size, "leaving fullscreen restores the windowed size");
+    }
+
+    #[test]
+    fn fullscreening_a_shaded_window_unshades_it_rather_than_emptying_the_frame() {
+        // Before the guard this produced a monitor-sized frame with no
+        // content in it: `reflow_frame`'s fullscreen branch runs first,
+        // so the shaded branch never ran, and nothing re-mapped the
+        // content that `shade` had unmapped.
+        //
+        // Fullscreen wins because it is the client's own state and
+        // shade is presentation, so the shade is undone rather than the
+        // fullscreen refused.
+        let (mut wm, id, window) = shadeable_window();
+        let unshaded_geometry = wm.client(id).unwrap().geometry;
+
+        wm.shade(id);
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        wm.fullscreen(id);
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::FULLSCREEN), "the fullscreen request is honoured");
+        assert!(!client.flags.contains(ClientFlags::SHADED), "and the shade is undone, not left standing");
+        assert_eq!(
+            wm.backend().client_mapped.get(&window),
+            Some(&true),
+            "a fullscreen window must have its content mapped, or the frame is an empty rectangle"
+        );
+
+        // Leaving fullscreen still round-trips the ordinary client
+        // geometry and does not resurrect the shade. (Shading changes
+        // only the backend frame geometry, so this is a round-trip
+        // assertion rather than a snapshot-order assertion.)
+        wm.unfullscreen(id);
+        let client = wm.client(id).unwrap();
+        assert!(!client.flags.contains(ClientFlags::FULLSCREEN));
+        assert!(!client.flags.contains(ClientFlags::SHADED), "leaving fullscreen must not resurrect the shade");
+        assert_eq!(client.geometry, unshaded_geometry, "and restores the geometry it had before either state");
+        assert_eq!(wm.backend().client_mapped.get(&window), Some(&true));
+    }
+
+    #[test]
+    fn shading_a_fullscreen_window_is_refused_rather_than_blanking_the_screen() {
+        // The other ordering, and the worse one: before the guard the
+        // content was unmapped while the full-screen rectangle stayed
+        // exactly where it was, leaving no titlebar to click and no
+        // contents to identify the window by.
+        //
+        // Refused rather than unfullscreened, matching the
+        // `ClientChrome::Bare` refusal a few lines above it:
+        // there is no titlebar to roll up into, and shade is the
+        // request that came from us rather than from the client.
+        let (mut wm, id, window) = shadeable_window();
+        wm.fullscreen(id);
+        let fullscreen_frame = *wm
+            .backend()
+            .last_frame_geometry
+            .get(&wm.client(id).unwrap().frame.unwrap())
+            .unwrap();
+
+        wm.shade(id);
+
+        let client = wm.client(id).unwrap();
+        assert!(!client.flags.contains(ClientFlags::SHADED), "shade must be refused while fullscreen");
+        assert!(client.flags.contains(ClientFlags::FULLSCREEN), "and must not disturb the fullscreen state");
+        // `None` here is the strongest possible answer: the backend was
+        // never told to unmap at all, because the refusal returns before
+        // `set_client_mapped`. `Some(false)` is the bug.
+        assert_eq!(
+            wm.backend().client_mapped.get(&window),
+            None,
+            "a refused shade must not call set_client_mapped at all"
+        );
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&client.frame.unwrap()),
+            Some(&fullscreen_frame),
+            "and the frame is untouched"
+        );
+
+        // `toggle_shade` goes through the same refusal, so the
+        // double-click and window-menu gestures cannot get around it.
+        wm.toggle_shade(id);
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+
+        // Leaving fullscreen leaves an ordinary window that still shades.
+        wm.unfullscreen(id);
+        wm.shade(id);
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED), "shade works again once fullscreen is gone");
+    }
+
+    #[test]
+    fn shaded_and_fullscreen_are_never_both_set_by_any_ordering() {
+        // The invariant the two guards exist to hold, stated once and
+        // driven through every entry point that can reach either flag —
+        // including the toggles, which is what a bound key and a
+        // client's `_NET_WM_STATE` message both land on.
+        for order in 0..2 {
+            let (mut wm, id, _) = shadeable_window();
+            if order == 0 {
+                wm.toggle_shade(id);
+                wm.toggle_fullscreen(id);
+            } else {
+                wm.toggle_fullscreen(id);
+                wm.toggle_shade(id);
+            }
+            let flags = wm.client(id).unwrap().flags;
+            assert!(
+                !(flags.contains(ClientFlags::SHADED) && flags.contains(ClientFlags::FULLSCREEN)),
+                "ordering {order} left both SHADED and FULLSCREEN set"
+            );
+        }
+    }
+
+    #[test]
+    fn shaded_sparse_chrome_fits_the_frame_and_matches_the_full_painter() {
+        use wm_theme::{default_theme, Appearance, FontState, RasterThemeEngine};
+        use wm_theme_api::ThemeEngine;
+
+        let fonts = FontState::new();
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            for theme in default_theme::all_themes_in(appearance) {
+                let name = theme.id.clone();
+                let engine = RasterThemeEngine::with_fonts(theme.clone(), fonts.clone());
+                for scale in [1.0, 1.5, 2.0] {
+                    let full_engine = RasterThemeEngine::with_fonts(theme.scaled(scale), fonts.clone());
+                    for (title, focused) in [("Terminal", true), ("Changed title", false)] {
+                        let request = DecorationRequest {
+                            content_size: Size::new(300, 200),
+                            title: title.into(),
+                            focused,
+                            resizable: true,
+                            buttons: Vec::new(),
+                        };
+                        let layout = engine.layout_at(&request, scale);
+                        let (paint_request, paint_layout) = shaded_paint_inputs(&request, &layout);
+                        let surface = engine.render_surface_at(&paint_request, &paint_layout, scale);
+                        let full = full_engine.render(&paint_request, &paint_layout);
+                        let mut pixels = vec![0; full.pixels.len()];
+                        for pixel in pixels.as_chunks_mut::<4>().0 {
+                            pixel[3] = 255; // The backend's opaque black gap fill.
+                        }
+                        for part in surface.parts {
+                            assert!(
+                                part.offset.x >= 0 && part.offset.y >= 0
+                                    && part.offset.x as u32 + part.buffer.width <= full.width
+                                    && part.offset.y as u32 + part.buffer.height <= full.height,
+                                "{name} {appearance:?} scale {scale}: sparse chrome at {:?}, {}x{} exceeds the {}x{} shaded frame",
+                                part.offset, part.buffer.width, part.buffer.height, full.width, full.height
+                            );
+                            for y in 0..part.buffer.height as usize {
+                                let src = y * part.buffer.width as usize * 4;
+                                let dst = ((part.offset.y as usize + y) * full.width as usize
+                                    + part.offset.x as usize) * 4;
+                                let len = part.buffer.width as usize * 4;
+                                pixels[dst..dst + len].copy_from_slice(&part.buffer.pixels[src..src + len]);
+                            }
+                        }
+                        assert!(pixels == full.pixels, "{name} {appearance:?} scale {scale}: shaded titlebar and bottom border must match the full painter");
+                        assert_eq!(request.content_size, Size::new(300, 200), "the client's restore size is untouched");
+                        assert!(layout.frame_size.h > paint_layout.frame_size.h);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shade_paints_a_titlebar_only_decoration_buffer() {
+        // Regression test: shading shrank the frame *rect* but still
+        // painted the full-height decoration into it. On X11 the frame
+        // window clips the oversized buffer, so the roll-up looked
+        // right; on Wayland the buffer is the frame's outline (the
+        // renderer draws it at the buffer's own size), so the window
+        // went blank at full size instead of rolling up. Asserting the
+        // painted buffer against the frame rect catches it on either
+        // backend.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let shaded_height = wm.client(id).unwrap().layout.shaded_frame_height;
+
+        wm.shade(id);
+
+        let painted = *wm.backend().last_paint_size.get(&frame).unwrap();
+        let frame_geom = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(painted.h, shaded_height, "the decoration buffer must be rasterized at shaded height");
+        assert_eq!(painted, frame_geom.size, "the painted buffer must cover the frame rect exactly, no more");
+    }
+
+    #[test]
+    fn a_shaded_frame_stays_rolled_up_across_repaints() {
+        // The double-click that shades is followed immediately by the
+        // matching button *release*, which repaints the frame to clear
+        // any pressed button — and `repaint_decoration` renders from
+        // `client.layout`, which stays at its full unshaded shape by
+        // design. Before the fix that repaint re-inflated the buffer a
+        // few microseconds after the shade painted it correctly, so the
+        // user never saw a rolled-up frame at all.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let shaded_height = wm.client(id).unwrap().layout.shaded_frame_height;
+
+        // A real double-click on the titlebar drag region, then the
+        // release that ends it.
+        let drag_point = Point::new(30, 2);
+        wm.dispatch(titlebar_press(frame, drag_point, 0, Modifiers::empty()));
+        wm.dispatch(titlebar_press(frame, drag_point, 100, Modifiers::empty()));
+        wm.dispatch(frame_release(frame, drag_point));
+
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        let painted = *wm.backend().last_paint_size.get(&frame).unwrap();
+        assert_eq!(painted.h, shaded_height, "the repaint after the double-click must stay at shaded height");
+
+        // Any later repaint (focus change, title update) must hold the
+        // shade too — same trap, different trigger.
+        wm.backend_mut().set_title(window, "user@host:~/chonkstep");
+        wm.dispatch(BackendEvent::TitleChanged(window));
+        let painted = *wm.backend().last_paint_size.get(&frame).unwrap();
+        assert_eq!(painted.h, shaded_height, "a title-change repaint must not re-inflate a shaded frame");
+    }
+
+    #[test]
+    fn every_frame_state_change_paints_a_buffer_that_matches_the_frame_rect() {
+        // The invariant the shade bug broke, swept over the state
+        // changes that move a frame's edges. It is stated as "buffer ==
+        // rect" rather than "buffer is at least the rect" because a
+        // backend that composites the buffer directly (Wayland) shows
+        // every pixel of it: too small leaves the frame stunted, too
+        // large paints chrome over screen the frame doesn't own.
+        // Fullscreen is deliberately out of scope — that path paints no
+        // decoration at all (`reflow_frame`'s fullscreen branch), the
+        // client's own content covering the frame edge to edge.
+        type Op = (&'static str, fn(&mut WindowManager<FakeBackend>, ClientId));
+        let ops: &[Op] = &[
+            ("shade", |wm, id| wm.shade(id)),
+            ("unshade", |wm, id| {
+                wm.shade(id);
+                wm.unshade(id)
+            }),
+            ("maximize while shaded", |wm, id| {
+                wm.shade(id);
+                wm.maximize(id, MaximizeDirections::FULL)
+            }),
+            ("maximize", |wm, id| wm.maximize(id, MaximizeDirections::FULL)),
+            ("unmaximize", |wm, id| {
+                wm.maximize(id, MaximizeDirections::FULL);
+                wm.unmaximize(id)
+            }),
+            ("miniaturize and back", |wm, id| {
+                wm.miniaturize(id);
+                wm.deminiaturize(id)
+            }),
+        ];
+
+        for (name, op) in ops {
+            let mut backend = FakeBackend::new();
+            let window = backend.create_window();
+            backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+            let mut wm = wm(backend);
+            wm.dispatch(BackendEvent::MapRequest(window));
+            let id = wm.client_for_window(window).unwrap();
+            let frame = wm.client(id).unwrap().frame.unwrap();
+            assert_eq!(
+                wm.backend().last_paint_size.get(&frame).copied(),
+                wm.backend().last_frame_geometry.get(&frame).map(|geometry| geometry.size),
+                "map: decoration buffer and frame rect disagree"
+            );
+
+            op(&mut wm, id);
+
+            assert_eq!(
+                wm.backend().last_paint_size.get(&frame).copied(),
+                wm.backend().last_frame_geometry.get(&frame).map(|geometry| geometry.size),
+                "{name}: decoration buffer and frame rect disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn unshade_restores_full_frame_and_remaps_content() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        wm.shade(id);
+        wm.unshade(id);
+
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::SHADED));
+        assert_eq!(wm.backend().client_mapped.get(&window), Some(&true));
+        let frame_geom = *wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(frame_geom.size.h, wm.client(id).unwrap().layout.frame_size.h);
+        // The buffer has to grow back with the rect: a Wayland frame is
+        // only as big as the decoration painted into it, so a shaded
+        // buffer left behind here would leave the window a titlebar-
+        // sized strip with its content hanging out below it.
+        let painted = *wm.backend().last_paint_size.get(&frame).unwrap();
+        assert_eq!(painted, frame_geom.size, "unshading must repaint the decoration at full frame size");
+    }
+
+    #[test]
+    fn shading_does_not_generate_a_spurious_unmapped_event() {
+        // Regression guard for the whole reason `Backend::set_client_
+        // mapped` exists rather than reusing `unmap_frame`: shading must
+        // never look like the client withdrew.
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.shade(id);
+
+        assert!(wm.client_for_window(window).is_some(), "client must still be tracked while shaded");
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Normal);
+    }
+
+    #[test]
+    fn ctrl_double_click_maximizes_vertical_only() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let drag_point = Point::new(30, 2);
+
+        wm.dispatch(titlebar_press(frame, drag_point, 0, Modifiers::empty()));
+        wm.dispatch(titlebar_press(frame, drag_point, 150, Modifiers::CONTROL));
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::MAXIMIZED_V));
+        assert!(!client.flags.contains(ClientFlags::MAXIMIZED_H), "Ctrl double-click should only maximize vertically");
+    }
+
+    #[test]
+    fn a_second_press_after_the_double_click_window_starts_a_move_instead() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let drag_point = Point::new(30, 2);
+
+        wm.dispatch(titlebar_press(frame, drag_point, 0, Modifiers::empty()));
+        wm.dispatch(titlebar_press(frame, drag_point, 900, Modifiers::empty()));
+
+        assert!(!wm.client(id).unwrap().flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(130, 130), surface_local: None });
+        let last_geom = wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_ne!(
+            last_geom.pos,
+            Point::new(50, 50),
+            "the second (non-double-click) press should still have armed a drag"
+        );
+    }
+
+    #[test]
+    fn dragging_near_the_screen_edge_snaps_the_frame_flush() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(4, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+
+        let grab = Point::new(30, 2);
+        wm.dispatch(BackendEvent::PointerButton {
+            surface: SurfaceRef::Frame(frame),
+            local: grab,
+            button: MouseButton::Left,
+            pressed: true,
+            time_ms: 0,
+            mods: Modifiers::empty(),
+        });
+        // Root-relative motion that would land the frame's left edge at
+        // x=4 — within the snap threshold of the screen's x=0 edge.
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(34, 52), surface_local: None });
+
+        let last_geom = wm.backend().last_frame_geometry.get(&frame).unwrap();
+        assert_eq!(last_geom.pos.x, 0, "frame should have snapped flush with the screen's left edge");
+    }
+
+    #[test]
+    fn activate_request_restores_and_focuses_a_miniaturized_client() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        wm.miniaturize(id);
+        assert_eq!(wm.client(id).unwrap().lifecycle, Lifecycle::Miniaturized);
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, true, false)),
+            "miniaturizing must publish the client as hidden"
+        );
+
+        wm.dispatch(BackendEvent::ActivateRequested(window));
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(client.lifecycle, Lifecycle::Normal, "activation must restore a miniaturized client");
+        assert!(client.flags.contains(ClientFlags::FOCUSED));
+        assert_eq!(wm.focused_client(), Some(id));
+        assert_eq!(
+            wm.backend().published_active_windows.last(),
+            Some(&Some(window)),
+            "the focus change must be published as the active window"
+        );
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, false, false)),
+            "the restored client must be re-published as not hidden"
+        );
+    }
+
+    /// Window A on workspace 0; B and C on workspace 1; workspace 0 on
+    /// screen with A focused. The desk an Omarchy launch-or-focus chord
+    /// or notification click meets, in the default Desktop interaction
+    /// mode.
+    fn desk_with_windows_elsewhere(
+        policy: Option<std::sync::Arc<dyn FloatPolicy>>,
+    ) -> (WindowManager<FakeBackend>, [FakeWindowId; 3], [ClientId; 3]) {
+        let mut backend = FakeBackend::new();
+        let windows = [backend.create_window(), backend.create_window(), backend.create_window()];
+        let mut wm = wm(backend);
+        assert!(!wm.spaces_mode(), "the default interaction mode is Desktop");
+        wm.set_float_policy(policy);
+        wm.dispatch(BackendEvent::MapRequest(windows[0]));
+        wm.switch_workspace(1);
+        wm.dispatch(BackendEvent::MapRequest(windows[1]));
+        wm.dispatch(BackendEvent::MapRequest(windows[2]));
+        wm.switch_workspace(0);
+        let ids = windows.map(|window| wm.client_for_window(window).unwrap());
+        assert_eq!(wm.current_workspace(), 0);
+        assert_eq!(wm.focused_client(), Some(ids[0]));
+        assert_eq!(wm.client(ids[1]).unwrap().workspace, 1);
+        assert_eq!(wm.client(ids[2]).unwrap().workspace, 1);
+        (wm, windows, ids)
+    }
+
+    fn frame_mapped(wm: &WindowManager<FakeBackend>, id: ClientId) -> bool {
+        wm.client(id)
+            .and_then(|client| client.frame)
+            .is_some_and(|frame| wm.backend().mapped_frames.contains(&frame))
+    }
+
+    /// The invariant the focus guard exists for: whatever holds
+    /// `FOCUSED` is a window the user can see.
+    fn assert_focus_is_on_screen(wm: &WindowManager<FakeBackend>) {
+        for (id, client) in wm.clients.iter() {
+            if client.flags.contains(ClientFlags::FOCUSED) {
+                assert!(frame_mapped(wm, id), "{id:?} holds focus with its frame unmapped");
+                assert_eq!(wm.focused_client(), Some(id));
+            }
+        }
+    }
+
+    /// IPC `focuswindow`, Lua `hl.dsp.focus({ window })`, xdg-activation,
+    /// foreign-toplevel `activate` and `_NET_ACTIVE_WINDOW` all arrive
+    /// as this event. In Desktop mode it used to focus B where it stood,
+    /// unmapped on workspace 1, while workspace 0 stayed on screen.
+    #[test]
+    fn activate_request_switches_to_the_workspace_holding_the_window() {
+        let (mut wm, [_, b_window, _], [a, b, c]) = desk_with_windows_elsewhere(None);
+
+        wm.dispatch(BackendEvent::ActivateRequested(b_window));
+
+        assert_eq!(wm.current_workspace(), 1, "activation must show the window it focuses");
+        assert_eq!(wm.backend().published_workspaces.last(), Some(&(2, 1)));
+        assert!(frame_mapped(&wm, b), "the activated window must be mapped");
+        assert!(!frame_mapped(&wm, a), "the workspace left behind must be hidden");
+        assert_eq!(wm.focused_client(), Some(b));
+        assert!(wm.client(b).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert_eq!(wm.backend().focused_window, Some(b_window));
+        assert_eq!(
+            wm.backend().published_active_windows.last(),
+            Some(&Some(b_window)),
+            "the bar's active window must be the one on screen"
+        );
+        assert!(
+            wm.focus_history().ends_with(&[a, b]),
+            "the workspace switch must not slip C into the history between A and B: {:?} (A {a:?}, B {b:?}, C {c:?})",
+            wm.focus_history()
+        );
+        assert_focus_is_on_screen(&wm);
+    }
+
+    #[test]
+    fn activate_request_on_a_pinned_window_stays_on_the_current_workspace() {
+        let (mut wm, [_, b_window, _], [_, b, _]) = desk_with_windows_elsewhere(None);
+        assert!(wm.set_client_pinned(b, true));
+        assert!(frame_mapped(&wm, b), "a pinned window is on every workspace");
+
+        wm.dispatch(BackendEvent::ActivateRequested(b_window));
+
+        assert_eq!(wm.current_workspace(), 0, "a pinned window is already on screen");
+        assert_eq!(wm.focused_client(), Some(b));
+        assert_focus_is_on_screen(&wm);
+    }
+
+    #[test]
+    fn a_refused_activation_neither_switches_workspace_nor_moves_focus() {
+        let (mut wm, [_, b_window, _], [a, b, _]) =
+            desk_with_windows_elsewhere(Some(std::sync::Arc::new(NoActivate)));
+        assert!(wm.client(b).unwrap().flags.contains(ClientFlags::NO_ACTIVATE));
+        let publishes = wm.backend().published_workspaces.len();
+
+        wm.dispatch(BackendEvent::ActivateRequested(b_window));
+
+        assert_eq!(wm.current_workspace(), 0);
+        assert_eq!(wm.backend().published_workspaces.len(), publishes);
+        assert_eq!(wm.focused_client(), Some(a));
+        assert_focus_is_on_screen(&wm);
+    }
+
+    /// A miniaturized window restores onto the workspace the user is
+    /// looking at (see `deminiaturize_one`), so activation shows it
+    /// here rather than switching away to where it was miniaturized.
+    #[test]
+    fn activate_request_restores_a_miniaturized_window_from_another_workspace() {
+        let (mut wm, [_, b_window, _], [_, b, _]) = desk_with_windows_elsewhere(None);
+        wm.switch_workspace(1);
+        wm.miniaturize(b);
+        wm.switch_workspace(0);
+        assert_eq!(wm.client(b).unwrap().lifecycle, Lifecycle::Miniaturized);
+
+        wm.dispatch(BackendEvent::ActivateRequested(b_window));
+
+        let client = wm.client(b).unwrap();
+        assert_eq!(client.lifecycle, Lifecycle::Normal);
+        assert_eq!(client.workspace, 0, "restored onto the workspace on screen");
+        assert_eq!(wm.current_workspace(), 0);
+        assert!(frame_mapped(&wm, b), "the restored window must be shown");
+        assert_eq!(wm.focused_client(), Some(b));
+        assert_eq!(wm.backend().published_active_windows.last(), Some(&Some(b_window)));
+        assert_focus_is_on_screen(&wm);
+    }
+
+    /// The application switcher offers windows from every workspace;
+    /// outside Spaces nothing on its commit path used to switch, and
+    /// the focus guard would otherwise turn that commit into a no-op.
+    #[test]
+    fn committing_the_application_switcher_shows_a_window_on_another_workspace() {
+        let (mut wm, [a_window, b_window, c_window], _) = desk_with_windows_elsewhere(None);
+        for (window, class) in [(a_window, "editor"), (b_window, "browser"), (c_window, "terminal")] {
+            wm.backend_mut().window_classes.insert(window, class.into());
+        }
+        wm.cycle_applications(1);
+        let (entries, selected) = wm.cycle_state().unwrap();
+        let selected = entries[selected].0;
+        assert_eq!(wm.client(selected).unwrap().workspace, 1, "the switcher selected a window elsewhere");
+
+        wm.cycle_end(true);
+
+        assert_eq!(wm.current_workspace(), 1);
+        assert_eq!(wm.focused_client(), Some(selected));
+        assert!(frame_mapped(&wm, selected), "the committed window must be shown");
+        assert_focus_is_on_screen(&wm);
+    }
+
+    /// The guard itself: nothing may hand the keyboard to a window the
+    /// user cannot see, whether asked directly or through a path that
+    /// focuses as a side effect.
+    #[test]
+    fn focus_is_refused_for_a_window_that_is_not_on_screen() {
+        let (mut wm, [a_window, b_window, c_window], [a, b, c]) = desk_with_windows_elsewhere(None);
+        let published = wm.backend().published_active_windows.len();
+
+        wm.focus_client(b);
+        wm.focus_client_with(b, false);
+        // A client turning modal takes focus; one on a hidden workspace
+        // must not.
+        wm.backend_mut().set_window_modal(c_window, true);
+        wm.dispatch(BackendEvent::ModalChanged { window: c_window, modal: true });
+
+        assert_eq!(wm.focused_client(), Some(a));
+        assert_eq!(wm.backend().focused_window, Some(a_window));
+        assert!(!wm.client(b).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert!(!wm.client(c).unwrap().flags.contains(ClientFlags::FOCUSED));
+        assert_eq!(wm.backend().published_active_windows.len(), published, "no active-window change may be published");
+        assert_focus_is_on_screen(&wm);
+
+        // Miniaturized is off screen too.
+        wm.switch_workspace(1);
+        wm.focus_client(c);
+        wm.miniaturize(b);
+        wm.focus_client(b);
+        assert_eq!(wm.focused_client(), Some(c));
+        assert_eq!(wm.backend().published_active_windows.last(), Some(&Some(c_window)));
+        assert_ne!(wm.backend().focused_window, Some(b_window));
+        assert_focus_is_on_screen(&wm);
+    }
+
+    /// Behind a session lock an activation must not change the
+    /// workspace the user unlocks onto. It asks for attention instead,
+    /// and the same request after unlock behaves normally.
+    #[test]
+    fn an_activation_behind_the_session_lock_marks_the_window_urgent_instead() {
+        let (mut wm, [_, b_window, _], [a, b, _]) = desk_with_windows_elsewhere(None);
+        wm.backend_mut().session_locked = true;
+
+        wm.dispatch(BackendEvent::ActivateRequested(b_window));
+
+        assert_eq!(wm.current_workspace(), 0, "no workspace switch behind the lock");
+        assert_eq!(wm.focused_client(), Some(a));
+        assert!(wm.client(b).unwrap().flags.contains(ClientFlags::URGENT));
+        assert_focus_is_on_screen(&wm);
+
+        wm.backend_mut().session_locked = false;
+        wm.dispatch(BackendEvent::ActivateRequested(b_window));
+
+        assert_eq!(wm.current_workspace(), 1);
+        assert_eq!(wm.focused_client(), Some(b));
+        assert!(!wm.client(b).unwrap().flags.contains(ClientFlags::URGENT), "focus dismisses the urgency");
+        assert_focus_is_on_screen(&wm);
+    }
+
+    #[test]
+    fn close_request_uses_the_same_backend_close_path_as_the_close_button() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        wm.dispatch(BackendEvent::CloseRequested(window));
+
+        // Same mechanism `close_button_click_sends_close_to_the_client`
+        // asserts on: `Backend::send_close`, which does the
+        // WM_DELETE_WINDOW-or-kill dance for both entry points.
+        assert!(wm.backend().close_requests.contains(&window));
+    }
+
+    #[test]
+    fn close_client_uses_the_same_backend_close_path_as_the_close_button() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.close_client(id);
+
+        // The third entry point into the one shared close mechanism —
+        // `Backend::send_close`, exactly what the titlebar button's
+        // commit and `_NET_CLOSE_WINDOW` record here too.
+        assert!(wm.backend().close_requests.contains(&window));
+    }
+
+    /// A config keybinding fires against whatever `focused_client`
+    /// returned a moment ago — a window can die between the two, so
+    /// every keybinding-facing method must shrug off a stale id rather
+    /// than panic or touch the backend.
+    #[test]
+    fn keybinding_action_methods_ignore_a_stale_client_id() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        wm.dispatch(BackendEvent::Destroyed(window));
+
+        wm.close_client(id);
+        wm.toggle_maximize_full(id);
+        wm.toggle_fullscreen(id);
+
+        assert!(wm.backend().close_requests.is_empty(), "a stale id must not close anything");
+        assert_eq!(wm.client_count(), 0);
+    }
+
+    #[test]
+    fn fullscreen_toggle_covers_the_monitor_and_a_second_toggle_restores_exactly() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let monitor = Rect { pos: Point::new(0, 0), size: Size::new(800, 600) };
+        backend.set_monitor(monitor);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        let toggle = BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Toggle,
+            first: NetState::Fullscreen,
+            second: None,
+        };
+        wm.dispatch(toggle.clone());
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::FULLSCREEN));
+        assert_eq!(client.geometry, monitor, "content must fill the monitor edge-to-edge");
+        assert_eq!(
+            client.layout.client_offset,
+            Point::new(0, 0),
+            "no chrome offset — the client sits at the frame's own origin"
+        );
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&frame),
+            Some(&monitor),
+            "the frame must be exactly the monitor rect"
+        );
+        assert!(
+            wm.backend().raised_frames.contains(&frame),
+            "entering fullscreen must raise"
+        );
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, true, false, false, false, false, false, false))
+        );
+
+        wm.dispatch(toggle);
+
+        let client = wm.client(id).unwrap();
+        assert!(!client.flags.contains(ClientFlags::FULLSCREEN));
+        assert_eq!(
+            client.geometry, original_geometry,
+            "a second toggle must restore the prior geometry exactly"
+        );
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, false, false))
+        );
+    }
+
+    /// Mirror of `fullscreen_toggle_covers_the_monitor_and_a_second_
+    /// toggle_restores_exactly`, through the keybinding entry point
+    /// instead of a `_NET_WM_STATE` message — the two must be
+    /// indistinguishable, since `toggle_fullscreen` routes through the
+    /// same `apply_fullscreen_action` a pager's Toggle takes.
+    #[test]
+    fn toggle_fullscreen_round_trips_exactly() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        let monitor = Rect { pos: Point::new(0, 0), size: Size::new(800, 600) };
+        backend.set_monitor(monitor);
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        wm.toggle_fullscreen(id);
+
+        let client = wm.client(id).unwrap();
+        assert!(client.flags.contains(ClientFlags::FULLSCREEN));
+        assert_eq!(client.geometry, monitor, "content must fill the monitor edge-to-edge");
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&frame),
+            Some(&monitor),
+            "the frame must be exactly the monitor rect"
+        );
+        assert!(
+            wm.backend().raised_frames.contains(&frame),
+            "entering fullscreen must raise"
+        );
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, true, false, false, false, false, false, false))
+        );
+
+        wm.toggle_fullscreen(id);
+
+        let client = wm.client(id).unwrap();
+        assert!(!client.flags.contains(ClientFlags::FULLSCREEN));
+        assert_eq!(
+            client.geometry, original_geometry,
+            "the second toggle must restore the prior geometry exactly"
+        );
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, false, false))
+        );
+    }
+
+    /// The reason `fullscreen_restore` is its own slot and not
+    /// `Client::restore_geometry`: leaving fullscreen must land back on
+    /// the maximized rect (the geometry fullscreen replaced), while
+    /// maximize's own pre-maximize snapshot stays intact for a later
+    /// `unmaximize`.
+    #[test]
+    fn fullscreen_over_a_maximized_window_restores_the_maximized_rect_then_the_original() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+        wm.maximize(id, MaximizeDirections::FULL);
+        let maximized_geometry = wm.client(id).unwrap().geometry;
+
+        wm.fullscreen(id);
+        wm.unfullscreen(id);
+
+        let client = wm.client(id).unwrap();
+        assert_eq!(
+            client.geometry, maximized_geometry,
+            "leaving fullscreen must restore the maximized rect it replaced"
+        );
+        assert!(
+            client.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+            "the maximized state must survive the fullscreen round trip"
+        );
+
+        wm.unmaximize(id);
+        assert_eq!(
+            wm.client(id).unwrap().geometry,
+            original_geometry,
+            "maximize's own restore snapshot must still be intact"
+        );
+    }
+
+    #[test]
+    fn net_state_maximize_add_of_both_axes_maps_to_full_maximize_and_remove_restores() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let original_geometry = wm.client(id).unwrap().geometry;
+
+        // The conventional pager "maximize": both axes in one message.
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::MaximizedHorz,
+            second: Some(NetState::MaximizedVert),
+        });
+
+        let client = wm.client(id).unwrap();
+        assert!(client
+            .flags
+            .contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, true, true, false, false, false))
+        );
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Remove,
+            first: NetState::MaximizedHorz,
+            second: Some(NetState::MaximizedVert),
+        });
+
+        let client = wm.client(id).unwrap();
+        assert!(!client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert_eq!(client.geometry, original_geometry, "removing both axes must restore the pre-maximize geometry");
+    }
+
+    /// Omarchy's first window rule, `suppress_event = "maximize"` on
+    /// every window: a client's own request to maximize or go fullscreen
+    /// is answered with its unchanged state, while the compositor's verb
+    /// still maximizes and the client may leave that again.
+    #[test]
+    fn a_suppress_event_rule_refuses_client_state_requests_but_not_compositor_verbs() {
+        #[derive(Debug)]
+        struct Suppresses;
+
+        impl FloatPolicy for Suppresses {
+            fn decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+                None
+            }
+
+            fn window_decision_for(&self, _class: &str, _title: &str, _xdg_tag: &str) -> crate::placement::WindowRuleDecision {
+                crate::placement::WindowRuleDecision {
+                    suppress_maximize: true,
+                    suppress_fullscreen: true,
+                    ..Default::default()
+                }
+            }
+        }
+
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(50, 50), size: Size::new(100, 100) });
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(800, 600) });
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(Suppresses)));
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let geometry = wm.client(id).unwrap().geometry;
+        let published = wm.backend().published_net_states.len();
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::MaximizedHorz,
+            second: Some(NetState::MaximizedVert),
+        });
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Toggle,
+            first: NetState::Fullscreen,
+            second: None,
+        });
+        let client = wm.client(id).unwrap();
+        assert!(!client
+            .flags
+            .intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V | ClientFlags::FULLSCREEN));
+        assert_eq!(client.geometry, geometry, "a refused request moves nothing");
+        assert_eq!(
+            wm.backend().published_net_states.len(),
+            published + 2,
+            "each refusal is answered with the unchanged state"
+        );
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, false, false))
+        );
+
+        wm.toggle_maximize_full(id);
+        assert!(
+            wm.client(id).unwrap().flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+            "the compositor's own verb still maximizes"
+        );
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Remove,
+            first: NetState::MaximizedHorz,
+            second: Some(NetState::MaximizedVert),
+        });
+        assert!(
+            !wm.client(id).unwrap().flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V),
+            "the client may still leave a maximize it did not ask for"
+        );
+    }
+
+    #[test]
+    fn net_state_modal_uses_the_same_flag_as_xdg_dialog_modality() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Add,
+            first: NetState::Modal,
+            second: None,
+        });
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::MODAL));
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, false, true))
+        );
+
+        wm.dispatch(BackendEvent::NetStateRequested {
+            window,
+            action: NetStateAction::Toggle,
+            first: NetState::Modal,
+            second: None,
+        });
+        assert!(!wm.client(id).unwrap().flags.contains(ClientFlags::MODAL));
+        assert_eq!(
+            wm.backend().published_net_states.last(),
+            Some(&(window, false, false, false, false, false, false, false))
+        );
+    }
+
+    #[test]
+    fn an_unmanaged_window_type_is_mapped_as_is_and_never_tracked() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        backend.set_window_type(window, WindowType::Unmanaged);
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        assert!(
+            wm.backend().unmanaged_mapped.contains(&window),
+            "must be mapped via `map_unmanaged`, as the client created it"
+        );
+        assert_eq!(wm.client_count(), 0, "no client entry may exist");
+        assert!(wm.client_for_window(window).is_none());
+        assert!(wm.backend().mapped_frames.is_empty(), "no decoration frame may have been created or mapped");
+    }
+
+    #[test]
+    fn client_list_publishes_on_map_and_shrinks_on_destroy() {
+        let mut backend = FakeBackend::new();
+        let w1 = backend.create_window();
+        let w2 = backend.create_window();
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(w1));
+        assert_eq!(wm.backend().published_client_lists.last(), Some(&vec![w1]));
+
+        wm.dispatch(BackendEvent::MapRequest(w2));
+        assert_eq!(
+            wm.backend().published_client_lists.last(),
+            Some(&vec![w1, w2]),
+            "oldest first — insertion order, not focus order"
+        );
+
+        wm.dispatch(BackendEvent::Destroyed(w1));
+        assert_eq!(wm.backend().published_client_lists.last(), Some(&vec![w2]));
+    }
+
+    #[test]
+    fn grab_key_forwards_the_combo_to_the_backend() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+        let combo = KeyCombo { keysym: 0x0071, modifiers: Modifiers::ALT | Modifiers::SHIFT }; // XK_q
+
+        wm.grab_key(combo);
+
+        assert_eq!(wm.backend().grabbed_keys, vec![combo], "the combo must reach Backend::grab_key unaltered");
+    }
+
+    #[test]
+    fn bind_default_keys_grabs_only_the_modal_cycling_combos() {
+        // The keybinding split (see `bind_default_keys`): everything
+        // beyond Alt+Tab / Alt+Shift+Tab is config-driven from the
+        // binary via `grab_key`, so nothing else may be claimed here —
+        // a leftover hardcoded grab would shadow the user's own
+        // binding for that combo.
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+
+        wm.bind_default_keys();
+
+        assert_eq!(
+            wm.backend().grabbed_keys,
+            vec![
+                KeyCombo { keysym: XK_TAB, modifiers: Modifiers::ALT },
+                KeyCombo { keysym: XK_TAB, modifiers: Modifiers::ALT | Modifiers::SHIFT },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_and_workarea_changes_are_published_for_pagers() {
+        let backend = FakeBackend::new();
+        let mut wm = wm(backend);
+        assert_eq!(
+            wm.backend().published_workspaces.first(),
+            Some(&(1, 0)),
+            "the initial workspace shape must be published at startup"
+        );
+
+        wm.switch_workspace(2);
+        assert_eq!(
+            wm.backend().published_workspaces.last(),
+            Some(&(3, 2)),
+            "growth to index 2 means 3 workspaces, current 2"
+        );
+
+        let area = Rect { pos: Point::new(0, 0), size: Size::new(800, 576) };
+        wm.set_workarea(area);
+        assert_eq!(
+            wm.backend().published_workareas.last(),
+            Some(&(area, 3)),
+            "the workarea must be published with the current workspace count"
+        );
+    }
+
+    /// Two 800x600 heads side by side, the left one primary — the
+    /// arrangement every multi-monitor test below measures against.
+    fn dual_monitors() -> Vec<MonitorInfo> {
+        vec![
+            MonitorInfo { geometry: LEFT_HEAD, name: "left".to_string(), identity: None, primary: true },
+            MonitorInfo { geometry: RIGHT_HEAD, name: "right".to_string(), identity: None, primary: false },
+        ]
+    }
+
+    const LEFT_HEAD: Rect = Rect { pos: Point { x: 0, y: 0 }, size: Size { w: 800, h: 600 } };
+    const RIGHT_HEAD: Rect = Rect { pos: Point { x: 800, y: 0 }, size: Size { w: 800, h: 600 } };
+    /// The left head with a 40px dock strip carved off its bottom.
+    const LEFT_WORKAREA: Rect = Rect { pos: Point { x: 0, y: 0 }, size: Size { w: 800, h: 560 } };
+
+    #[test]
+    fn removing_a_monitor_rescues_and_unmaximizes_its_windows() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(1000, 100), size: Size::new(240, 180) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        wm.maximize(id, MaximizeDirections::FULL);
+        wm.fullscreen(id);
+
+        wm.backend_mut().set_monitors(vec![MonitorInfo {
+            geometry: LEFT_HEAD,
+            name: "left".to_string(),
+            identity: None,
+            primary: true,
+        }]);
+        wm.rescue_clients_from_removed_monitor(RIGHT_HEAD);
+
+        let client = wm.client(id).unwrap();
+        assert!(!client.flags.intersects(
+            ClientFlags::FULLSCREEN | ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V
+        ));
+        let frame = client_frame_rect(client);
+        assert!(LEFT_HEAD.contains(Point::new(
+            frame.pos.x + frame.size.w as i32 / 2,
+            frame.pos.y + frame.size.h as i32 / 2,
+        )));
+    }
+
+    fn head(geometry: Rect, name: &str, identity: Option<&str>) -> MonitorInfo {
+        MonitorInfo {
+            geometry,
+            name: name.to_string(),
+            identity: identity.map(str::to_string),
+            primary: geometry.pos.x == 0 && geometry.pos.y == 0,
+        }
+    }
+
+    fn map_freeform(wm: &mut WindowManager<FakeBackend>, pos: Point, size: Size) -> ClientId {
+        let window = wm.backend_mut().create_window();
+        wm.backend_mut().set_geometry(window, Rect { pos, size });
+        wm.dispatch(BackendEvent::MapRequest(window));
+        wm.client_for_window(window).unwrap()
+    }
+
+    fn depart(wm: &mut WindowManager<FakeBackend>, departed: Rect, name: &str, identity: Option<&str>, remaining: Vec<MonitorInfo>) {
+        wm.backend_mut().set_monitors(remaining);
+        wm.rescue_departed_output(departed, name, identity);
+    }
+
+    #[test]
+    fn reconnecting_a_monitor_restores_the_evacuated_rectangle() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let left = map_freeform(&mut wm, Point::new(40, 100), Size::new(180, 100));
+        let right = map_freeform(&mut wm, Point::new(900, 120), Size::new(500, 450));
+        let left_at = wm.client(left).unwrap().geometry;
+        let right_at = wm.client(right).unwrap().geometry;
+
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        assert_eq!(wm.client(left).unwrap().geometry, left_at, "a window on the surviving monitor stays put");
+        assert_ne!(wm.client(right).unwrap().geometry.pos, right_at.pos, "the right window has to leave with its monitor");
+        assert_eq!(wm.evacuated_homes.get(&right).map(|home| home.geometry), Some(right_at));
+        assert!(!wm.evacuated_homes.contains_key(&left));
+
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(left).unwrap().geometry, left_at);
+        assert_eq!(wm.client(right).unwrap().geometry, right_at);
+        assert!(wm.evacuated_homes.is_empty());
+    }
+
+    #[test]
+    fn a_second_evacuation_keeps_the_original_rectangle() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let right = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(right).unwrap().geometry;
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        let tiny = Rect { pos: Point::new(0, 0), size: Size::new(100, 80) };
+        depart(&mut wm, LEFT_HEAD, "left", None, vec![head(tiny, "left", None)]);
+        assert_eq!(wm.evacuated_homes.get(&right).map(|home| home.geometry), Some(original));
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(right).unwrap().geometry, original);
+    }
+
+    #[test]
+    fn the_same_display_identity_restores_under_a_new_connector_name() {
+        let mut backend = FakeBackend::new();
+        let right = head(RIGHT_HEAD, "USB-2", Some("Sony SDM"));
+        backend.set_monitors(vec![head(LEFT_HEAD, "eDP-1", None), right]);
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(id).unwrap().geometry;
+        depart(&mut wm, RIGHT_HEAD, "USB-2", Some("Sony SDM"), vec![head(LEFT_HEAD, "eDP-1", None)]);
+        wm.backend_mut().set_monitors(vec![head(LEFT_HEAD, "eDP-1", None), head(RIGHT_HEAD, "USB-3", Some("Sony SDM"))]);
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, original);
+        assert!(wm.evacuated_homes.is_empty());
+    }
+
+    #[test]
+    fn a_different_display_does_not_take_the_evacuated_window() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(vec![head(LEFT_HEAD, "eDP-1", None), head(RIGHT_HEAD, "USB-2", Some("Sony SDM"))]);
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        depart(&mut wm, RIGHT_HEAD, "USB-2", Some("Sony SDM"), vec![head(LEFT_HEAD, "eDP-1", None)]);
+        let parked = wm.client(id).unwrap().geometry;
+        wm.backend_mut().set_monitors(vec![head(LEFT_HEAD, "eDP-1", None), head(RIGHT_HEAD, "USB-3", Some("Other panel"))]);
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, parked);
+        assert!(wm.evacuated_homes.contains_key(&id));
+    }
+
+    #[test]
+    fn an_explicit_move_while_the_display_is_gone_wins() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        let placed = Rect { pos: Point::new(30, 40), size: Size::new(200, 150) };
+        wm.set_client_content_geometry(id, placed);
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, placed);
+        assert!(wm.evacuated_homes.is_empty());
+    }
+
+    #[test]
+    fn a_titlebar_click_while_the_display_is_gone_does_not_forget_the_home() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(id).unwrap().geometry;
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        wm.dispatch(titlebar_press(frame, Point::new(30, 2), 0, Modifiers::empty()));
+        wm.dispatch(frame_release(frame, Point::new(30, 2)));
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, original);
+    }
+
+    #[test]
+    fn dragging_while_the_display_is_gone_keeps_the_new_position() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(id).unwrap().geometry;
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        wm.dispatch(titlebar_press(frame, Point::new(30, 2), 0, Modifiers::empty()));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(80, 80), surface_local: None });
+        wm.dispatch(frame_release(frame, Point::new(80, 80)));
+        let placed = wm.client(id).unwrap().geometry;
+        assert_ne!(placed, original);
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, placed);
+    }
+
+    #[test]
+    fn maximizing_while_the_display_is_gone_keeps_the_window_there() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        wm.maximize(id, MaximizeDirections::FULL);
+        let maximized = wm.client(id).unwrap().geometry;
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, maximized);
+        assert!(wm.client(id).unwrap().flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
+        assert!(LEFT_HEAD.contains(Point::new(
+            maximized.pos.x + maximized.size.w as i32 / 2,
+            maximized.pos.y + maximized.size.h as i32 / 2,
+        )));
+    }
+
+    #[test]
+    fn a_client_configure_while_the_display_is_gone_does_not_discard_the_home() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(id).unwrap().geometry;
+        let window = wm.client(id).unwrap().window;
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        wm.dispatch(BackendEvent::ConfigureRequest {
+            window,
+            requested: Rect { pos: Point::new(0, 0), size: Size::new(100, 80) },
+        });
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, original);
+    }
+
+    #[test]
+    fn closing_an_evacuated_window_drops_its_return_record() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let window = wm.client(id).unwrap().window;
+        let left = map_freeform(&mut wm, Point::new(40, 100), Size::new(180, 100));
+        let left_at = wm.client(left).unwrap().geometry;
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert!(!wm.evacuated_homes.contains_key(&id));
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(left).unwrap().geometry, left_at);
+    }
+
+    #[test]
+    fn a_shifted_or_smaller_return_places_the_window_on_that_monitor() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(id).unwrap().geometry;
+        depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        let shifted = Rect { pos: Point::new(1000, 40), size: RIGHT_HEAD.size };
+        wm.backend_mut().set_monitors(vec![head(LEFT_HEAD, "left", None), head(shifted, "right", None)]);
+        wm.restore_evacuated_clients();
+        assert_eq!(
+            wm.client(id).unwrap().geometry.pos,
+            Point::new(original.pos.x + 200, original.pos.y + 40)
+        );
+        assert_eq!(wm.client(id).unwrap().geometry.size, original.size);
+
+        depart(&mut wm, shifted, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+        let smaller = Rect { pos: Point::new(800, 0), size: Size::new(200, 150) };
+        wm.backend_mut().set_monitors(vec![head(LEFT_HEAD, "left", None), head(smaller, "right", None)]);
+        wm.restore_evacuated_clients();
+        let restored = wm.client(id).unwrap().geometry;
+        assert!(smaller.contains(restored.pos));
+        assert!(restored.size.w <= smaller.size.w && restored.size.h <= smaller.size.h);
+        assert!(wm.evacuated_homes.is_empty(), "a returned display consumes the saved rectangle");
+        wm.backend_mut().set_monitors(dual_monitors());
+        wm.restore_evacuated_clients();
+        assert_eq!(wm.client(id).unwrap().geometry, restored);
+    }
+
+    #[test]
+    fn a_repeated_unplug_cycle_restores_each_time() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+        let id = map_freeform(&mut wm, Point::new(900, 120), Size::new(240, 180));
+        let original = wm.client(id).unwrap().geometry;
+        for _ in 0..2 {
+            depart(&mut wm, RIGHT_HEAD, "right", None, vec![head(LEFT_HEAD, "left", None)]);
+            assert_ne!(wm.client(id).unwrap().geometry.pos, original.pos);
+            wm.backend_mut().set_monitors(dual_monitors());
+            wm.restore_evacuated_clients();
+            assert_eq!(wm.client(id).unwrap().geometry, original);
+        }
+    }
+
+    #[test]
+    fn maximize_fills_the_workarea_of_the_monitor_holding_the_window() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let window = backend.create_window();
+        // Squarely on the right-hand head, by the client's own
+        // requested position.
+        backend.set_geometry(window, Rect { pos: Point::new(1000, 100), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        // A dock strip reserved on the primary only: the right head has
+        // no entry, so it keeps its full geometry (`set_workareas`'
+        // short-vector rule).
+        wm.set_workareas(vec![LEFT_WORKAREA]);
+
+        wm.maximize(id, MaximizeDirections::FULL);
+
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&frame),
+            Some(&RIGHT_HEAD),
+            "a window on the second head must maximize into that head, not into the primary's reserved workarea"
+        );
+    }
+
+    #[test]
+    fn a_window_dragged_onto_the_second_monitor_maximizes_there() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let window = backend.create_window();
+        backend.set_geometry(window, Rect { pos: Point::new(100, 100), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).unwrap();
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        let right_workarea = Rect { pos: Point::new(800, 0), size: Size::new(800, 560) };
+        wm.set_workareas(vec![LEFT_WORKAREA, right_workarea]);
+
+        // Where it started: the primary, and its reserved workarea.
+        wm.maximize(id, MaximizeDirections::FULL);
+        assert_eq!(wm.backend().last_frame_geometry.get(&frame), Some(&LEFT_WORKAREA));
+        wm.unmaximize(id);
+
+        // Titlebar-drag it across the seam. Far enough from every
+        // monitor edge that snapping has nothing to say about the
+        // landing position.
+        wm.dispatch(titlebar_press(frame, Point::new(30, 2), 0, Modifiers::empty()));
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(1230, 202), surface_local: None });
+        wm.dispatch(frame_release(frame, Point::new(1230, 202)));
+
+        wm.maximize(id, MaximizeDirections::FULL);
+
+        assert_eq!(
+            wm.backend().last_frame_geometry.get(&frame),
+            Some(&right_workarea),
+            "maximize must follow the window across the seam, into the second head's own workarea"
+        );
+    }
+
+    #[test]
+    fn initial_placement_lands_on_the_monitor_under_the_pointer() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let first = backend.create_window();
+        let second = backend.create_window();
+        let mut wm = wm(backend);
+
+        // The user is working on the right-hand head when the first
+        // window opens...
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(1200, 300), surface_local: None });
+        wm.dispatch(BackendEvent::MapRequest(first));
+        let first_frame = frame_rect(&wm, first);
+        assert!(
+            RIGHT_HEAD.contains(first_frame.pos),
+            "a window opened while the pointer is on the second head must place there, got {first_frame:?}"
+        );
+
+        // ...and back on the primary when the second one does.
+        wm.dispatch(BackendEvent::PointerMotion { root: Point::new(200, 300), surface_local: None });
+        wm.dispatch(BackendEvent::MapRequest(second));
+        let second_frame = frame_rect(&wm, second);
+        assert!(
+            LEFT_HEAD.contains(second_frame.pos),
+            "the pointer moving back to the primary must move where new windows open, got {second_frame:?}"
+        );
+    }
+
+    /// Omarchy's own windows are the one case where the desktop
+    /// overrides both halves of what a client asked for. The size is
+    /// logical, so it follows the desk's scale; the position is the
+    /// middle of the workarea whatever the client requested, because
+    /// the whole rule is "this window appears in the middle at this
+    /// size" (`placement::float_override`).
+    #[test]
+    fn an_omarchy_window_maps_centered_at_its_own_fixed_size() {
+        let mut backend = FakeBackend::new();
+        let window = backend.create_window();
+        // A terminal's own idea of its size, and a real (non-placeholder)
+        // position the rule must override rather than honor.
+        backend.set_geometry(window, Rect { pos: Point::new(40, 30), size: Size::new(720, 405) });
+        backend.window_classes.insert(window, "org.omarchy.terminal".to_string());
+        let mut wm = wm(backend);
+        wm.dispatch(BackendEvent::MapRequest(window));
+
+        let id = wm.client_for_window(window).unwrap();
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(875, 600), "the fixed logical size, at scale 1");
+        let frame = frame_rect(&wm, window);
+        let titlebar = wm.client(id).unwrap().layout.titlebar_height;
+        assert_eq!(frame.size, Size::new(875, 600 + titlebar), "chrome around the granted content");
+        // Centered in the 1600x1200 fake screen, frame and all.
+        assert_eq!(frame.pos, Point::new((1600 - 875) / 2, (1200 - (600 + titlebar as i32)) / 2));
+
+        // The frame extents a client reasons from describe the window it
+        // actually got, not the one it asked for.
+        assert_eq!(wm.client(id).unwrap().layout.frame_size, frame.size);
+    }
+
+    /// Omarchy's picture-in-picture and webcam-overlay rules, as
+    /// `wm_config`'s rule reader answers them: arithmetic on the monitor
+    /// in logical pixels, which this crate measures for the policy and
+    /// scales back by the output's own scale.
+    ///
+    /// `pip`: `size 600 338`, `move (monitor_w-window_w-40) (monitor_h*0.04)`.
+    /// `WebcamOverlay-small`: `size (monitor_h*4/25) (monitor_h*9/50)`,
+    /// `move (monitor_w-monitor_h*4/25-40) (monitor_h-monitor_h*9/50-40)`.
+    /// `about`: `float on, center on` — no size, no position.
+    #[derive(Debug)]
+    struct CornerRules;
+
+    impl FloatPolicy for CornerRules {
+        fn decision_for(&self, class: &str, _title: &str, _xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            matches!(class, "pip" | "WebcamOverlay-small" | "about")
+                .then_some(crate::placement::FloatDecision { size: None, center: true })
+        }
+
+        fn placement_for(
+            &self,
+            class: &str,
+            _title: &str,
+            _xdg_tag: &str,
+            metrics: &crate::placement::RuleMetrics,
+        ) -> Option<crate::placement::RulePlacement> {
+            let (monitor_w, monitor_h) = (f64::from(metrics.monitor.w), f64::from(metrics.monitor.h));
+            let px = |v: f64| v.round() as i32;
+            match class {
+                "pip" => {
+                    // `window_w` is the frame's visual width: the content
+                    // the rule just sized plus whatever chrome wraps it.
+                    let window_w = 600.0 + f64::from(metrics.chrome.w);
+                    Some(crate::placement::RulePlacement {
+                        size: Some(Size::new(600, 338)),
+                        position: Some(Point::new(px(monitor_w - window_w - 40.0), px(monitor_h * 0.04))),
+                    })
+                }
+                "WebcamOverlay-small" => Some(crate::placement::RulePlacement {
+                    size: Some(Size::new(px(monitor_h * 4.0 / 25.0) as u32, px(monitor_h * 9.0 / 50.0) as u32)),
+                    position: Some(Point::new(
+                        px(monitor_w - monitor_h * 4.0 / 25.0 - 40.0),
+                        px(monitor_h - monitor_h * 9.0 / 50.0 - 40.0),
+                    )),
+                }),
+                "about" => Some(crate::placement::RulePlacement::default()),
+                _ => None,
+            }
+        }
+    }
+
+    /// A policy keyed on the `xdg_toplevel_tag_v1` tag alone, the way
+    /// a `match:xdg_tag ^quake$` rule is: it floats a tagged window at
+    /// a fixed size and has no opinion about any other.
+    #[derive(Debug)]
+    struct TagRules;
+
+    impl FloatPolicy for TagRules {
+        fn decision_for(&self, _class: &str, _title: &str, xdg_tag: &str) -> Option<crate::placement::FloatDecision> {
+            (xdg_tag == "quake").then_some(crate::placement::FloatDecision { size: Some(Size::new(500, 400)), center: true })
+        }
+    }
+
+    /// The tag reaches the rules at map time, read from the backend
+    /// like the title and class: a window the client tagged `quake`
+    /// maps floating at the rule's size, and one of the same class
+    /// without the tag maps as itself. After the map, a tag change is
+    /// protocol-only metadata: it advances the protocol-state revision
+    /// so the IPC republishes the window, and nothing else — a window
+    /// the core does not know cannot advance it.
+    #[test]
+    fn the_xdg_tag_reaches_the_rules_at_map_time_and_a_later_change_only_republishes() {
+        let mut backend = FakeBackend::new();
+        let tagged = backend.create_window();
+        let plain = backend.create_window();
+        for window in [tagged, plain] {
+            backend.set_geometry(window, Rect { pos: Point::new(0, 0), size: Size::new(640, 360) });
+            backend.set_client_draws_own_chrome(window, true);
+            backend.window_classes.insert(window, "term".to_string());
+        }
+        backend.window_xdg_tags.insert(tagged, "quake".to_string());
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(TagRules)));
+
+        let geometry = mapped_geometry(&mut wm, tagged);
+        assert_eq!(geometry.size, Size::new(500, 400), "the tag rule sized the tagged window");
+        wm.dispatch(BackendEvent::MapRequest(plain));
+        let plain_id = wm.client_for_window(plain).expect("the untagged window maps");
+        assert_eq!(wm.client(plain_id).unwrap().geometry.size, Size::new(640, 360), "no rule matched the untagged one");
+
+        let revision = wm.protocol_state_revision();
+        wm.dispatch(BackendEvent::MetadataChanged(tagged));
+        assert_ne!(wm.protocol_state_revision(), revision, "a retag must reach the IPC publishers");
+        let revision = wm.protocol_state_revision();
+        let unknown = wm.backend_mut().create_window();
+        wm.dispatch(BackendEvent::MetadataChanged(unknown));
+        assert_eq!(wm.protocol_state_revision(), revision, "a window the core never mapped publishes nothing");
+        assert_eq!(wm.client_for_window(tagged).map(|id| wm.client(id).unwrap().geometry.size), Some(Size::new(500, 400)),
+            "rules are not re-run after map");
+    }
+
+    /// One output of `monitor` device pixels at `scale`, with three
+    /// client-drawn windows that each asked for 640x360 at the
+    /// placeholder origin: a picture-in-picture, the small webcam
+    /// overlay, and a plain centered float.
+    fn corner_desk(monitor: Rect, scale: f32) -> (WindowManager<FakeBackend>, [FakeWindowId; 3]) {
+        let mut backend = FakeBackend::new();
+        backend.set_monitor(monitor);
+        backend.set_monitor_scales(vec![scale]);
+        let windows = [backend.create_window(), backend.create_window(), backend.create_window()];
+        for (window, class) in windows.iter().zip(["pip", "WebcamOverlay-small", "about"]) {
+            backend.set_geometry(*window, Rect { pos: Point::new(0, 0), size: Size::new(640, 360) });
+            backend.set_client_draws_own_chrome(*window, true);
+            backend.window_classes.insert(*window, class.to_string());
+        }
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(CornerRules)));
+        (wm, windows)
+    }
+
+    fn mapped_geometry(wm: &mut WindowManager<FakeBackend>, window: FakeWindowId) -> Rect {
+        wm.dispatch(BackendEvent::MapRequest(window));
+        let id = wm.client_for_window(window).expect("the window maps");
+        let client = wm.client(id).unwrap();
+        assert!(client.placement.floating, "a rule-placed window floats");
+        client.geometry
+    }
+
+    /// The issue's own numbers: on a 1920x1080 output at scale 1 with
+    /// nothing reserved, the picture-in-picture lands 40 from the right
+    /// edge and 4% down, and the small webcam overlay lands in the
+    /// bottom-right corner at 4/25 by 9/50 of the monitor's height.
+    #[test]
+    fn rule_placed_windows_map_at_their_corners() {
+        let (mut wm, [pip, cam, _]) = corner_desk(Rect { pos: Point::new(0, 0), size: Size::new(1920, 1080) }, 1.0);
+        assert_eq!(
+            mapped_geometry(&mut wm, pip),
+            Rect { pos: Point::new(1280, 43), size: Size::new(600, 338) },
+            "x = 1920 - 600 - 40, y = round(1080 * 0.04)"
+        );
+        assert_eq!(
+            mapped_geometry(&mut wm, cam),
+            Rect { pos: Point::new(1707, 846), size: Size::new(173, 194) },
+            "round(172.8) x round(194.4) at (round(1707.2), round(845.6))"
+        );
+    }
+
+    /// The same desk at scale 2 is 3840x2160 device pixels and the same
+    /// 1920x1080 logical monitor: the rule is evaluated in logical
+    /// pixels and lands at the same logical place, scaled by the
+    /// output's own factor — not the session's `ui_scale`, which is
+    /// left at 1 here to prove which one is read.
+    #[test]
+    fn rule_placed_windows_follow_the_outputs_own_scale() {
+        let (mut wm, [pip, cam, _]) = corner_desk(Rect { pos: Point::new(0, 0), size: Size::new(3840, 2160) }, 2.0);
+        assert_eq!(
+            mapped_geometry(&mut wm, pip),
+            Rect { pos: Point::new(2560, 86), size: Size::new(1200, 676) },
+            "(1280, 43) and 600x338 logical, twice the pixels"
+        );
+        assert_eq!(
+            mapped_geometry(&mut wm, cam),
+            Rect { pos: Point::new(3414, 1692), size: Size::new(346, 388) },
+            "(1707, 846) and 173x194 logical, twice the pixels"
+        );
+    }
+
+    /// A rule position is relative to the monitor, not the primary: the
+    /// same corner on a second head starts from that head's origin.
+    #[test]
+    fn rule_positions_are_relative_to_the_monitor_the_window_maps_on() {
+        let (mut wm, [pip, _, _]) = corner_desk(Rect { pos: Point::new(2560, 0), size: Size::new(1920, 1080) }, 1.0);
+        assert_eq!(mapped_geometry(&mut wm, pip), Rect { pos: Point::new(2560 + 1280, 43), size: Size::new(600, 338) });
+    }
+
+    /// A rule can never put a frame where it cannot be reached: a bar
+    /// reserving the top of the screen pushes the picture-in-picture
+    /// down to the workarea's edge, and one at the right pulls the
+    /// webcam overlay in.
+    #[test]
+    fn rule_placed_windows_are_clamped_to_the_workarea() {
+        let (mut wm, [pip, cam, _]) = corner_desk(Rect { pos: Point::new(0, 0), size: Size::new(1920, 1080) }, 1.0);
+        wm.set_workareas(vec![Rect { pos: Point::new(0, 64), size: Size::new(1920, 1016) }]);
+        assert_eq!(
+            mapped_geometry(&mut wm, pip),
+            Rect { pos: Point::new(1280, 64), size: Size::new(600, 338) },
+            "y = 43 is under the bar, so the frame sits just below it"
+        );
+        wm.set_workareas(vec![Rect { pos: Point::new(0, 0), size: Size::new(1850, 1080) }]);
+        assert_eq!(
+            mapped_geometry(&mut wm, cam),
+            Rect { pos: Point::new(1850 - 173, 846), size: Size::new(173, 194) },
+            "the rule's x of 1707 would hang 30 pixels off the workarea"
+        );
+    }
+
+    /// A plain `float` plus `center` rule — no expression anywhere —
+    /// keeps the client's own size and centers it, exactly as before.
+    #[test]
+    fn a_plain_float_and_center_rule_still_centers() {
+        let (mut wm, [_, _, about]) = corner_desk(Rect { pos: Point::new(0, 0), size: Size::new(1920, 1080) }, 1.0);
+        assert_eq!(
+            mapped_geometry(&mut wm, about),
+            Rect { pos: Point::new((1920 - 640) / 2, (1080 - 360) / 2), size: Size::new(640, 360) }
+        );
+    }
+
+    /// With a server-side frame it is the frame, chrome included, that
+    /// sits 40 from the edge: the rule's `window_w` is the visual width.
+    #[test]
+    fn a_rule_position_places_the_frame_not_the_content() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitor(Rect { pos: Point::new(0, 0), size: Size::new(1920, 1080) });
+        let pip = backend.create_window();
+        backend.set_geometry(pip, Rect { pos: Point::new(0, 0), size: Size::new(640, 360) });
+        backend.window_classes.insert(pip, "pip".to_string());
+        let mut wm = wm(backend);
+        wm.set_float_policy(Some(std::sync::Arc::new(CornerRules)));
+        wm.dispatch(BackendEvent::MapRequest(pip));
+        let id = wm.client_for_window(pip).unwrap();
+        let layout = wm.client(id).unwrap().layout.clone();
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(600, 338));
+        let frame = frame_rect(&wm, pip);
+        let visual = Point::new(frame.pos.x + layout.input_margin as i32, frame.pos.y + layout.input_margin as i32);
+        assert_eq!(visual, Point::new(1920 - layout.visual_bounds().size.w as i32 - 40, 43), "{layout:?}");
+    }
+
+    /// The same window on a scale-2 desk is the same *window*: twice the
+    /// pixels, still centered. And an ordinary application is untouched
+    /// by any of it — the rule keys on the identity, nothing else.
+    #[test]
+    fn the_omarchy_float_follows_the_ui_scale_and_leaves_other_apps_alone() {
+        let mut backend = FakeBackend::new();
+        let omarchy = backend.create_window();
+        let other = backend.create_window();
+        backend.set_geometry(omarchy, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.set_geometry(other, Rect { pos: Point::new(0, 0), size: Size::new(400, 300) });
+        backend.window_classes.insert(omarchy, "org.omarchy.about".to_string());
+        backend.window_classes.insert(other, "Alacritty".to_string());
+        let mut wm = wm(backend);
+        wm.set_ui_scale(1.5);
+
+        wm.dispatch(BackendEvent::MapRequest(omarchy));
+        let id = wm.client_for_window(omarchy).unwrap();
+        assert_eq!(wm.client(id).unwrap().geometry.size, Size::new(1313, 900), "875x600 logical at scale 1.5");
+
+        wm.dispatch(BackendEvent::MapRequest(other));
+        let id = wm.client_for_window(other).unwrap();
+        assert_eq!(
+            wm.client(id).unwrap().geometry.size,
+            Size::new(400, 300),
+            "everything else keeps the size it asked for"
+        );
+    }
+
+    #[test]
+    fn with_no_pointer_seen_placement_follows_the_focused_windows_monitor() {
+        // A session's very first windows can map before the mouse has
+        // moved at all (autostarted apps), so placement must still
+        // resolve to the head the user is demonstrably on.
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let anchor = backend.create_window();
+        let fresh = backend.create_window();
+        backend.set_geometry(anchor, Rect { pos: Point::new(1000, 100), size: Size::new(100, 100) });
+        let mut wm = wm(backend);
+
+        wm.dispatch(BackendEvent::MapRequest(anchor));
+        wm.dispatch(BackendEvent::MapRequest(fresh));
+
+        let placed = frame_rect(&wm, fresh);
+        assert!(
+            RIGHT_HEAD.contains(placed.pos),
+            "with no pointer ever seen, a fresh window must join the focused window's head, got {placed:?}"
+        );
+    }
+
+    /// The frame geometry the backend was last told for `window`'s
+    /// client — where a placed window actually landed.
+    fn frame_rect(wm: &WindowManager<FakeBackend>, window: FakeWindowId) -> Rect {
+        let id = wm.client_for_window(window).expect("window should be managed");
+        let frame = wm.client(id).unwrap().frame.unwrap();
+        *wm.backend().last_frame_geometry.get(&frame).expect("a placed frame must have been configured")
+    }
+
+    #[test]
+    fn a_point_outside_every_monitor_resolves_to_the_nearest_one() {
+        // A vertical stack with a 100px gap between the outputs — the
+        // dead band no monitor covers, which a pointer really can sit
+        // in on a mismatched arrangement.
+        let top = Rect { pos: Point::new(0, 0), size: Size::new(800, 600) };
+        let bottom = Rect { pos: Point::new(0, 700), size: Size::new(800, 600) };
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(vec![
+            MonitorInfo { geometry: top, name: "top".to_string(), identity: None, primary: true },
+            MonitorInfo { geometry: bottom, name: "bottom".to_string(), identity: None, primary: false },
+        ]);
+        let mut wm = wm(backend);
+        let top_area = Rect { pos: Point::new(0, 0), size: Size::new(800, 560) };
+        let bottom_area = Rect { pos: Point::new(0, 700), size: Size::new(800, 560) };
+        wm.set_workareas(vec![top_area, bottom_area]);
+
+        assert_eq!(wm.usable_area_at(Point::new(400, 640)), top_area, "in the gap, nearer the top output");
+        assert_eq!(wm.usable_area_at(Point::new(400, 680)), bottom_area, "in the gap, nearer the bottom one");
+        assert_eq!(wm.monitor_rect_at(Point::new(400, 680)), bottom, "the raw rect resolves the same way");
+        assert_eq!(
+            wm.usable_area_at(Point::new(-5000, -5000)),
+            top_area,
+            "a point nowhere near any output still has to resolve to one"
+        );
+        assert_eq!(wm.usable_area_at(Point::new(i32::MIN, i32::MIN)), top_area);
+        assert_eq!(wm.usable_area_at(Point::new(i32::MAX, i32::MAX)), bottom_area);
+    }
+
+    #[test]
+    fn set_workarea_reserves_space_on_the_primary_monitor_only() {
+        // The primary is deliberately the *second* entry: an index-0
+        // assumption would reserve the dock strip on the wrong head.
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(vec![
+            MonitorInfo { geometry: LEFT_HEAD, name: "aux".to_string(), identity: None, primary: false },
+            MonitorInfo { geometry: RIGHT_HEAD, name: "main".to_string(), identity: None, primary: true },
+        ]);
+        let mut wm = wm(backend);
+        let reserved = Rect { pos: Point::new(800, 0), size: Size::new(800, 560) };
+
+        wm.set_workarea(reserved);
+
+        assert_eq!(wm.usable_area_at(Point::new(1200, 300)), reserved, "the primary keeps the strip it was given");
+        assert_eq!(wm.usable_area_at(Point::new(400, 300)), LEFT_HEAD, "every other head keeps its full geometry");
+    }
+
+    #[test]
+    fn net_workarea_publishes_the_union_of_the_per_monitor_workareas() {
+        let mut backend = FakeBackend::new();
+        backend.set_monitors(dual_monitors());
+        let mut wm = wm(backend);
+
+        wm.set_workareas(vec![Rect { pos: Point::new(0, 40), size: Size::new(800, 560) }]);
+
+        // The property carries no per-monitor dimension at all, so the
+        // bounding box of the reserved primary and the untouched second
+        // head is the only honest thing to hand a pager.
+        assert_eq!(
+            wm.backend().published_workareas.last(),
+            Some(&(Rect { pos: Point::new(0, 0), size: Size::new(1600, 600) }, 1)),
+            "_NET_WORKAREA must span every monitor's workarea"
+        );
+    }
+    mod spatial;
+    mod spaces;
+    mod monitors;
+    mod special;
+    mod restyle;
+    mod system7;
+    mod beos;
+    mod os2warp;
+    fn mac_windows() -> (WindowManager<FakeBackend>, [ClientId; 3]) {
+        let mut backend = FakeBackend::new();
+        let windows = [backend.create_window(), backend.create_window(), backend.create_window()];
+        for (window, app) in windows.into_iter().zip(["editor", "browser", "editor"]) {
+            backend.window_classes.insert(window, app.into());
+        }
+        let mut wm = wm(backend);
+        wm.set_interaction_config(crate::InteractionConfig { mode: crate::InteractionMode::Mac, ..Default::default() });
+        for window in windows { wm.dispatch(BackendEvent::MapRequest(window)); }
+        let ids = windows.map(|window| wm.client_for_window(window).unwrap());
+        (wm, ids)
+    }
+
+    #[test]
+    fn mac_switcher_groups_apps_and_restores_hidden_windows_on_command_release() {
+        let (mut wm, [first, browser, last]) = mac_windows();
+        wm.hide_application(false);
+        assert!(wm.mac_client_hidden(first) && wm.mac_client_hidden(last));
+        assert_eq!(wm.focused_client(), Some(browser));
+        wm.cycle_applications(1);
+        assert_eq!(wm.cycle_state().unwrap().0.len(), 2);
+        // Releasing one Command while the other remains held cannot commit.
+        wm.dispatch(BackendEvent::KeyRelease(KeyCombo { keysym: 0xffeb, modifiers: Modifiers::SUPER }));
+        assert!(wm.cycle_state().is_some());
+        wm.dispatch(BackendEvent::KeyRelease(KeyCombo { keysym: 0xffec, modifiers: Modifiers::empty() }));
+        assert!(wm.cycle_state().is_none());
+        assert!(!wm.mac_client_hidden(first) && !wm.mac_client_hidden(last));
+        assert_eq!(wm.focused_client(), Some(last));
+        wm.cycle_application_windows(1);
+        assert_eq!(wm.focused_client(), Some(first));
+    }
+
+    /// Command-Tab's H (the desk's switcher): the selected application is hidden whether or not
+    /// it has the focus; the focused one keeps it when another is hidden.
+    #[test]
+    fn hiding_an_application_that_is_not_focused_keeps_the_focus() {
+        let (mut wm, [first, browser, last]) = mac_windows();
+        assert_eq!(wm.focused_client(), Some(last));
+        wm.hide_application_of(browser);
+        assert!(wm.mac_client_hidden(browser) && !wm.mac_client_hidden(first));
+        assert_eq!(wm.focused_client(), Some(last));
+        wm.hide_application_of(first);
+        assert!(wm.mac_client_hidden(first) && wm.mac_client_hidden(last));
+        assert_ne!(wm.focused_client(), Some(last), "the focus left the hidden application");
+    }
+
+    #[test]
+    fn mac_show_desktop_hide_others_and_minimize_are_distinct() {
+        let (mut wm, [first, browser, last]) = mac_windows();
+        wm.miniaturize(first);
+        wm.hide_application(true);
+        assert_eq!(wm.focused_client(), Some(last));
+        assert!(wm.mac_client_hidden(browser));
+        wm.toggle_show_desktop();
+        assert!(!wm.is_focusable(last));
+        wm.toggle_show_desktop();
+        assert_eq!(wm.focused_client(), Some(last));
+        assert!(wm.mac_client_hidden(browser));
+        assert_eq!(wm.client(first).unwrap().lifecycle, Lifecycle::Miniaturized);
+        wm.set_interaction_config(crate::InteractionConfig::default());
+        assert!(wm.is_focusable(browser));
+        assert_eq!(wm.client(first).unwrap().lifecycle, Lifecycle::Miniaturized);
+    }
+
+    #[test]
+    fn mac_fullscreen_space_round_trips_and_compacts_when_window_closes() {
+        let (mut wm, [first, _, last]) = mac_windows();
+        let geometry = wm.client(last).unwrap().geometry;
+        wm.fullscreen(last);
+        assert_eq!((wm.workspace_count(),wm.current_workspace()), (2,1));
+        assert_eq!(wm.client(first).unwrap().workspace,0);
+        assert!(!wm.remove_workspace(1), "a live fullscreen Space is exited through its window");
+        wm.unfullscreen(last);
+        assert_eq!((wm.workspace_count(),wm.current_workspace()), (1,0));
+        assert_eq!(wm.client(last).unwrap().geometry,geometry);
+        wm.fullscreen(last);
+        let window=wm.client(last).unwrap().window;
+        wm.dispatch(BackendEvent::Destroyed(window));
+        assert_eq!((wm.workspace_count(),wm.current_workspace()), (1,0));
+        assert!(wm.mac_fullscreen.is_empty());
+    }
+
+    /// A window merely told it is fullscreen has not taken the screen,
+    /// so it gets no Space of its own; only compositor fullscreen does.
+    #[test]
+    fn mac_client_only_fullscreen_opens_no_space() {
+        let (mut wm, [_, _, last]) = mac_windows();
+        let geometry = wm.client(last).unwrap().geometry;
+        wm.set_fullscreen_state(last, FullscreenMode::None, FullscreenMode::Fullscreen);
+        assert!(wm.client(last).unwrap().flags.contains(ClientFlags::CLIENT_FULLSCREEN));
+        assert_eq!((wm.workspace_count(), wm.current_workspace()), (1, 0));
+        assert!(wm.mac_fullscreen.is_empty());
+        assert_eq!(wm.client(last).unwrap().geometry, geometry);
+        wm.set_fullscreen_state(last, FullscreenMode::Fullscreen, FullscreenMode::Fullscreen);
+        assert_eq!((wm.workspace_count(), wm.current_workspace()), (2, 1));
+        wm.set_fullscreen_state(last, FullscreenMode::None, FullscreenMode::None);
+        assert_eq!((wm.workspace_count(), wm.current_workspace()), (1, 0));
+        assert!(wm.mac_fullscreen.is_empty());
+    }
+
+}

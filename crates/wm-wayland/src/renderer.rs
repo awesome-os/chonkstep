@@ -1,0 +1,2271 @@
+//! Scene composition: turns the [`WaylandBackend`] ledger into GLES
+//! render elements and puts a frame on screen.
+//!
+//! The composition order is fixed, bottom to top: the root background
+//! (solid color or wallpaper image), then the ledger's two ordered
+//! sequences: `above: false` shell surfaces, the managed `stacking`,
+//! and `above: true` shells. Each frame draws
+//! its decoration buffer at its geometry with its client's surface
+//! tree (and that client's xdg popups) on top at the window's content
+//! rect, then XWayland override-redirect windows, then the pointer
+//! cursor. That is exactly the stacking the X11 session produces with
+//! real windows, reproduced here as a plain ordered walk.
+//!
+//! A managed window whose client draws its own chrome interleaves with
+//! the frames, in the same band and by the same `stacking` order — it
+//! is only the decoration buffer it lacks, not a place in the scene.
+//!
+//! Redraws are incrementally damaged on both backends: the winit path
+//! renders at the EGL surface's real buffer age and the session path
+//! trusts the `DrmCompositor`'s per-element tracking, so an idle
+//! desktop's only per-frame work is whatever actually changed (a
+//! blinking cursor's rectangle, a dock LED). This used to be a
+//! deliberate full-frame repaint (`age = 0`, the picom
+//! `--no-use-damage` trade); the evidence that retired it is in
+//! `session.rs` at the `full_damage_forced` site, and that same
+//! environment variable (`CHONKSTEP_FULL_DAMAGE=1`) restores the old
+//! behaviour on every path without a compiler. What incremental damage
+//! demands of THIS file is stable element identity: every element's id
+//! must survive across frames (the buffers' own ids do; solid fills
+//! carry `ShellRecord::fill_id`), because the tracker reads a fresh id
+//! as "old element gone, new element appeared" and re-damages both.
+//! `CHONKSTEP_DAMAGE_LOG=1` prints each drawn frame's damage.
+//!
+//! # One scene, one output at a time
+//!
+//! Every rect in the ledger is in *global* space — the coordinate
+//! system spanning all monitors, which is the only space `wm-core` and
+//! `chonk-shell` know about. A framebuffer, by contrast, always starts
+//! at its own (0, 0): both `OutputDamageTracker::render_output` and
+//! `DrmCompositor::render_frame` intersect elements against a rectangle
+//! anchored at the origin and sized to that output's mode, so an
+//! element placed at a global coordinate would be clipped away on every
+//! output but the first.
+//!
+//! [`build_scene`] therefore takes the output's global viewport,
+//! subtracts its origin from every element it produces, and omits
+//! objects whose pixels cannot reach its extent. Ledger rectangles
+//! answer the common case in constant time; a surface tree outside one
+//! falls back to its exact subsurface bounds so a shadow or popup can
+//! still cross a monitor edge. A two-output desktop no longer imports
+//! and instantiates every element twice merely to have each damage
+//! tracker clip half of them away.
+//!
+//! # Physical pixels everywhere, whatever the outputs advertise
+//!
+//! The `wl_output`s advertise the session's UI scale so native clients
+//! render sharp (see `state.rs`'s `advertised_output_scale`), but the
+//! composition here never hears about it: every damage tracker and
+//! `DrmCompositor` in this crate is pinned to scale 1, so the scale an
+//! element's `Element::geometry(scale)` is asked at is always 1.0 and
+//! "logical" equals the device pixels this whole compositor works in.
+//! That pin is what lets the chrome — memory buffers the theme already
+//! rasterized in device pixels, placed at device-pixel positions — land
+//! 1 buffer pixel : 1 screen pixel with no conversion at all.
+//!
+//! Client surfaces are the one place a second coordinate space leaks
+//! in: smithay sizes a `WaylandSurfaceRenderElement` at the surface's
+//! *logical* extent (buffer pixels divided by the scale the client
+//! committed, or the viewport destination when one is set), times the
+//! output scale it is rendered at. Under a scale-1 tracker a 2x
+//! client's element would come out at half its buffer, so
+//! [`push_surface_tree`] wraps every client element in a
+//! [`RescaleRenderElement`] that multiplies it back up by that
+//! surface's factor — fractional since fractional-scale-v1
+//! (`xdg::committed_surface_scale` corrected by
+//! `xdg::effective_surface_scale`), restoring 1 buffer pixel :
+//! 1 screen pixel for a client that committed at the output's factor,
+//! and a GPU down/upscale for one that committed at some other — which
+//! is the size the ledger recorded for it
+//! (`xdg::committed_content_size`) and the frame was drawn around.
+
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::utils::{CropRenderElement, RescaleRenderElement};
+use smithay::backend::renderer::element::{Kind, RenderElementStates};
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
+use smithay::backend::renderer::Color32F;
+use smithay::desktop::utils::{
+    bbox_from_surface_tree, send_frames_surface_tree, take_presentation_feedback_surface_tree,
+    surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
+    OutputPresentationFeedback,
+};
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource;
+use smithay::render_elements;
+use smithay::utils::{IsAlive, Logical, Physical, Point as SPoint, Rectangle as SRect, Scale};
+use smithay::wayland::compositor::{self, with_states, TraversalAction};
+use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use wm_theme_api::{Point, Rect};
+
+use crate::state::{Compositor, Graphics, RootBackground, StackEntry, WaylandBackend, WindowRecord};
+
+render_elements! {
+    /// Everything one frame is composed of. The macro generates the
+    /// `Element`/`RenderElement` plumbing for the enum so a single
+    /// `Vec` can carry client surfaces, decoration/wallpaper/cursor
+    /// buffers, and solid fills through one `render_output` call.
+    pub SceneElement<=GlesRenderer>;
+    Surface = RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Memory = MemoryRenderBufferRenderElement<GlesRenderer>,
+    BinaryMemory = crate::binary_alpha::BinaryAlpha<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    ScaledMemory = RescaleRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    Solid = SolidColorRenderElement,
+    Shadow = crate::frame_effects::ShadowElement,
+    RoundedSurface = crate::rounded::Rounded<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+    RoundedSolid = crate::rounded::Rounded<SolidColorRenderElement>,
+    CaptureDimming = crate::capture_tool::dimming::DimmingElement,
+    CroppedSurface = CropRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+    CroppedMemory = CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    CroppedBinaryMemory = CropRenderElement<crate::binary_alpha::BinaryAlpha<MemoryRenderBufferRenderElement<GlesRenderer>>>,
+    CroppedScaledMemory = CropRenderElement<RescaleRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>>,
+    CroppedSolid = CropRenderElement<SolidColorRenderElement>,
+    CroppedShadow = CropRenderElement<crate::frame_effects::ShadowElement>,
+    CroppedRoundedSurface = CropRenderElement<crate::rounded::Rounded<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>,
+    CroppedRoundedSolid = CropRenderElement<crate::rounded::Rounded<SolidColorRenderElement>>,
+    DisplaySurface = CropRenderElement<CropRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>,
+    DisplayMemory = CropRenderElement<CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>>,
+    DisplayBinaryMemory = CropRenderElement<CropRenderElement<crate::binary_alpha::BinaryAlpha<MemoryRenderBufferRenderElement<GlesRenderer>>>>,
+    DisplayScaledMemory = CropRenderElement<CropRenderElement<RescaleRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>>>,
+    DisplaySolid = CropRenderElement<CropRenderElement<SolidColorRenderElement>>,
+    DisplayShadow = CropRenderElement<CropRenderElement<crate::frame_effects::ShadowElement>>,
+    DisplayRoundedSurface = CropRenderElement<CropRenderElement<crate::rounded::Rounded<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>>,
+    DisplayRoundedSolid = CropRenderElement<CropRenderElement<crate::rounded::Rounded<SolidColorRenderElement>>>,
+}
+
+/// Clip a just-appended plane in place. Stable IDs and retained vector capacity
+/// survive the transform; no intermediate scene vector or texture is created.
+pub(crate) fn clip_plane(elements: &mut Vec<SceneElement>, start: usize,
+    rect: Rect, id: &smithay::backend::renderer::element::Id) {
+    let crop = SRect::new((rect.pos.x, rect.pos.y).into(), (rect.size.w as i32, rect.size.h as i32).into());
+    let empty = SolidColorRenderElement::new(id.clone(), SRect::from_size((0, 0).into()),
+        CommitCounter::default(), Color32F::TRANSPARENT, Kind::Unspecified);
+    use smithay::backend::renderer::element::Element;
+    let mut write = start;
+    for index in start..elements.len() {
+        let old = std::mem::replace(&mut elements[index], empty.clone().into());
+        // Fully contained surfaces keep their original render element and
+        // scanout eligibility. Only edge crossings need a crop wrapper.
+        let clipped = if crop.contains_rect(old.geometry(1.0.into())) { Some(old) } else {
+        match old {
+            SceneElement::Surface(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::Memory(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::BinaryMemory(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::ScaledMemory(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::Solid(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::RoundedSurface(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::RoundedSolid(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedRoundedSurface(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedRoundedSolid(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::Shadow(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedSurface(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedMemory(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedBinaryMemory(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedScaledMemory(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedSolid(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            SceneElement::CroppedShadow(e) => CropRenderElement::from_element(e, 1.0, crop).map(Into::into),
+            other => Some(other),
+        }
+        };
+        if let Some(clipped) = clipped { elements[write] = clipped; write += 1; }
+    }
+    elements.truncate(write);
+}
+
+/// Renders one full frame from the current ledger, submits it, sends
+/// frame callbacks so clients keep animating, and clears the damage
+/// flag. Failures log and leave the damage flag set — the next wakeup
+/// simply tries again, which is the only sane recovery for a transient
+/// GL hiccup.
+/// The scene, front to back (the damage tracker's convention: earlier
+/// elements occlude later ones) — and the single definition of what a
+/// chonkstep Wayland session looks like. Both backends submit exactly
+/// these elements: the nested winit one and the DRM/KMS session render
+/// the same desktop because they share this function, not because two
+/// implementations were kept in agreement. Returns the elements plus
+/// the clear color the root background asks for.
+///
+/// `viewport` is the output or capture region in global space. Its
+/// origin is subtracted from every element so the result is in that
+/// target's framebuffer coordinates; its extent lets scene assembly
+/// omit objects wholly owned by another output (see the module docs).
+/// Called once per output per frame.
+///
+/// `purpose` says who the scene is for. Every caller states it, so a
+/// window under a `no_screen_share` rule can neither be redacted on
+/// the user's own screen by accident nor reach a capture by omission.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_scene(
+    backend: &WaylandBackend,
+    renderer: &mut GlesRenderer,
+    pointer_location: SPoint<f64, smithay::utils::Logical>,
+    cursor_status: &CursorImageStatus,
+    tablet_cursors: &[crate::input::TabletCursor],
+    cursors: &crate::state::CursorSet,
+    viewport: Rect,
+    purpose: ScenePurpose,
+) -> (Vec<SceneElement>, Color32F) {
+    let mut elements = Vec::new();
+    let clear_color = build_scene_into(
+        &mut elements,
+        backend,
+        renderer,
+        pointer_location,
+        cursor_status,
+        tablet_cursors,
+        cursors,
+        viewport,
+        purpose,
+    );
+    (elements, clear_color)
+}
+
+/// Who a scene is assembled for.
+///
+/// The one difference between the two is a window under a
+/// `no_screen_share` rule (`WindowRecord::capture_redacted`): the
+/// output shows it, a capture shows an opaque rectangle in its place.
+/// Everything else - stacking, hit-test order, the lock scene - is
+/// identical, which is what lets one scene builder serve both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScenePurpose {
+    /// The output's own frame: everything as the user sees it.
+    Display,
+    /// A screen share, recording or screenshot rendered offscreen:
+    /// screencopy, ext-image-copy-capture, the built-in capture tool.
+    Capture,
+}
+
+impl ScenePurpose {
+    /// Whether a scene for this purpose draws `record` as a redaction
+    /// rectangle instead of its content.
+    pub(crate) fn redacts(self, record: &WindowRecord) -> bool {
+        self == ScenePurpose::Capture && record.capture_redacted
+    }
+}
+
+/// What a capture shows where a redacted window is: an opaque
+/// mid-grey, visibly a placeholder rather than a hole in the picture
+/// or a black window nobody can tell from a crashed one. Its channels
+/// are 51 exactly at 8 bits, so a test can name the colour.
+pub(crate) const CAPTURE_REDACTION_COLOR: Color32F = Color32F::new(0.2, 0.2, 0.2, 1.0);
+
+/// Pushes the single element a capture shows for a redacted window:
+/// one opaque quad over `bounds`, in target coordinates. Its id is the
+/// record's, minted once, and its commit never advances, so a
+/// `copy_with_damage` stream's retained damage tracker sees the same
+/// unchanged element every frame however often the client behind it
+/// commits.
+pub(crate) fn push_capture_redaction(
+    elements: &mut Vec<SceneElement>,
+    record: &WindowRecord,
+    bounds: SRect<i32, Physical>,
+) {
+    if bounds.size.w <= 0 || bounds.size.h <= 0 {
+        return;
+    }
+    elements.push(
+        SolidColorRenderElement::new(
+            record.capture_redaction_id.clone(),
+            bounds,
+            CommitCounter::default(),
+            CAPTURE_REDACTION_COLOR,
+            Kind::Unspecified,
+        )
+        .into(),
+    );
+}
+
+/// The rectangle `record`'s popups would be drawn in, or `None` when it
+/// has none. `origin` is where the window's own surface tree is
+/// anchored, in target coordinates; each popup's surface-local offset
+/// converts by `offset_scale` and its tree by its own committed scale
+/// times `stretch` - the arithmetic `push_window_content` and the
+/// Overview's scaled presentation position popups with, so a
+/// redaction covers exactly what they would have drawn. Widened by a
+/// pixel on every side so rounding can never leave a sliver of a menu
+/// showing at its edge.
+pub(crate) fn popup_extent(
+    backend: &WaylandBackend,
+    record: &WindowRecord,
+    surface: &WlSurface,
+    origin: SPoint<i32, Physical>,
+    offset_scale: Scale<f64>,
+    stretch: Scale<f64>,
+) -> Option<SRect<i32, Physical>> {
+    let mut extent: Option<SRect<i32, Physical>> = None;
+    for (popup, offset) in backend.popups_for_surface(surface) {
+        let popup_surface = popup.wl_surface();
+        let popup_factor = crate::xdg::effective_surface_scale(
+            crate::xdg::committed_surface_scale(popup_surface),
+            backend.window_output_scale(record),
+        );
+        let at = (
+            origin.x.saturating_add((f64::from(offset.x) * offset_scale.x).round() as i32),
+            origin.y.saturating_add((f64::from(offset.y) * offset_scale.y).round() as i32),
+        );
+        let logical = bbox_from_surface_tree(popup_surface, (0, 0));
+        let (sx, sy) = (popup_factor * stretch.x, popup_factor * stretch.y);
+        let rect = SRect::<i32, Physical>::new(
+            (
+                at.0.saturating_add(crate::xdg::scale_length(logical.loc.x, sx)).saturating_sub(1),
+                at.1.saturating_add(crate::xdg::scale_length(logical.loc.y, sy)).saturating_sub(1),
+            )
+                .into(),
+            (
+                crate::xdg::scale_length(logical.size.w, sx).max(0).saturating_add(2),
+                crate::xdg::scale_length(logical.size.h, sy).max(0).saturating_add(2),
+            )
+                .into(),
+        );
+        extent = Some(extent.map_or(rect, |extent| extent.merge(rect)));
+    }
+    extent
+}
+
+/// The stacking walk's substitute for a redacted window, framed or
+/// not: the redaction quad over `bounds` (the frame's visual rectangle
+/// or the bare content rect, viewport-relative) grown to take in the
+/// window's popups, pushed at the same place in the element list the
+/// content, chrome and popups would have occupied. Nothing of the
+/// window is imported: the rectangle is not drawn *over* it.
+fn push_window_redaction(
+    elements: &mut Vec<SceneElement>,
+    backend: &WaylandBackend,
+    record: &WindowRecord,
+    bounds: Rect,
+    viewport: Rect,
+) {
+    let mut area = SRect::<i32, Physical>::new(
+        (bounds.pos.x, bounds.pos.y).into(),
+        (bounds.size.w.min(i32::MAX as u32) as i32, bounds.size.h.min(i32::MAX as u32) as i32).into(),
+    );
+    if let Some(surface) = record.surface.wl_surface() {
+        let origin = SPoint::<i32, Physical>::from((
+            record.content.pos.x.saturating_sub(record.content_offset.x) - viewport.pos.x,
+            record.content.pos.y.saturating_sub(record.content_offset.y) - viewport.pos.y,
+        ));
+        let factor = backend.window_surface_scale(record);
+        if let Some(popups) = popup_extent(backend, record, &surface, origin, Scale::from(factor), Scale::from(1.0)) {
+            area = area.merge(popups);
+        }
+    }
+    push_capture_redaction(elements, record, area);
+}
+
+/// Rebuilds a scene in caller-owned storage, retaining the vector's
+/// allocation across frames. On-screen rendering uses one instance per
+/// output; one-shot offscreen consumers use [`build_scene`] instead.
+///
+/// `tablet_cursors` are the tablet tools in proximity. A capture that
+/// asks for no cursor passes none, alongside the `Hidden` pointer status
+/// it substitutes: a tool's image is a cursor like the pointer's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_scene_into(
+    elements: &mut Vec<SceneElement>,
+    backend: &WaylandBackend,
+    renderer: &mut GlesRenderer,
+    pointer_location: SPoint<f64, smithay::utils::Logical>,
+    cursor_status: &CursorImageStatus,
+    tablet_cursors: &[crate::input::TabletCursor],
+    cursors: &crate::state::CursorSet,
+    viewport: Rect,
+    purpose: ScenePurpose,
+) -> Color32F {
+    // Elements are assembled FRONT to BACK — the damage tracker's
+    // convention (first element occludes later ones) — so this walk is
+    // the module-doc composition order reversed: cursor, above-shells,
+    // override-redirect windows, frames, below-shells, wallpaper.
+    elements.clear();
+
+    push_cursor_elements(elements, renderer, backend, pointer_location, cursor_status, cursors, viewport);
+    // The pointer does not follow a pen, so each tool in proximity draws
+    // its own image at its own position, chosen exactly as the pointer's
+    // is: over a frame, the desktop or a blanked lock screen the
+    // compositor's sprites, over client content the client's request.
+    for tool in tablet_cursors {
+        push_cursor_elements(elements, renderer, backend, tool.position, &tool.status, cursors, viewport);
+    }
+    // Directly beneath the cursors and above everything else: what the
+    // pointer is carrying sits under its tip.
+    push_dnd_icon(elements, renderer, backend, pointer_location, viewport, purpose);
+
+    // Input-method candidate windows belong above every application
+    // surface (including overlay layers) and below only the pointer.
+    // They live in the same ledger the hit-test reads, so the visible
+    // popup and the clickable popup can never drift apart.
+    push_ime_popups(elements, renderer, backend, viewport);
+
+    // A locked session is a different scene, not a filtered one: only
+    // the lock client's surfaces exist, over a black clear. The branch
+    // sits here — after the cursor, before anything of the desktop —
+    // so no code path below can leak a frame of the scene behind the
+    // lock, and every consumer of this function (the on-screen frame,
+    // screencopy, the screenshot marker) inherits the same blank. An
+    // output the locker has not covered (its surface not committed
+    // yet, its process dead, a monitor that just appeared) simply
+    // finds no element inside its viewport and clears to black, which
+    // is what the protocol demands for the gap.
+    if backend.locked {
+        for entry in &backend.lock_surfaces {
+            if !entry.surface.alive() {
+                continue;
+            }
+            let Some(monitor) = entry.output.and_then(|index| backend.monitors.get(index)) else {
+                continue;
+            };
+            if overlap_area(monitor.geometry, viewport) == 0 {
+                continue;
+            }
+            let origin = SPoint::<i32, Physical>::from((
+                monitor.geometry.pos.x - viewport.pos.x,
+                monitor.geometry.pos.y - viewport.pos.y,
+            ));
+            // Lock configures use the output's logical size. Buffer density
+            // affects sampling, never the extent of this dedicated surface.
+            let factor = backend.scale_at(monitor.geometry);
+            push_surface_tree(
+                elements,
+                renderer,
+                entry.surface.wl_surface(),
+                origin,
+                factor,
+                1.0,
+                Kind::Unspecified,
+            );
+        }
+        return Color32F::new(0.0, 0.0, 0.0, 1.0);
+    }
+
+    // The `Overlay` layer band beats everything but the cursor —
+    // that is what the protocol reserves it for (OSDs, screen
+    // annotations) — including the desktop's own dock and menus.
+    push_layer_band(elements, renderer, backend, WlrLayer::Overlay, viewport);
+
+    if let Some(transition) = backend.gesture_scene.as_ref().filter(|t| t.horizontal() && t.output.is_none_or(|output| output == viewport)) {
+        return crate::gesture_scene::render(elements, renderer, backend, transition, viewport, purpose);
+    }
+
+    if let Some(overview) = backend
+        .overview
+        .as_ref()
+        .filter(|o| o.presented(backend, viewport) && o.covers(viewport))
+    {
+        // Menus opened from Overview stay above it. Its full-output shell is
+        // an input target only; all visual content is retained scene elements.
+        for id in backend.shell_stacking.iter().rev() {
+            if *id == overview.surface {
+                break;
+            }
+            if let Some(record) = backend.shells.get(id).filter(|s| s.above && s.mapped) {
+                push_shell_elements(elements, renderer, record, viewport);
+            }
+        }
+        let furniture_alpha = if overview.has_workspace_cards() { 1.0 } else { (1.0 - overview.progress.clamp(0.0, 1.0)) as f32 };
+        push_furniture(elements, renderer, backend, viewport, furniture_alpha, true);
+        crate::overview::render(elements, renderer, backend, overview, viewport, purpose);
+        push_furniture(elements, renderer, backend, viewport, furniture_alpha, false);
+        return push_background(elements, renderer, backend, viewport);
+    }
+
+    // A fullscreen application owns its output's desktop plane. Keep
+    // protocol Overlay (OSDs and lock-adjacent surfaces) above it, but
+    // suppress ordinary desktop furniture: the shell's dock/menus and
+    // layer-shell Top bars. This answer is computed once for this
+    // output and shared with the input walk below through the same
+    // predicate, so invisible furniture can never keep a click target.
+    let desktop_bands_occluded = fullscreen_occludes_desktop_bands(backend, viewport);
+    if !desktop_bands_occluded {
+        for id in backend.shell_stacking.iter().rev() {
+            let Some(record) = backend.shells.get(id) else {
+                continue;
+            };
+            if record.above && record.mapped {
+                if let Some(overview) = backend.overview.as_ref().filter(|o| o.surface == *id) {
+                    crate::overview::render(elements, renderer, backend, overview, viewport, purpose);
+                    crate::overview::render_backdrop(elements, renderer, backend, overview, viewport);
+                    continue;
+                }
+                push_shell_elements(elements, renderer, record, viewport);
+            }
+        }
+
+        // `Top` layer surfaces (bars, notification daemons) sit below
+        // the shell's `above` band on purpose: a mako notification
+        // must not cover the menu the user just opened or the dock's
+        // tiles, while still floating over ordinary managed windows.
+        // The input walk in `input.rs::hit_at` slots the band
+        // identically.
+        push_layer_band(elements, renderer, backend, WlrLayer::Top, viewport);
+    }
+
+    crate::layout_scene::render_feedback(elements, renderer, backend, viewport, purpose);
+
+    // XWayland override-redirect windows (menus, tooltips —
+    // `WindowType::Unmanaged`, so they own no frame and no
+    // stacking entry) draw above every managed frame, which is
+    // where the X server would put a just-mapped override-redirect
+    // window in practice.
+    for window in backend.scene_index.unmanaged() {
+        if let Some(record) = backend.windows.get(&window).filter(|record| record.mapped) {
+            let start = elements.len();
+            if purpose.redacts(record) {
+                push_window_redaction(elements, backend, record, viewport_relative(record.content, viewport), viewport);
+            } else {
+                push_window_content(elements, renderer, backend, record.content, record, viewport, None, 1.0);
+            }
+            if let Some(name) = backend.space_output_for(record) {
+                if let Some(monitor) = backend.monitors.iter().find(|m| m.name == name) {
+                    let mut rect = monitor.geometry;
+                    rect.pos.x -= viewport.pos.x;
+                    rect.pos.y -= viewport.pos.y;
+                    clip_plane(elements, start, rect, &record.space_clip_id);
+                } else { elements.truncate(start); }
+            }
+        }
+    }
+
+    for entry in backend.stacking.iter().rev() {
+        let start = elements.len();
+        (|| {
+        if crate::layout_scene::render_window(elements, renderer, backend, entry, viewport, purpose) {
+            return;
+        }
+        // A managed window whose client drew its own chrome has no
+        // frame and no decoration buffer — just its content, at the
+        // depth its own stacking slot gives it. Nothing else in this
+        // walk would draw it: the override-redirect pass above keys on
+        // `WindowType::Unmanaged`, which such a window is not, and the
+        // frame band below reaches clients only through their frames.
+        // Skipping it here is what would make Edge and LibreOffice
+        // invisible the moment they stop being framed.
+        if let StackEntry::Window(id) = entry {
+            let Some(record) = backend.windows.get(id) else {
+                return;
+            };
+            if record.mapped && backend.scene_index.is_presented(*id) {
+                // A capture's redaction stands in for the content, the
+                // dim and the popups alike, at this same stacking slot.
+                if purpose.redacts(record) {
+                    push_window_redaction(elements, backend, record, viewport_relative(record.content, viewport), viewport);
+                    return;
+                }
+                push_dim(elements, renderer, backend.window_dim(*id, record), &record.dim_id,
+                    viewport_relative(record.content, viewport), Rect::new(Point::new(0, 0), viewport.size), None);
+                let alpha = backend.window_alpha(*id, record);
+                push_window_content(elements, renderer, backend, record.content, record, viewport, None, alpha);
+            }
+        }
+        if let StackEntry::Frame(id) = entry {
+            let Some(frame) = backend.frames.get(id) else {
+                return;
+            };
+            if !frame.mapped {
+                return;
+            }
+            let window = backend.windows.get(&frame.window);
+            // A redacted window's frame goes with it: the titlebar
+            // names the vault, and a rectangle with a decorated edge
+            // is no less a giveaway than the content was. One quad
+            // over the frame's visual rectangle (and the popups)
+            // replaces content, dim, chrome, border, shadow and fill,
+            // in the slot they would have taken.
+            if let Some(record) = window.filter(|record| purpose.redacts(record)) {
+                push_window_redaction(elements, backend, record, viewport_relative(frame.visual_geometry(), viewport), viewport);
+                return;
+            }
+            let shape = crate::rounded::translated_shape(frame.effects.as_ref().and_then(|e|e.shape),
+                frame.geometry.pos, viewport.pos, Point::new(0,0), 1.0, 1.0);
+            // The window's body alpha and dim, both read from the same
+            // ledger the hit-test reads: neither changes where a click
+            // lands. The dim goes first so it lands in front of the
+            // content and the chrome alike, masked to the frame's own
+            // rounded silhouette.
+            let alpha = window.map_or(1.0, |record| backend.window_alpha(frame.window, record));
+            if let Some(record) = window.filter(|record| record.mapped) {
+                push_dim(elements, renderer, backend.window_dim(frame.window, record), &record.dim_id,
+                    viewport_relative(frame.visual_geometry(), viewport), Rect::new(Point::new(0, 0), viewport.size), shape);
+            }
+            // Content above chrome: the client's tree first
+            // (front-to-back), then the decoration buffer. A
+            // shaded window keeps its frame mapped with the
+            // content unmapped (`set_client_mapped(false)`), which
+            // falls out naturally here.
+            let content_draw = window.filter(|record| record.mapped).map(|record| {
+                push_window_content(elements, renderer, backend, record.content, record, viewport, Some(frame), alpha)
+            }).unwrap_or_default();
+            let opaque_client = content_draw.opaque_client;
+            if overlap_area(frame.geometry, viewport) == 0 {
+                crate::frame_effects::push_shadow(elements, renderer, frame.effects.as_ref(), frame.geometry.pos,
+                    viewport.pos, Point::new(0,0), 1.0, 1.0, alpha);
+                return;
+            }
+            for part in &frame.parts {
+                let location = SPoint::<f64, Physical>::from((
+                    (frame.geometry.pos.x + part.offset.x - viewport.pos.x) as f64,
+                    (frame.geometry.pos.y + part.offset.y - viewport.pos.y) as f64,
+                ));
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    location,
+                    &part.buffer,
+                    (alpha < 1.0).then_some(alpha),
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ) {
+                    Ok(element) => elements.push(if part.binary_alpha {
+                        crate::binary_alpha::BinaryAlpha(element).into()
+                    } else { element.into() }),
+                    Err(error) => tracing::warn!(?error, "failed to import a decoration buffer"),
+                }
+            }
+            let solid_start = elements.len();
+            for solid in &frame.solids {
+                let mut rect = solid.solid.rect;
+                rect.pos.x += frame.geometry.pos.x - viewport.pos.x;
+                rect.pos.y += frame.geometry.pos.y - viewport.pos.y;
+                elements.push(solid.element(rect, alpha).into());
+            }
+            crate::rounded::mask_frame_solids(elements, solid_start, renderer, shape, content_draw.lower_border_drawn);
+            crate::frame_effects::push_shadow(elements, renderer, frame.effects.as_ref(), frame.geometry.pos,
+                viewport.pos, Point::new(0,0), 1.0, 1.0, alpha);
+            // Preserve the opaque mid-resize/unshade gap that the former
+            // window-sized pixel buffer supplied, but as four floats plus a
+            // stable id instead of frame-width * frame-height * 4 retained
+            // bytes. It is behind both the client content and sparse chrome.
+            // Fill only the client's requested interior. Filling the outer
+            // frame would turn transparent resize margins and shadow corners
+            // black underneath the correctly alpha-masked chrome bands.
+            // An opaque modern client already supplies the requested interior.
+            // A second rounded black fill would apply corner coverage twice.
+            // A translucent body gets no fill either: opaque black behind a
+            // 0.96 window is exactly the darkening the rule did not ask for,
+            // and what lies beneath is composited through the window instead.
+            if opaque_client || alpha < 1.0 { return; }
+            let Some(content) = window.filter(|record| record.mapped).map(|record| record.content) else { return; };
+            let geometry = SRect::<i32, Physical>::new(
+                (
+                    content.pos.x - viewport.pos.x,
+                    content.pos.y - viewport.pos.y,
+                )
+                    .into(),
+                (content.size.w as i32, content.size.h as i32).into(),
+            );
+            let fill_start = elements.len();
+            elements.push(
+                SolidColorRenderElement::new(
+                    frame.fill_id.clone(),
+                    geometry,
+                    CommitCounter::default(),
+                    Color32F::new(0.0, 0.0, 0.0, 1.0),
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+            crate::rounded::mask_plane(elements, fill_start, renderer, shape, true);
+        }
+            })();
+        let window = match entry {
+            StackEntry::Window(id) => Some(*id),
+            StackEntry::Frame(id) => backend.frames.get(id).map(|frame| frame.window),
+        };
+        if let Some(record) = window.and_then(|id| backend.windows.get(&id)) {
+            if let Some(name) = &record.space_output {
+                if let Some(monitor) = backend.monitors.iter().find(|m| &m.name == name) {
+                    let mut rect = monitor.geometry;
+                    rect.pos.x -= viewport.pos.x;
+                    rect.pos.y -= viewport.pos.y;
+                    clip_plane(elements, start, rect, &record.space_clip_id);
+                } else { elements.truncate(start); }
+            }
+        }
+    }
+
+    // `Bottom` layers ride under the managed windows and over the
+    // shell's `below` furniture; `Background` (a wallpaper client like
+    // swaybg, should someone run one) under everything but the root
+    // wallpaper itself.
+    push_layer_band(elements, renderer, backend, WlrLayer::Bottom, viewport);
+
+    for id in backend.shell_stacking.iter().rev() {
+        let Some(record) = backend.shells.get(id) else {
+            continue;
+        };
+        if !record.above && record.mapped {
+            push_shell_elements(elements, renderer, record, viewport);
+        }
+    }
+
+    push_background(elements, renderer, backend, viewport)
+}
+
+pub(crate) fn push_background(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    viewport: Rect,
+) -> Color32F {
+    push_layer_band(elements, renderer, backend, WlrLayer::Background, viewport);
+
+    // Root background. A solid color is simply the clear color —
+    // with full-frame damage every pixel gets cleared, so no
+    // element is needed; a wallpaper image is the bottom-most
+    // element over a black clear. The image is painted by the shell
+    // at the size of the whole screen (the union of every monitor),
+    // so it hangs off the global origin and each output shows its
+    // own slice of it — which is what makes one wallpaper span the
+    // desktop rather than repeating per monitor.
+    let clear_color = match &backend.root_background {
+        RootBackground::Color((r, g, b)) => Color32F::new(*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0),
+        RootBackground::Image(buffer) => {
+            if overlap_area(Rect::new(Point::new(0, 0), backend.output_size), viewport) == 0 {
+                return Color32F::new(0.0, 0.0, 0.0, 1.0);
+            }
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                SPoint::<f64, Physical>::from((-viewport.pos.x as f64, -viewport.pos.y as f64)),
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(element) => elements.push(element.into()),
+                Err(error) => tracing::warn!(?error, "failed to import the wallpaper buffer"),
+            }
+            Color32F::new(0.0, 0.0, 0.0, 1.0)
+        }
+    };
+
+    clear_color
+}
+
+/// Tells every surface in the rendered scene which frame it just
+/// appeared in — clients gate their next commit on these, so a visible
+/// surface must hear them while a parked window or policy-hidden layer
+/// should sleep. Shared by both backends for exactly that reason.
+///
+/// Called from one output's completed presentation boundary. Render results
+/// select each surface's primary output; hidden surfaces receive no callbacks.
+pub(crate) fn send_frame_callbacks(
+    backend: &WaylandBackend,
+    output: &smithay::output::Output,
+    output_rect: Rect,
+    cursor_status: &CursorImageStatus,
+    pointer_location: SPoint<f64, Logical>,
+    elapsed: Duration,
+) {
+    let send_tree = |surface: &WlSurface| {
+        signal_pacing_barriers(surface, output);
+        send_frames_surface_tree(surface, output, elapsed, None, surface_primary_scanout_output);
+    };
+    // While locked, ONLY lock surfaces hear about frames: withholding
+    // callbacks from everything else freezes those clients for the
+    // duration, which the spec explicitly sanctions and which stops a
+    // fullscreen video burning a GPU behind a lock screen. (Their next
+    // commit after unlock un-freezes them — commits were never
+    // refused, only unanswered.)
+    if backend.locked {
+        for entry in &backend.lock_surfaces {
+            if entry.surface.alive()
+                && entry
+                    .output
+                    .and_then(|index| backend.monitors.get(index))
+                    .is_some_and(|monitor| monitor.geometry == output_rect)
+            {
+                send_tree(entry.surface.wl_surface());
+            }
+        }
+        return;
+    }
+    // Presented layer surfaces animate too (a bar's clock, mako's
+    // timeout fade), popups included. Omarchy layers disabled by the
+    // namespace policy stay mapped but are absent from the scene, so
+    // withholding callbacks is what makes them actually idle.
+    for record in &backend.layers {
+        if !backend.layer_presented(record) {
+            continue;
+        }
+        let surface = record.surface.wl_surface();
+        send_tree(surface);
+        for (popup, _) in backend.popups_for_surface(surface) {
+            send_tree(popup.wl_surface());
+        }
+    }
+    // A window parked on another workspace is protocol-mapped but did
+    // not appear in this frame. Sending its callback would make it
+    // render another invisible buffer every time an unrelated visible
+    // client produced a frame. The workspace transition frame supplies
+    // the first callback when it becomes exposed again.
+    for_each_presented_window(backend, |record| {
+        if let Some(surface) = record.surface.wl_surface() {
+            send_tree(&surface);
+            for (popup, _) in backend.popups_for_surface(&surface) {
+                send_tree(popup.wl_surface());
+            }
+        }
+    });
+    // The drag icon paces itself like the cursor surface: on the output
+    // its hotspot is over. (The lock returned above; a locked session
+    // carries no drag, and would freeze the icon with everything else.)
+    if let Some(icon) = dnd_icon_on(backend, output_rect, pointer_location) {
+        send_tree(icon);
+    }
+    let pointer_location = Point::new(pointer_location.x.floor() as i32, pointer_location.y.floor() as i32);
+    if output_rect.contains(pointer_location) {
+        if let CursorImageStatus::Surface(surface) = cursor_status {
+            send_tree(surface);
+        }
+    }
+    for popup in &backend.ime_popups {
+        if popup.alive() && popup.get_parent().is_some() {
+            send_tree(popup.wl_surface());
+        }
+    }
+}
+
+/// The live drag icon, if its hotspot is inside `output_rect`: the
+/// output that owes it frame callbacks and presentation feedback, the
+/// way the cursor surface's is chosen.
+fn dnd_icon_on(
+    backend: &WaylandBackend,
+    output_rect: Rect,
+    pointer_location: SPoint<f64, Logical>,
+) -> Option<&WlSurface> {
+    let icon = backend.dnd_icon.as_ref().filter(|icon| icon.surface.alive())?;
+    let anchor = icon.anchor(pointer_location);
+    output_rect
+        .contains(Point::new(anchor.x.floor() as i32, anchor.y.floor() as i32))
+        .then_some(&icon.surface)
+}
+
+/// Release a FIFO barrier only once its surface tree has actually appeared at
+/// a presentation boundary. Commit timing is clock-driven instead and is
+/// serviced by `Compositor::service_surface_pacing`; coupling it to a frame
+/// would deadlock the commit whose pixels are waiting behind that timer.
+fn signal_pacing_barriers(surface: &WlSurface, output: &smithay::output::Output) {
+    compositor::with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, states, &()| {
+            if surface_primary_scanout_output(surface, states).as_ref() != Some(output) {
+                return;
+            }
+            // Most surfaces never use FIFO. A frame callback must not create
+            // pacing state which makes every later input pass service them.
+            if !states.cached_state.has::<smithay::wayland::fifo::FifoBarrierCachedState>() {
+                return;
+            }
+            if let Some(barrier) = states
+                .cached_state
+                .get::<smithay::wayland::fifo::FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take()
+            {
+                barrier.signal();
+            }
+        },
+        |_, _, &()| true,
+    );
+}
+
+/// Update surface visibility from a successfully submitted frame and drain
+/// feedback only for surfaces actually presented on their primary output.
+/// Smithay selects that output from visible area and refresh rate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn take_presentation_feedback(
+    surface_outputs: &mut crate::surface_outputs::SurfaceOutputs,
+    backend: &WaylandBackend,
+    output: &smithay::output::Output,
+    output_rect: Rect,
+    render_states: &RenderElementStates,
+    cursor_status: &CursorImageStatus,
+    pointer_location: SPoint<f64, Logical>,
+) -> OutputPresentationFeedback {
+    let mut feedback = OutputPresentationFeedback::new(output);
+    let mut take_tree = |surface: &WlSurface| {
+        // Use actual rendered pixels, including transforms, clipping,
+        // occlusion and each subsurface/popup's independent visibility.
+        // Geometry-based ownership invents presentations for offscreen Flow
+        // windows and misses overflow rendered on a parent's other output.
+        take_presentation_feedback_surface_tree(
+            surface,
+            &mut feedback,
+            |surface, states| {
+                surface_outputs.update_primary(surface, output, states, render_states)
+            },
+            |surface, _| surface_presentation_feedback_flags_from_states(surface, render_states),
+        );
+    };
+
+    if backend.locked {
+        for entry in &backend.lock_surfaces {
+            if entry.surface.alive()
+                && entry.output.and_then(|index| backend.monitors.get(index)).is_some_and(|monitor| monitor.geometry == output_rect)
+            {
+                take_tree(entry.surface.wl_surface());
+            }
+        }
+        return feedback;
+    }
+
+    for_each_presented_window(backend, |record| {
+        if let Some(surface) = record.surface.wl_surface() {
+            take_tree(&surface);
+            for (popup, _) in backend.popups_for_surface(&surface) {
+                take_tree(popup.wl_surface());
+            }
+        }
+    });
+    for record in &backend.layers {
+        if !backend.layer_presented(record) {
+            continue;
+        }
+        let surface = record.surface.wl_surface();
+        take_tree(surface);
+        for (popup, _) in backend.popups_for_surface(surface) {
+            take_tree(popup.wl_surface());
+        }
+    }
+    for popup in &backend.ime_popups {
+        if popup.alive() && popup.get_parent().is_some() {
+            take_tree(popup.wl_surface());
+        }
+    }
+    let pointer = Point::new(pointer_location.x.floor() as i32, pointer_location.y.floor() as i32);
+    if output_rect.contains(pointer) {
+        if let CursorImageStatus::Surface(surface) = cursor_status {
+            take_tree(surface);
+        }
+    }
+    // Not only for the feedback: this visit is what records the icon's
+    // primary output, and `send_frames_surface_tree` answers a frame
+    // callback only on that output.
+    if let Some(icon) = dnd_icon_on(backend, output_rect, pointer_location) {
+        take_tree(icon);
+    }
+    feedback
+}
+
+/// Visits each application surface tree represented by the current
+/// scene exactly once. Both bands come from the lifecycle index rather
+/// than rediscovering visibility from all windows and all stacking
+/// entries on every frame callback and presentation-feedback drain.
+fn for_each_presented_window(backend: &WaylandBackend, mut visit: impl FnMut(&WindowRecord)) {
+    crate::gesture_scene::for_each_neighbor(backend, &mut visit);
+    if let Some(overview) = backend.overview.as_ref()
+        .filter(|o| backend.shells.get(&o.surface).is_some_and(|s| s.mapped)) {
+        for record in overview.extra_windows(backend) { visit(record); }
+    }
+    for window in backend.scene_index.unmanaged() {
+        if let Some(record) = backend
+            .windows
+            .get(&window)
+            .filter(|record| record.mapped && record.surface.alive())
+        {
+            visit(record);
+        }
+    }
+    for window in backend.scene_index.presented() {
+        if let Some(record) = backend
+            .windows
+            .get(&window)
+            .filter(|record| record.mapped && record.surface.alive())
+        {
+            visit(record);
+        }
+    }
+}
+
+fn overlap_area(a: Rect, b: Rect) -> u64 {
+    let left = i64::from(a.pos.x.max(b.pos.x));
+    let top = i64::from(a.pos.y.max(b.pos.y));
+    let right = (i64::from(a.pos.x) + i64::from(a.size.w))
+        .min(i64::from(b.pos.x) + i64::from(b.size.w));
+    let bottom = (i64::from(a.pos.y) + i64::from(a.size.h))
+        .min(i64::from(b.pos.y) + i64::from(b.size.h));
+    (right - left).max(0) as u64 * (bottom - top).max(0) as u64
+}
+
+/// Whether desktop-level bands must stay behind the focused fullscreen
+/// window on `viewport`.
+///
+/// `viewport` is one output's global rectangle. Testing the active
+/// window's content against it makes the policy output-local without a
+/// second fullscreen/output ledger: on a two-monitor desktop the other
+/// output keeps its own bar and dock. The focused window is the same
+/// authoritative value `hyprctl activewindow` reports, and `mapped`
+/// excludes minimized, shaded, and parked-workspace content.
+pub(crate) fn fullscreen_occludes_desktop_bands(backend: &WaylandBackend, viewport: Rect) -> bool {
+    if backend
+        .overview
+        .as_ref()
+        .is_some_and(|o| o.presented(backend, viewport))
+    {
+        return false;
+    }
+    // Each independently visible fullscreen Space owns its display furniture,
+    // even while keyboard focus is on another output.
+    if backend.windows.iter().any(|(id, record)| record.space_output.is_some() && record.fullscreen
+        && backend.scene_index.is_presented(*id) && record.mapped && record.surface.alive() && fullscreen_rect_occludes_viewport(record.content, viewport)) {
+        return true;
+    }
+    let Some(window) = backend.ewmh.active_window() else {
+        return false;
+    };
+    backend.windows.get(&window).is_some_and(|record| {
+        record.fullscreen
+            && record.mapped
+            && record.surface.alive()
+            && fullscreen_rect_occludes_viewport(record.content, viewport)
+    })
+}
+
+fn fullscreen_rect_occludes_viewport(content: Rect, viewport: Rect) -> bool {
+    overlap_area(content, viewport) > 0
+}
+
+pub(crate) fn presentation_refresh(output: &smithay::output::Output) -> smithay::wayland::presentation::Refresh {
+    output.current_mode().and_then(|mode| u64::try_from(mode.refresh).ok()).filter(|rate| *rate > 0).map_or(
+        smithay::wayland::presentation::Refresh::Unknown,
+        |millihertz| smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(1_000_000_000_000 / millihertz)),
+    )
+}
+
+pub(crate) fn present_now(
+    feedback: &mut OutputPresentationFeedback,
+    refresh: smithay::wayland::presentation::Refresh,
+    flags: smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind,
+) {
+    feedback.presented(
+        smithay::utils::Clock::<smithay::utils::Monotonic>::new().now(),
+        refresh,
+        0,
+        flags,
+    );
+}
+
+pub(crate) fn present_at(
+    feedback: &mut OutputPresentationFeedback,
+    at: Duration,
+    refresh: smithay::wayland::presentation::Refresh,
+    sequence: u64,
+    flags: smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind,
+) {
+    feedback.presented::<_, smithay::utils::Monotonic>(at, refresh, sequence, flags);
+}
+
+/// How many consecutive failed frames are reported before the warning
+/// is throttled to one in a hundred.
+///
+/// Every failure path here keeps the damage flag set so the next pass
+/// retries, which is right for a transient fault (a VT switch landing
+/// mid-frame) and wrong for a permanent one: a wedged renderer would
+/// otherwise write a warning per frame forever, burning a CPU and
+/// filling the log of a session whose screen is already black. The
+/// count resets on the first frame that succeeds.
+const FRAME_FAILURES_BEFORE_THROTTLE: u32 = 5;
+static CONSECUTIVE_FRAME_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// Records a failed frame and answers whether this one should be
+/// logged.
+pub(crate) fn note_frame_failure() -> bool {
+    let previous = CONSECUTIVE_FRAME_FAILURES.fetch_add(1, Ordering::Relaxed);
+    previous < FRAME_FAILURES_BEFORE_THROTTLE || previous.is_multiple_of(100)
+}
+
+/// Clears the failure streak after a frame reaches the screen.
+pub(crate) fn note_frame_success() {
+    CONSECUTIVE_FRAME_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// Draws one frame through whichever backend this session is running
+/// on. The submission halves differ (a winit swap versus a DRM page
+/// flip) and live with their backends; everything visible above them
+/// is [`build_scene`].
+pub(crate) fn render_frame(comp: &mut Compositor) -> bool {
+    if comp.dmabuf.refresh(&comp.graphics, &comp.outputs) {
+        comp.surface_outputs.reset_feedback(comp.dmabuf.default_feedback());
+    }
+    // A plain screencopy must complete even when it lands on an idle desktop.
+    // The coarse damage bit gets us here; forcing age zero below makes the
+    // output damage tracker produce the actual presentation that paces it.
+    let plain_capture_pending = crate::protocols::plain_capture_pending(&comp.protocols);
+    match comp.graphics {
+        Graphics::Session(_) => {
+            // Snapshot readback is deliberately outside the deadline
+            // path. It is synchronous on some drivers; doing it after
+            // the flip is queued spends post-submit slack rather than
+            // making fresh input miss the vblank we just scheduled for.
+            let drew = crate::session::render_frame_session(comp, plain_capture_pending);
+            if drew {
+                crate::capture::refresh_snapshots(comp);
+            }
+            drew
+        }
+        Graphics::Winit(_) => {
+            // The nested backend has no vblank clock of its own; keep
+            // its existing immediate ordering under the host compositor.
+            crate::capture::refresh_snapshots(comp);
+            render_frame_winit(comp, plain_capture_pending)
+        }
+    }
+}
+
+fn render_frame_winit(comp: &mut Compositor, plain_capture_pending: bool) -> bool {
+    if comp.outputs.len() > 1 { return render_frame_winit_outputs(comp, plain_capture_pending); }
+    // Disjoint field borrows: the winit backend (renderer +
+    // framebuffer) mutates while the ledger is read — both live on
+    // `Compositor`, so destructure instead of going through `&mut
+    // self` methods.
+    let Compositor { wm, graphics, outputs, pointer_location, cursor_status, tablet_cursors, cursors, start_time, frame_stats, surface_outputs, dmabuf, gpu_timer, .. } = comp;
+    let Graphics::Winit(winit_backend) = graphics else {
+        return false;
+    };
+    // The host window is the one and only output (see `state.rs`'s
+    // `run`), so there is nothing to iterate and no viewport to offset
+    // by — this arm is the multi-output path's degenerate case, not a
+    // second implementation of it.
+    let Some(entry) = outputs.first_mut() else {
+        return false;
+    };
+    let output = &entry.output;
+    let damage_tracker = &mut entry.damage_tracker;
+    let scene_scratch = &mut entry.scene_scratch;
+
+    // Imports and timer setup can bind a surfaceless EGL context. Finish them
+    // before latching the window backbuffer and asking for its age; unbinding
+    // between that query and drawing can select a different buffer on NVIDIA.
+    let (clear_color, timing) = {
+        let renderer = winit_backend.renderer();
+        let gesture_build = wm.backend().gesture_scene.as_ref().map(|_| std::time::Instant::now());
+        let clear_color = build_scene_into(
+            scene_scratch,
+            wm.backend(),
+            renderer,
+            *pointer_location,
+            cursor_status,
+            tablet_cursors,
+            cursors,
+            Rect::new(Point::new(0, 0), entry.size),
+            ScenePurpose::Display,
+        );
+        if let Some(started) = gesture_build { frame_stats.record_gesture_build(started.elapsed()); }
+
+        crate::capture_tool::render(scene_scratch, renderer, wm.backend(), Rect::new(Point::new(0, 0), entry.size));
+        surface_outputs.update_scene(output, (entry.size.w as i32, entry.size.h as i32).into(), scene_scratch, dmabuf.default_feedback());
+        let timing = if gpu_timer.enabled() { gpu_timer.begin(renderer, &output.name()) } else { None };
+        (clear_color, timing)
+    };
+
+    // Smithay 0.7's bind prepares a target and handles resize, but
+    // does not make the surface current until Renderer::render. That
+    // is too late for buffer_age: captures may have left a surfaceless
+    // context current, making this query fail and force full damage.
+    if let Err(error) = make_winit_surface_current(winit_backend) {
+        gpu_timer.end(winit_backend.renderer(), timing);
+        scene_scratch.clear();
+        if note_frame_failure() {
+            tracing::warn!(?error, "could not bind the winit framebuffer; skipping frame");
+        }
+        return false;
+    }
+    // Real buffer age — the whole point of damage tracking. The age
+    // says how many frames old this buffer's contents are, and the
+    // tracker then repaints only what changed since; `None` (an EGL
+    // stack without `EGL_EXT_buffer_age`) degrades to 0, which is the
+    // old always-full-frame behaviour, honestly forced rather than
+    // silently assumed. `CHONKSTEP_FULL_DAMAGE=1` forces 0 for the same
+    // escape-hatch reason `session.rs` documents.
+    let age = if crate::session::full_damage_forced() || plain_capture_pending {
+        0
+    } else {
+        winit_backend.buffer_age().unwrap_or(0)
+    };
+    let scene_total = scene_scratch.len();
+    let rendered = (|| {
+        let (renderer, mut framebuffer) = winit_backend.bind().map_err(|error| {
+            if note_frame_failure() {
+                tracing::warn!(?error, "could not bind the winit framebuffer; skipping frame");
+            }
+        })?;
+        match damage_tracker.render_output(renderer, &mut framebuffer, age, scene_scratch, clear_color) {
+            Ok(result) => {
+                log_damage(age, result.damage.map(Vec::as_slice));
+                Ok(result.damage.is_some().then_some(result.states))
+            }
+            Err(error) => {
+                if note_frame_failure() {
+                    tracing::warn!(?error, "render failed; keeping damage for a retry");
+                }
+                Err(())
+            }
+        }
+    })();
+    gpu_timer.end(winit_backend.renderer(), timing);
+    // The nested backend has no asynchronous page-flip ownership. Release
+    // element-owned client buffers on success and failure, retaining capacity.
+    scene_scratch.clear();
+    let Ok(render_states) = rendered else { return false; };
+
+    if render_states.is_some() {
+        // The buffer holds a complete frame either way (the tracker
+        // repainted every stale pixel for this buffer's age), so the
+        // full-window swap rect is correct; the damage rects computed
+        // above only bounded the GPU work. Handing the host compositor
+        // the precise rects would additionally shrink *its* recomposite,
+        // but the winit swap's damage is in a different orientation
+        // than the tracker's output space under this backend's
+        // `Flipped180`, and a wrong rect here shows as smearing on the
+        // host — full is the honest choice for a dev backend.
+        let size = winit_backend.window_size();
+        if let Err(error) = winit_backend.submit(Some(&[SRect::from_size(size)])) {
+            if note_frame_failure() {
+                tracing::warn!(?error, "swap failed; keeping damage for a retry");
+            }
+            return false;
+        }
+    }
+
+    let Some(render_states) = render_states else {
+        wm.backend_mut().damage = false;
+        return false;
+    };
+
+    note_frame_success();
+    wm.backend_mut().scene_elements = crate::state::SceneElementCounts::from_states(scene_total, &render_states);
+    let output_rect = wm.backend().monitors.first().map(|monitor| monitor.geometry).unwrap_or_default();
+    let mut feedback = take_presentation_feedback(surface_outputs, wm.backend(), output, output_rect, &render_states, cursor_status, *pointer_location);
+    surface_outputs.send_feedback(output, &render_states, dmabuf);
+    present_now(
+        &mut feedback,
+        presentation_refresh(output),
+        smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+    );
+    send_frame_callbacks(
+        wm.backend(),
+        output,
+        output_rect,
+        cursor_status,
+        *pointer_location,
+        start_time.elapsed(),
+    );
+    wm.backend_mut().damage = false;
+    true
+}
+
+/// Multiple virtual heads share one nested host swap. Each head builds the
+/// production output viewport independently, then only its final elements are
+/// translated into the host framebuffer. This exercises output-local Overview,
+/// fullscreen, clipping and surface membership without claiming KMS cadence.
+fn render_frame_winit_outputs(comp: &mut Compositor, capture_pending: bool) -> bool {
+    use smithay::backend::renderer::element::utils::{RelocateRenderElement, Relocate};
+    let Compositor { wm, graphics, outputs, pointer_location, cursor_status, tablet_cursors, cursors,
+        start_time, surface_outputs, dmabuf, .. } = comp;
+    let Graphics::Winit(backend) = graphics else { return false; };
+    let mut elements = Vec::new();
+    {
+        let renderer = backend.renderer();
+        for entry in outputs.iter_mut() {
+            let viewport = Rect::new(entry.position, entry.size);
+            let scene = &mut entry.scene_scratch;
+            build_scene_into(scene, wm.backend(), renderer, *pointer_location, cursor_status, tablet_cursors, cursors, viewport,
+                ScenePurpose::Display);
+            crate::capture_tool::render(scene, renderer, wm.backend(), viewport);
+            // Native output framebuffers enforce this boundary themselves.
+            // The shared host framebuffer needs it before translating the head,
+            // especially for an entering swipe plane or an edge cursor.
+            if let Some(id) = scene.first().map(|element| smithay::backend::renderer::element::Element::id(element).clone()) {
+                clip_plane(scene, 0, Rect::new(Point::new(0, 0), entry.size), &id);
+            }
+            surface_outputs.update_scene(&entry.output, (entry.size.w as i32, entry.size.h as i32).into(), scene, dmabuf.default_feedback());
+            elements.extend(scene.drain(..).map(|e| RelocateRenderElement::from_element(e,
+                (entry.position.x, entry.position.y), Relocate::Relative)));
+        }
+    }
+    if make_winit_surface_current(backend).is_err() { return false; }
+    let age = if capture_pending || crate::session::full_damage_forced() { 0 } else { backend.buffer_age().unwrap_or(0) };
+    let result = {
+        let Ok((renderer, mut framebuffer)) = backend.bind() else { return false; };
+        outputs[0].damage_tracker.render_output(renderer, &mut framebuffer, age, &elements,
+            Color32F::new(0.015, 0.015, 0.018, 1.0)).map(|r| r.damage.is_some().then_some(r.states))
+    };
+    let states = match result { Ok(Some(states)) => states, Ok(None) => { wm.backend_mut().damage = false; return false; },
+        Err(error) => { tracing::warn!(?error, "nested display render failed"); return false; } };
+    if backend.submit(Some(&[SRect::from_size(backend.window_size())])).is_err() { return false; }
+    wm.backend_mut().scene_elements = crate::state::SceneElementCounts::from_states(elements.len(), &states);
+    for entry in outputs.iter() {
+        let rect = Rect::new(entry.position, entry.size);
+        let mut feedback = take_presentation_feedback(surface_outputs, wm.backend(), &entry.output, rect,
+            &states, cursor_status, *pointer_location);
+        surface_outputs.send_feedback(&entry.output, &states, dmabuf);
+        present_now(&mut feedback, presentation_refresh(&entry.output),
+            smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync);
+        send_frame_callbacks(wm.backend(), &entry.output, rect, cursor_status, *pointer_location, start_time.elapsed());
+    }
+    wm.backend_mut().damage = false;
+    true
+}
+
+fn make_winit_surface_current(
+    backend: &mut smithay::backend::winit::WinitGraphicsBackend<GlesRenderer>,
+) -> Result<(), String> {
+    use smithay::backend::egl::ffi::egl;
+
+    // Perform Smithay's resize bookkeeping before latching the back
+    // buffer. Keep ownership in the backend; only copy its raw handles
+    // to avoid overlapping renderer/surface accessor borrows.
+    drop(backend.bind().map_err(|error| format!("bind: {error:?}"))?);
+    backend.renderer().with_context(|gl| {
+        // SAFETY: with_context owns this renderer's current context. Restore
+        // the default framebuffer before latching the EGL window backbuffer;
+        // captures can leave an offscreen framebuffer bound.
+        unsafe { gl.BindFramebuffer(smithay::backend::renderer::gles::ffi::FRAMEBUFFER, 0); }
+    }).map_err(|error| format!("default framebuffer: {error:?}"))?;
+    let context = backend.renderer().egl_context();
+    let handle = context.get_context_handle();
+    let display = context.display().get_display_handle();
+    let surface = backend.egl_surface().get_surface_handle();
+    // SAFETY: all three handles belong to this live backend. Rendering
+    // and capture use its context only on the compositor thread. The
+    // backend cannot resize/drop the surface during this call. This is
+    // the same operation as EGLContext::make_current_with_surface; no
+    // GL state, framebuffer contents, or resource ownership is changed.
+    let result = unsafe { egl::MakeCurrent(**display, surface, surface, handle) };
+    if result == egl::FALSE {
+        // SAFETY: EGL's entry points are loaded for this live backend.
+        // GetError only reads/clears this thread's EGL error and needs no current context.
+        let error = unsafe { egl::GetError() };
+        return Err(format!("make current: EGL error {error:#x}"));
+    }
+    Ok(())
+}
+
+/// Damage-rect telemetry, on when `CHONKSTEP_DAMAGE_LOG` is set: one
+/// line per drawn frame with the buffer age it rendered at, how many
+/// rects the tracker produced, and their total area. This is the
+/// honest measurement the damage work is judged by — an idle desktop
+/// must log nothing (no frame at all), a blinking cursor a few hundred
+/// square pixels, a fullscreen video the video's rectangle.
+pub(crate) fn log_damage(age: usize, damage: Option<&[SRect<i32, Physical>]>) {
+    if !crate::diagnostics::enabled("damage-log") {
+        return;
+    }
+    match damage {
+        Some(rects) => {
+            let area: i64 = rects.iter().map(|rect| rect.size.w as i64 * rect.size.h as i64).sum();
+            tracing::info!(age, rects = rects.len(), area, "frame damage");
+        }
+        None => tracing::info!(age, "frame damage: none (no repaint)"),
+    }
+}
+
+/// Pushes one layer band's surfaces (front to back — newest record
+/// first, so the newest surface in a band draws on top, matching the
+/// hit walk), each with its xdg popups floating above it exactly as a
+/// managed window's do. Layer surfaces are ordinary client surfaces:
+/// they go through [`push_surface_tree`] like every other, or a 2x
+/// client's bar would land at half size.
+fn push_ime_popups(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    viewport: Rect,
+) {
+    for popup in backend.ime_popups.iter().rev() {
+        if !popup.alive() {
+            continue;
+        }
+        let Some(parent) = popup.get_parent() else { continue };
+        let root = popup.wl_surface();
+        let location = popup.location();
+        let global = Point::new(parent.location.loc.x + location.x, parent.location.loc.y + location.y);
+        let parent_rect = Rect::new(
+            Point::new(parent.location.loc.x, parent.location.loc.y),
+            wm_theme_api::Size::new(parent.location.size.w.max(0) as u32, parent.location.size.h.max(0) as u32),
+        );
+        let factor = crate::xdg::effective_surface_scale(
+            crate::xdg::committed_surface_scale(root),
+            backend.scale_at(parent_rect),
+        );
+        if !surface_tree_reaches_viewport(
+            root,
+            global,
+            Rect::new(global, wm_theme_api::Size::default()),
+            factor,
+            viewport,
+        ) {
+            continue;
+        }
+        push_surface_tree(
+            elements,
+            renderer,
+            root,
+            SPoint::<i32, Physical>::from((global.x - viewport.pos.x, global.y - viewport.pos.y)),
+            factor,
+            1.0,
+            Kind::Unspecified,
+        );
+    }
+}
+
+fn push_layer_band(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    band: WlrLayer,
+    viewport: Rect,
+) {
+    push_layer_band_alpha(elements, renderer, backend, band, viewport, 1.0);
+}
+fn push_layer_band_alpha(elements: &mut Vec<SceneElement>, renderer: &mut GlesRenderer,
+    backend: &WaylandBackend, band: WlrLayer, viewport: Rect, alpha: f32) {
+    for record in backend.layers.iter().rev() {
+        if record.layer != band || !backend.layer_presented(record) {
+            continue;
+        }
+        let surface = record.surface.wl_surface();
+        let origin = SPoint::<i32, Physical>::from((
+            record.geometry.pos.x - viewport.pos.x,
+            record.geometry.pos.y - viewport.pos.y,
+        ));
+        // Popups above their parent, offsets converted by the parent's
+        // committed factor — the identical arithmetic
+        // `push_window_content` uses, for the identical reason.
+        let factor = crate::xdg::effective_surface_scale(
+            crate::xdg::committed_surface_scale(surface),
+            backend.scale_at(record.geometry),
+        );
+        for (popup, offset) in backend.popups_for_surface(surface) {
+            let popup_surface = popup.wl_surface();
+            let popup_factor = crate::xdg::effective_surface_scale(
+                crate::xdg::committed_surface_scale(popup_surface),
+                backend.scale_at(record.geometry),
+            );
+            let global = Point::new(
+                record.geometry.pos.x.saturating_add(crate::xdg::scale_length(offset.x, factor)),
+                record.geometry.pos.y.saturating_add(crate::xdg::scale_length(offset.y, factor)),
+            );
+            if !surface_tree_reaches_viewport(
+                popup_surface,
+                global,
+                Rect::new(global, wm_theme_api::Size::default()),
+                popup_factor,
+                viewport,
+            ) {
+                continue;
+            }
+            let location = SPoint::<i32, Physical>::from((
+                global.x - viewport.pos.x,
+                global.y - viewport.pos.y,
+            ));
+            push_surface_tree_alpha(elements, renderer, popup_surface, location, popup_factor, 1.0, Kind::Unspecified, alpha);
+        }
+        if surface_tree_reaches_viewport(surface, record.geometry.pos, record.geometry, factor, viewport) {
+            push_surface_tree_alpha(elements, renderer, surface, origin, factor, 1.0, Kind::Unspecified, alpha);
+        }
+    }
+}
+
+/// Pushes one shell surface's elements (front to back): its painted
+/// buffer, or a solid fill of its background color when it has never
+/// been painted — the same visual the X11 backend gets from a fresh
+/// window's background pixel before the first blit.
+fn push_shell_elements(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    record: &crate::state::ShellRecord,
+    viewport: Rect,
+) {
+    push_shell_elements_alpha(elements, renderer, record, viewport, 1.0);
+}
+fn push_shell_elements_alpha(elements: &mut Vec<SceneElement>, renderer: &mut GlesRenderer,
+    record: &crate::state::ShellRecord, viewport: Rect, alpha: f32) {
+    if overlap_area(record.geometry, viewport) == 0 {
+        return;
+    }
+    match &record.buffer {
+        Some(buffer) => {
+            let location = SPoint::<f64, Physical>::from((
+                (record.geometry.pos.x - viewport.pos.x) as f64,
+                (record.geometry.pos.y - viewport.pos.y) as f64,
+            ));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                location,
+                buffer,
+                Some(alpha),
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(element) => elements.push(element.into()),
+                Err(error) => tracing::warn!(?error, "failed to import a shell surface buffer"),
+            }
+        }
+        None => {
+            let (r, g, b) = record.background;
+            let geometry = SRect::<i32, Physical>::new(
+                (
+                    record.geometry.pos.x - viewport.pos.x,
+                    record.geometry.pos.y - viewport.pos.y,
+                )
+                    .into(),
+                (record.geometry.size.w as i32, record.geometry.size.h as i32).into(),
+            );
+            // The record's own stable id: the damage tracker keys
+            // element history by it, and this compositor now renders
+            // with real buffer ages (see `render_frame_winit` and the
+            // session backend's per-element default), so a fresh id per
+            // frame would re-damage every never-painted shell surface
+            // every frame.
+            elements.push(
+                SolidColorRenderElement::new(
+                    record.fill_id.clone(),
+                    geometry,
+                    CommitCounter::default(),
+                    Color32F::new(r as f32 / 255.0 * alpha, g as f32 / 255.0 * alpha, b as f32 / 255.0 * alpha, alpha),
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
+    }
+}
+
+pub(crate) fn push_furniture(elements: &mut Vec<SceneElement>, renderer: &mut GlesRenderer,
+    backend: &WaylandBackend, viewport: Rect, alpha: f32, above: bool) {
+    if alpha <= 0.0 || fullscreen_occludes_desktop_bands(backend, viewport) { return; }
+    for id in backend.shell_stacking.iter().rev() {
+        if backend.overview.as_ref().is_some_and(|o| o.surface == *id) { continue; }
+        if let Some(record) = backend.shells.get(id).filter(|s| s.mapped && s.above == above) {
+            push_shell_elements_alpha(elements, renderer, record, viewport, alpha);
+        }
+    }
+    push_layer_band_alpha(elements, renderer, backend, if above { WlrLayer::Top } else { WlrLayer::Bottom }, viewport, alpha);
+}
+
+/// Pushes one managed window's client content (front to back): its
+/// xdg popups above, then the surface tree itself at the content rect.
+///
+/// Two corrections separate the surface's origin from the content rect,
+/// and both used to be assumed away. A client drawing its own chrome
+/// wraps its buffer in a drop shadow and says so through
+/// `xdg_surface.set_window_geometry`, so the buffer starts up and left
+/// of the window (`record.content_offset`). And a client rendering at
+/// 2x works in its own logical pixels while this ledger is in physical
+/// ones, so everything it reports is its buffer scale times smaller
+/// than what is drawn.
+#[derive(Default)]
+struct ContentDraw {
+    opaque_client: bool,
+    lower_border_drawn: bool,
+}
+
+fn viewport_relative(rect: Rect, viewport: Rect) -> Rect {
+    Rect::new(Point::new(rect.pos.x - viewport.pos.x, rect.pos.y - viewport.pos.y), rect.size)
+}
+
+/// One black quad at `strength` in front of an unfocused window under
+/// `dim_inactive`, masked to the frame's rounded silhouette. The window
+/// underneath stays opaque and keeps occluding what it covers — one
+/// blended quad, rather than everything beneath the window composited
+/// through it, is what makes this the cheap focus cue. Retained under
+/// the window's own id so the damage tracker sees one element that
+/// comes and goes; the strength rides on the commit counter so a
+/// reload that changes it repaints. `rect` and `visible` are both
+/// viewport-relative, like `shape`, so the tiled path can hand in a
+/// rect on its own presentation transform.
+pub(crate) fn push_dim(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    strength: Option<f32>,
+    id: &smithay::backend::renderer::element::Id,
+    rect: Rect,
+    visible: Rect,
+    shape: Option<wm_theme_api::DecorationShape>,
+) {
+    let Some(strength) = strength else {
+        return;
+    };
+    if overlap_area(rect, visible) == 0 {
+        return;
+    }
+    let geometry = SRect::<i32, Physical>::new(
+        (rect.pos.x, rect.pos.y).into(),
+        (rect.size.w as i32, rect.size.h as i32).into(),
+    );
+    let start = elements.len();
+    elements.push(
+        SolidColorRenderElement::new(
+            id.clone(),
+            geometry,
+            CommitCounter::from((strength.clamp(0.0, 1.0) * 1000.0) as usize),
+            Color32F::new(0.0, 0.0, 0.0, strength.clamp(0.0, 1.0)),
+            Kind::Unspecified,
+        )
+        .into(),
+    );
+    crate::rounded::mask_plane(elements, start, renderer, shape, false);
+}
+
+/// `alpha` is the window's body alpha: its content, its popups and its
+/// lower border ring all take it, so a translucent window is
+/// translucent as one thing rather than a solid menu over a see-through
+/// page.
+#[allow(clippy::too_many_arguments)]
+fn push_window_content(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    content: Rect,
+    record: &crate::state::WindowRecord,
+    viewport: Rect,
+    frame: Option<&crate::state::FrameRecord>,
+    alpha: f32,
+) -> ContentDraw {
+    if !record.surface.alive() {
+        return ContentDraw::default();
+    }
+    let Some(surface) = record.surface.wl_surface() else {
+        return ContentDraw::default();
+    };
+    // Drawn up and to the left by the client's own window-geometry
+    // offset, so that the *window* lands at `content.pos` rather than
+    // the top-left of a buffer that also contains a drop shadow. For a
+    // client that declares no geometry this is zero and the expression
+    // is the plain one it used to be. See `WindowRecord::content_offset`.
+    let global_origin = Point::new(
+        content.pos.x.saturating_sub(record.content_offset.x),
+        content.pos.y.saturating_sub(record.content_offset.y),
+    );
+    // Each surface is drawn at the buffer scale it itself committed,
+    // which is not the same thing as a scale for the session — see
+    // `push_surface_tree` for how that lands 1 buffer pixel on 1
+    // screen pixel.
+    //
+    // Reading the scale from the surface rather than the desktop is
+    // what leaves everything else alone. An Xwayland window, or a
+    // toolkit that trusts only `wl_output`, commits a 1x buffer,
+    // reports 1, and is drawn precisely as before. A session-wide
+    // factor would instead stretch those to double size over ledger
+    // rectangles that never grew with them.
+    //
+    // Chrome is not drawn through here — frames and shell surfaces are
+    // memory buffers the theme already rasterized in physical pixels,
+    // pushed at 1:1 elsewhere in this file — so the two do not have to
+    // agree beyond meeting at the same rectangle.
+    let factor = backend.window_surface_scale(record);
+    for (popup, offset) in backend.popups_for_surface(&surface) {
+        // The offset is surface-local to the parent, so it converts by
+        // the parent's factor; the popup's tree then renders at the
+        // popup's own, because a menu is a separate surface with its own
+        // committed scale and the protocol never promises the two match.
+        let popup_surface = popup.wl_surface();
+        let popup_factor = crate::xdg::effective_surface_scale(
+            crate::xdg::committed_surface_scale(popup_surface),
+            backend.window_output_scale(record),
+        );
+        let global = Point::new(
+            global_origin.x.saturating_add(crate::xdg::scale_length(offset.x, factor)),
+            global_origin.y.saturating_add(crate::xdg::scale_length(offset.y, factor)),
+        );
+        if !surface_tree_reaches_viewport(
+            popup_surface,
+            global,
+            Rect::new(global, wm_theme_api::Size::default()),
+            popup_factor,
+            viewport,
+        ) {
+            continue;
+        }
+        let location = SPoint::<i32, Physical>::from((
+            global.x - viewport.pos.x,
+            global.y - viewport.pos.y,
+        ));
+        push_surface_tree_alpha(elements, renderer, popup_surface, location, popup_factor, 1.0, Kind::Unspecified, alpha);
+    }
+    let effects = frame.and_then(|frame|frame.effects.as_ref());
+    let shape = crate::rounded::translated_shape(effects.and_then(|e|e.shape),
+        frame.map_or(Point::new(0,0),|frame|frame.geometry.pos), viewport.pos, Point::new(0,0), 1.0, 1.0);
+    let lower_border_drawn = effects.is_some_and(|effects| {
+        crate::rounded::push_border(elements, renderer, shape, &effects.border_ids, effects.commit, alpha)
+    });
+    let (presentation_origin, presentation_scale) = backend.window_presentation(record, frame.is_some());
+    let origin = SPoint::<i32, Physical>::from((
+        presentation_origin.x - viewport.pos.x,
+        presentation_origin.y - viewport.pos.y,
+    ));
+    if surface_tree_reaches_viewport(&surface, presentation_origin, content, presentation_scale, viewport) {
+        let start = elements.len();
+        push_surface_tree_alpha(elements, renderer, &surface, origin, presentation_scale, 1.0, Kind::Unspecified, alpha);
+        let requested = Rect::new(Point::new(content.pos.x - viewport.pos.x,
+            content.pos.y - viewport.pos.y), content.size);
+        let opaque = shape.is_some_and(|shape| shape.radius > 0)
+            && crate::rounded::opaque_client_covers(&elements[start..], requested);
+        crate::rounded::mask_plane(elements, start, renderer, shape, true);
+        return ContentDraw { opaque_client: opaque, lower_border_drawn };
+    }
+    ContentDraw { opaque_client: false, lower_border_drawn }
+}
+
+/// Whether a surface tree contributes pixels to this output/capture.
+///
+/// The ledger rectangle is a cheap answer for the ordinary case. A
+/// tree can legally draw beyond it through a drop shadow or subsurface,
+/// so a miss falls back to smithay's exact tree bounds rather than
+/// incorrectly clipping overflow at an output boundary. The expensive
+/// import/element construction then runs only for outputs the tree can
+/// actually reach.
+pub(crate) fn surface_tree_reaches_viewport(
+    surface: &WlSurface,
+    global_origin: Point,
+    ledger_rect: Rect,
+    factor: impl Into<Scale<f64>>,
+    viewport: Rect,
+) -> bool {
+    if overlap_area(ledger_rect, viewport) > 0 {
+        return true;
+    }
+    let factor = factor.into();
+    let logical = bbox_from_surface_tree(surface, (0, 0));
+    let x = global_origin
+        .x
+        .saturating_add(crate::xdg::scale_length(logical.loc.x, factor.x));
+    let y = global_origin
+        .y
+        .saturating_add(crate::xdg::scale_length(logical.loc.y, factor.y));
+    let width = crate::xdg::scale_length(logical.size.w, factor.x).max(0) as u32;
+    let height = crate::xdg::scale_length(logical.size.h, factor.y).max(0) as u32;
+    overlap_area(Rect::new(Point::new(x, y), wm_theme_api::Size::new(width, height)), viewport) > 0
+}
+
+/// Pushes one wayland surface tree (front to back), drawn so that each
+/// of its committed buffer pixels lands on exactly one screen pixel at
+/// `location` — the only size at which the tree agrees with the
+/// physical rectangle the ledger keeps for it.
+///
+/// The multiplication has to happen here because smithay's element
+/// machinery mixes two spaces (verified against the vendored 0.7
+/// source, `element/surface.rs` and `element/memory.rs`): an element's
+/// *location* is `Point<f64, Physical>` and passes through untouched,
+/// but its *size* is the surface's logical extent — buffer pixels
+/// divided by the `wl_surface.set_buffer_scale` the client committed —
+/// multiplied at draw time by whatever scale the damage tracker passes
+/// to `Element::geometry(scale)`. Every tracker in this crate is pinned
+/// to 1.0 so the chrome's device-pixel buffers stay exact (see the
+/// module docs), which leaves a 2x client's element at half its buffer.
+/// The [`RescaleRenderElement`] wrap multiplies the element's geometry
+/// (and its subsurface offsets, which the tree walk left logical by
+/// passing 1.0 below) back up by the tree's committed buffer scale,
+/// around `location` so the tree's own anchor never moves.
+///
+/// `render_scale` is 1.0 for the on-screen scene; `capture.rs` passes
+/// its thumbnail downscale, matching the tracker it then renders with.
+///
+/// One factor for the whole tree, passed in by the caller: every site
+/// that anchors a tree also measured its rectangle, and the two must
+/// multiply by the same number (`WaylandBackend::window_surface_scale`
+/// for managed windows, `xdg::effective_surface_scale` compositions for
+/// the rest). The factor is fractional since fractional-scale-v1: a
+/// client told 1.5 commits a viewport-backed buffer whose ratio *is*
+/// 1.5, and an integral-fallback client's 2x buffer is composed at the
+/// output's real 1.5 (a GPU downscale — the sharp direction).
+/// The protocol permits a subsurface to commit a different scale than
+/// its parent, but the offsets between them convert by a single number
+/// either way, and no toolkit this desktop runs mixes scales within
+/// one window.
+pub(crate) fn push_surface_tree(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    surface: &WlSurface,
+    location: SPoint<i32, Physical>,
+    factor: f64,
+    render_scale: f64,
+    kind: Kind,
+) {
+    push_surface_tree_alpha(elements, renderer, surface, location, factor, render_scale, kind, 1.0);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_surface_tree_alpha(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    surface: &WlSurface,
+    location: SPoint<i32, Physical>,
+    factor: impl Into<Scale<f64>>,
+    render_scale: f64,
+    kind: Kind,
+    alpha: f32,
+) {
+    // This is smithay's `render_elements_from_surface_tree` traversal
+    // with its sink made caller-owned. That helper necessarily returns
+    // a fresh Vec, which meant one allocator round trip per visible
+    // Wayland tree, per output, per frame even after the outer scene
+    // storage became reusable. Pushing the same elements straight into
+    // the retained scene keeps ordering and import semantics identical
+    // while removing the hidden inner allocation.
+    //
+    // It is also driven from an explicit stack rather than by recursing
+    // on itself, so this walk's stack cost is a constant that does not
+    // depend on how deep a client chose to nest its subsurfaces. Depth
+    // is bounded at the protocol edge now (`xdg::Compositor::new_subsurface`
+    // and `MAX_SUBSURFACE_DEPTH`), which is what protects the recursions
+    // inside smithay that cannot be rewritten from here — but the walk
+    // this compositor owns should not need that bound to be safe, and
+    // does not.
+    let factor = factor.into();
+    let tree_origin = location;
+    let scale: Scale<f64> = render_scale.into();
+    let mut pending = take_walk_stack();
+    // The root is carried in hand rather than pushed, so a tree with no
+    // subsurfaces at all — nearly every window — touches the stack zero
+    // times and its scratch capacity stays at whatever the frame before
+    // needed.
+    let mut next = Some(TreeStep::Descend(surface.clone(), tree_origin.to_f64()));
+    while let Some(step) = next.take().or_else(|| pending.pop()) {
+        match step {
+            TreeStep::Descend(node, location) => {
+                // One level, and one level only: the filter answers for
+                // `node` and refuses children to everything else, so
+                // upstream's recursion turns around after a single step
+                // no matter what the tree looks like below. What comes
+                // back is the exact order upstream would have walked in,
+                // including `node`'s own place among its children — a
+                // subsurface may sit below its parent, and that position
+                // lives in a child list this crate cannot read directly.
+                let mark = pending.len();
+                compositor::with_surface_tree_downward(
+                    &node,
+                    location,
+                    |visited, states, location| {
+                        if visited.id() != node.id() {
+                            return TraversalAction::SkipChildren;
+                        }
+                        let mut location = *location;
+                        let data = states.data_map.get::<RendererSurfaceStateUserData>();
+                        if let Some(data) = data {
+                            if let Some(view) = data.lock().unwrap().view() {
+                                location += view.offset.to_f64().to_physical(scale);
+                                TraversalAction::DoChildren(location)
+                            } else {
+                                TraversalAction::SkipChildren
+                            }
+                        } else {
+                            TraversalAction::SkipChildren
+                        }
+                    },
+                    |visited, _, location| {
+                        pending.push(if visited.id() == node.id() {
+                            TreeStep::Draw(node.clone(), *location)
+                        } else {
+                            TreeStep::Descend(visited.clone(), *location)
+                        });
+                    },
+                    |_, _, _| true,
+                );
+                // A stack pops backwards; the level was collected
+                // forwards. Reversing the segment this level just added
+                // makes the pops come out in display order, and leaves
+                // the siblings still queued below it untouched.
+                pending[mark..].reverse();
+            }
+            TreeStep::Draw(node, location) => {
+                let drawn = with_states(&node, |states| {
+                    let mut location = location;
+                    let data = states.data_map.get::<RendererSurfaceStateUserData>();
+                    let has_view = data
+                        .and_then(|data| data.lock().unwrap().view())
+                        .map(|view| {
+                            location += view.offset.to_f64().to_physical(scale);
+                        })
+                        .is_some();
+                    if !has_view {
+                        return None;
+                    }
+                    Some(WaylandSurfaceRenderElement::from_surface(
+                        renderer, &node, states, location, alpha, kind,
+                    ))
+                });
+                match drawn {
+                    Some(Ok(Some(element))) => elements.push(
+                        RescaleRenderElement::from_element(element, tree_origin, factor).into(),
+                    ),
+                    Some(Ok(None)) | None => {}
+                    Some(Err(error)) => tracing::warn!(%error, "failed to import a Wayland surface"),
+                }
+            }
+        }
+    }
+    return_walk_stack(pending);
+}
+
+/// One entry of [`push_surface_tree`]'s explicit walk.
+enum TreeStep {
+    /// Expand this surface's own level: its children, and its own
+    /// position among them.
+    Descend(WlSurface, SPoint<f64, Physical>),
+    /// Emit this surface's element, at the location the walk resolved
+    /// for it.
+    Draw(WlSurface, SPoint<f64, Physical>),
+}
+
+thread_local! {
+    /// Scratch for the walk above, so replacing a recursion with a
+    /// stack does not reintroduce the per-tree allocation the function
+    /// was written to remove. Only the capacity is retained: the stack
+    /// is emptied before it is parked, so no `WlSurface` outlives the
+    /// frame that walked it.
+    ///
+    /// Taken rather than borrowed across the walk. `push_surface_tree`
+    /// is not reentrant and runs on the repaint thread, but a `take`
+    /// costs a pointer swap and makes that a fact about performance
+    /// instead of a `RefCell` panic waiting for the day it stops being
+    /// true.
+    static WALK_STACK: RefCell<Vec<TreeStep>> = const { RefCell::new(Vec::new()) };
+}
+
+fn take_walk_stack() -> Vec<TreeStep> {
+    WALK_STACK.with(|stack| std::mem::take(&mut *stack.borrow_mut()))
+}
+
+fn return_walk_stack(mut stack: Vec<TreeStep>) {
+    stack.clear();
+    WALK_STACK.with(|slot| *slot.borrow_mut() = stack);
+}
+
+/// Pushes one cursor's elements (the pointer's, or a tablet tool's at
+/// its own position), picking the image by what that position is over
+/// ([`crate::input::pointer_subject`]) rather than by the last
+/// `CursorImageStatus` alone. A status is a *statement by a client*, and
+/// it outlives the pointer's visit (no client un-sets a cursor on leave;
+/// leave means it may not), so trusting it everywhere kept LibreOffice's
+/// pointer on screen over the dock and every frame the pointer crossed
+/// after leaving it. So:
+///
+/// - Over client content the client's choice applies. A cursor surface
+///   is drawn offset by its hotspot, which smithay stashes in the
+///   surface's data map. A named shape (`wp_cursor_shape_v1`) is drawn
+///   from the user's Xcursor theme at the output's nominal size, with
+///   the theme's hotspot (see [`crate::cursor_theme`]). `default`, a
+///   shape the theme lacks, and any shape the theme worker has not yet
+///   delivered draw ChonkStep's own arrow.
+/// - Over our frames, the arrow, or the resize double-arrow the frame
+///   asked for through `Backend::set_frame_cursor`.
+/// - Over the desktop and shell surfaces, the arrow.
+///
+/// Frames and the desktop keep the hand-drawn set even while a client's
+/// last status names a shape, so the pointer does not change style at
+/// every window edge. Every reason to draw no cursor at all still comes
+/// first: the IPC-hidden cursor, the compositor's own typing, touch and
+/// idle hide, the capture tool's selection cursor, and `Hidden`, which is
+/// also how a cursorless screencopy asks.
+pub(crate) fn push_cursor_elements(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    location: SPoint<f64, smithay::utils::Logical>,
+    status: &CursorImageStatus,
+    cursors: &crate::state::CursorSet,
+    viewport: Rect,
+) {
+    let capture_cursor = crate::capture_tool::owns_cursor(backend,
+        Point::new(location.x.floor() as i32, location.y.floor() as i32));
+    // Either reason hides it: the IPC-owned flag, or the compositor's own
+    // typing, touch and idle policy (`input::cursor_visibility`).
+    if (backend.cursor_hidden || backend.cursor_visibility.hidden()) && !capture_cursor {
+        return;
+    }
+    // The pointer has one position in global space. Build it in each
+    // output's local coordinates, then retain it only where its pixels
+    // intersect; including an off-screen cursor could otherwise defeat
+    // direct scanout on a monitor the pointer is nowhere near.
+    let offset = SPoint::<f64, smithay::utils::Logical>::from((
+        viewport.pos.x as f64,
+        viewport.pos.y as f64,
+    ));
+    let global = location;
+    let location = location - offset;
+    // `Hidden` stays absolute, over every subject: screencopy relies on
+    // substituting it to capture a cursorless frame (see
+    // `protocols.rs`'s `capture_region`), and a client hiding the
+    // pointer over its own video is the one client statement that must
+    // not be second-guessed while the pointer is there.
+    if matches!(status, CursorImageStatus::Hidden) {
+        return;
+    }
+    if crate::capture_tool::selection_cursor(backend).is_some() { return; }
+    let subject = if capture_cursor {
+        crate::input::PointerSubject::Desktop
+    } else {
+        crate::input::pointer_subject(backend, global)
+    };
+    let sprite = match subject {
+        crate::input::PointerSubject::Client => match status {
+            // "The ordinary pointer" stays ChonkStep's own arrow, so the
+            // style does not change as the pointer crosses onto an app.
+            CursorImageStatus::Named(smithay::input::pointer::CursorIcon::Default) => Some(cursors.arrow()),
+            CursorImageStatus::Named(icon) => {
+                Some(cursors.themed.get(*icon, backend.scale_at(viewport)).unwrap_or_else(|| cursors.arrow()))
+            }
+            _ => None,
+        },
+        crate::input::PointerSubject::Frame(Some(edge)) => Some(cursors.for_edge(edge)),
+        crate::input::PointerSubject::Frame(None) | crate::input::PointerSubject::Desktop => Some(cursors.arrow()),
+    };
+    if let Some(sprite) = sprite {
+        // A sprite, hotspot-corrected: the resize double-arrows mark
+        // their center, not their corner, and drawing them uncorrected
+        // puts the visible crosshair half a glyph below-right of the
+        // edge the user is aiming at; a theme image carries its own.
+        let position = SPoint::<f64, smithay::utils::Logical>::from((
+            location.x - sprite.hotspot.0 as f64,
+            location.y - sprite.hotspot.1 as f64,
+        ))
+        .to_physical(1.0);
+        if !memory_element_reaches_viewport(position.to_i32_round(), sprite.size, viewport.size) {
+            return;
+        }
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            position,
+            &sprite.buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        ) {
+            Ok(element) => elements.push(element.into()),
+            Err(error) => tracing::warn!(?error, "failed to import a compositor cursor"),
+        }
+        return;
+    }
+    match status {
+        CursorImageStatus::Hidden => {}
+        CursorImageStatus::Surface(surface) if surface.alive() => {
+            let hotspot = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<Mutex<CursorImageAttributes>>()
+                    .map(|attrs| attrs.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            // A client cursor is drawn buffer pixel : screen pixel like
+            // every other surface (`push_surface_tree`), never
+            // multiplied by the UI scale on top. The outputs advertise
+            // that scale, so a native client commits its cursor at 2x
+            // into a buffer already sized for it; an Xwayland client
+            // hears `XCURSOR_SIZE` instead (24 x scale,
+            // `chonk_shell::startup::ensure_xcursor_size`) and commits
+            // the same pixels at buffer scale 1. Both land the same
+            // size. The hotspot is surface-local — the client's own
+            // logical units — so it converts by the same committed
+            // factor as the pixels it points into, or a 2x cursor
+            // would click half its arrow's length away from its tip.
+            let cursor_scale = crate::xdg::committed_surface_scale(surface);
+            let hotspot_physical =
+                SPoint::<f64, Physical>::from((hotspot.x as f64 * cursor_scale, hotspot.y as f64 * cursor_scale));
+            let global_position = (global.to_physical(1.0) - hotspot_physical).to_i32_round();
+            if surface_tree_reaches_viewport(
+                surface,
+                Point::new(global_position.x, global_position.y),
+                Rect::new(Point::new(global_position.x, global_position.y), wm_theme_api::Size::default()),
+                cursor_scale,
+                viewport,
+            ) {
+                let position = global_position
+                    - SPoint::<i32, Physical>::from((viewport.pos.x, viewport.pos.y));
+                push_surface_tree(elements, renderer, surface, position, cursor_scale, 1.0, Kind::Cursor);
+            }
+        }
+        _ => {
+            // A client whose cursor surface has died gets the arrow
+            // (named shapes chose their sprite above, and `Hidden`
+            // returned before it). No hotspot offset and no size override:
+            // the arrow's tip is its (0, 0) pixel, and the cursor set
+            // has already rasterized the shape at the UI scale from
+            // that same origin, so the tip stays under the pointer at
+            // every scale. Sizing the element here instead would ask
+            // the GLES renderer to filter a 1-bit shape up, blurring
+            // the halo the arrow reads against dark windows by.
+            let position = location.to_physical(1.0);
+            let arrow = cursors.arrow();
+            if !memory_element_reaches_viewport(position.to_i32_round(), arrow.size, viewport.size) {
+                return;
+            }
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                position,
+                &arrow.buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            ) {
+                Ok(element) => elements.push(element.into()),
+                Err(error) => tracing::warn!(?error, "failed to import the default cursor"),
+            }
+        }
+    }
+}
+
+/// Pushes the drag icon of the client drag in flight — the file
+/// thumbnail or link preview a client handed to `start_drag` — at the
+/// drag's hotspot, so it is carried under the pointer (or the finger)
+/// for the life of the drag. See [`crate::state::DndIcon`].
+///
+/// Application pixels never appear over a lock. Locking already ends
+/// the drag (`reset_client_input_focus`'s `unset_grab` reaches
+/// `dropped`, which clears the ledger entry); the check here is the
+/// second line of defence, for a frame assembled before that ran.
+///
+/// `Kind::Unspecified`, never `Kind::Cursor`: the icon is composited
+/// like any surface, so it cannot compete with the pointer for the
+/// KMS cursor plane or disturb the `CHONKSTEP_NO_CURSOR_PLANE` path.
+/// Being ordinary scene content it is part of every capture that
+/// takes this scene — screencopy with or without its cursor overlay,
+/// the screenshot marker, the capture tool — the way a drag looks on
+/// screen; a per-window capture draws one window's tree and no icon.
+///
+/// It is drawn and never hit-tested: `hit_at` does not walk the
+/// pointer band, the protocol ignores a drag icon's input region, and
+/// the drop target smithay's grab computes must be what is under it.
+pub(crate) fn push_dnd_icon(
+    elements: &mut Vec<SceneElement>,
+    renderer: &mut GlesRenderer,
+    backend: &WaylandBackend,
+    pointer_location: SPoint<f64, Logical>,
+    viewport: Rect,
+    purpose: ScenePurpose,
+) {
+    if backend.locked {
+        return;
+    }
+    let Some(icon) = backend.dnd_icon.as_ref().filter(|icon| icon.surface.alive()) else {
+        return;
+    };
+    if purpose == ScenePurpose::Capture && icon.capture_redacted {
+        return;
+    }
+    // The icon is drawn buffer pixel : screen pixel like the client
+    // cursor, at the density it committed, with the integral-fallback
+    // correction every window gets on a fractional output.
+    let factor = crate::xdg::effective_surface_scale(
+        crate::xdg::committed_surface_scale(&icon.surface),
+        backend.scale_at(viewport),
+    );
+    let origin = dnd_icon_origin(icon.anchor(pointer_location), icon.offset, factor);
+    let global = Point::new(origin.x, origin.y);
+    if !surface_tree_reaches_viewport(
+        &icon.surface,
+        global,
+        Rect::new(global, wm_theme_api::Size::default()),
+        factor,
+        viewport,
+    ) {
+        return;
+    }
+    let position = origin - SPoint::<i32, Physical>::from((viewport.pos.x, viewport.pos.y));
+    push_surface_tree(elements, renderer, &icon.surface, position, factor, 1.0, Kind::Unspecified);
+}
+
+/// Where the icon's (0, 0) lands in global physical pixels: the drag's
+/// hotspot plus the accumulated surface-local offset, converted by the
+/// factor the icon's pixels are drawn at — the conversion the client
+/// cursor's hotspot uses, since both are the client's own logical
+/// units pointing into the same buffer, and a 2x icon offset by 6
+/// must move 12 screen pixels or it drifts from where it was designed
+/// to sit against the pointer.
+pub(crate) fn dnd_icon_origin(
+    anchor: SPoint<f64, Logical>,
+    offset: SPoint<i32, Logical>,
+    factor: f64,
+) -> SPoint<i32, Physical> {
+    let offset = SPoint::<f64, Physical>::from((offset.x as f64 * factor, offset.y as f64 * factor));
+    (anchor.to_physical(1.0) + offset).to_i32_round()
+}
+
+fn memory_element_reaches_viewport(
+    location: SPoint<i32, Physical>,
+    size: wm_theme_api::Size,
+    viewport: wm_theme_api::Size,
+) -> bool {
+    let rect = Rect::new(
+        Point::new(location.x, location.y),
+        size,
+    );
+    overlap_area(rect, Rect::new(Point::new(0, 0), viewport)) > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wm_theme_api::Size;
+
+    #[test]
+    fn viewport_overlap_is_half_open_and_overflow_safe() {
+        let output = Rect::new(Point::new(100, 50), Size::new(1920, 1080));
+        assert_eq!(overlap_area(output, Rect::new(Point::new(2020, 50), Size::new(20, 20))), 0);
+        assert_eq!(overlap_area(output, Rect::new(Point::new(2019, 1129), Size::new(20, 20))), 1);
+        assert_eq!(
+            overlap_area(
+                Rect::new(Point::new(i32::MAX - 4, i32::MAX - 4), Size::new(u32::MAX, u32::MAX)),
+                Rect::new(Point::new(i32::MAX - 2, i32::MAX - 2), Size::new(2, 2)),
+            ),
+            4,
+        );
+    }
+
+    #[test]
+    fn fullscreen_occlusion_is_confined_to_the_intersected_output() {
+        let left = Rect::new(Point::new(0, 0), Size::new(1920, 1080));
+        let right = Rect::new(Point::new(1920, 0), Size::new(1920, 1080));
+        let fullscreen = Rect::new(Point::new(0, 0), Size::new(1920, 1080));
+        assert!(fullscreen_rect_occludes_viewport(fullscreen, left));
+        assert!(!fullscreen_rect_occludes_viewport(fullscreen, right));
+    }
+
+    #[test]
+    fn drag_icon_offset_converts_by_the_icons_own_scale() {
+        let anchor = SPoint::<f64, Logical>::from((100.4, 200.6));
+        // No offset: the icon's corner sits on the hotspot, rounded to a pixel.
+        assert_eq!(dnd_icon_origin(anchor, (0, 0).into(), 1.0), SPoint::<i32, Physical>::from((100, 201)));
+        // A 1x client's offset moves the same number of screen pixels ...
+        assert_eq!(dnd_icon_origin(anchor, (6, -10).into(), 1.0), SPoint::<i32, Physical>::from((106, 191)));
+        // ... a 2x client's twice as many, and a 1.5x client's by the fraction.
+        assert_eq!(dnd_icon_origin(anchor, (6, -10).into(), 2.0), SPoint::<i32, Physical>::from((112, 181)));
+        assert_eq!(dnd_icon_origin(anchor, (6, -10).into(), 1.5), SPoint::<i32, Physical>::from((109, 186)));
+        // The hotspot moves the icon with it, offset unchanged.
+        let moved = SPoint::<f64, Logical>::from((300.0, 50.0));
+        assert_eq!(dnd_icon_origin(moved, (6, -10).into(), 1.0), SPoint::<i32, Physical>::from((306, 40)));
+    }
+
+    #[test]
+    fn disjoint_output_admission_removes_cross_output_duplicates() {
+        let outputs = [
+            Rect::new(Point::new(0, 0), Size::new(1920, 1080)),
+            Rect::new(Point::new(1920, 0), Size::new(1920, 1080)),
+        ];
+        let objects = [
+            Rect::new(Point::new(100, 100), Size::new(800, 600)),
+            Rect::new(Point::new(2200, 100), Size::new(800, 600)),
+        ];
+        let admitted = outputs
+            .iter()
+            .flat_map(|output| objects.iter().filter(move |object| overlap_area(**object, *output) > 0))
+            .count();
+        assert_eq!(admitted, objects.len(), "each disjoint object belongs to one output, not both");
+    }
+}

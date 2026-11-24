@@ -1,0 +1,925 @@
+//! A reusable, stateful cascading-menu controller: owns the popup-window
+//! stack, hover-to-open-submenu hysteresis, and edge-aware cascade
+//! positioning for an arbitrarily-nested [`MenuItem`] tree. Generic over
+//! [`PopupHost`] so any host — the desktop shell's `X11Backend`, or a
+//! future `chonk-ui` app building its own dropdown menu over its own
+//! connection — gets the identical cascade *behavior*, not just the same
+//! item-tree rendering, by implementing that one small trait.
+//! `chonkstep::desktop::Desktop` is this controller's first real caller,
+//! not a parallel reimplementation of it.
+
+use std::time::{Duration, Instant};
+
+use wm_theme_api::{Point, PopupGrab, PopupHost, Rect, Size};
+
+use crate::menu::{self, MenuItem};
+use crate::model::Theme;
+
+/// How long the pointer must dwell over a submenu row before it opens —
+/// matches classic Mac/NeXT menu hysteresis (~200ms in the desktops
+/// this look comes from) so merely sweeping the mouse across a row on
+/// the way to something else doesn't flash every cascade open along the
+/// path.
+pub const SUBMENU_HOVER_DELAY: Duration = Duration::from_millis(180);
+
+/// One level of an open menu/submenu chain — each is its own popup
+/// window, the classic arrangement: cascades are separate top-level
+/// windows positioned beside their parent, not a single window that
+/// grows.
+struct OpenLevel<Id> {
+    window: Id,
+    /// This level's own title: the root level carries the menu's title,
+    /// and every cascade carries the label of the submenu row it opened
+    /// from — the classic behavior titles each cascade after its entry
+    /// ("Applications", "Theme"), never the root title repeated.
+    title: String,
+    items: Vec<MenuItem>,
+    item_rects: Vec<Rect>,
+    highlighted: Option<usize>,
+    geom: Rect,
+    /// Index into the *parent* level's `items` this level cascaded from
+    /// — `None` for the root level.
+    opened_from_item: Option<usize>,
+}
+
+struct PendingSubmenu {
+    level: usize,
+    item_index: usize,
+    hovered_since: Instant,
+}
+
+/// The result of a click that landed on one of this menu's own popups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuClick {
+    /// A submenu row was opened immediately (a fast deliberate click
+    /// beats the hover-open delay) — the chain stays open.
+    OpenedSubmenu,
+    /// An action row fired this id; the whole chain is now closed.
+    Action(u32),
+    /// The click landed inside the popup but not on any item — the
+    /// title strip, or blank space — so the whole chain is now closed
+    /// with no action (transient menus dismiss on any non-item click,
+    /// the way an unpinned classic menu does).
+    Dismissed,
+}
+
+/// A keyboard gesture understood by an open cascade menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Space,
+}
+
+/// Owns zero or more cascaded popup windows for one open menu session.
+/// `Id` is the host's `PopupHost::PopupId`.
+pub struct CascadeMenu<Id> {
+    title: String,
+    background: (u8, u8, u8),
+    /// Whether the ROOT level renders the posted-menu close box (set
+    /// per `open`; cascades never carry one — closing the root closes
+    /// the chain).
+    closable: bool,
+    bounds: Size,
+    levels: Vec<OpenLevel<Id>>,
+    grab: Option<PopupGrab>,
+    pending_submenu: Option<PendingSubmenu>,
+    chrome: Option<crate::UiChrome>,
+}
+
+impl<Id: Copy + Eq + std::fmt::Debug> CascadeMenu<Id> {
+    /// `title` labels every popup's title bar (root and cascades alike —
+    /// matching this SDK's existing single-app-identity menu chrome);
+    /// `background` is the popup window's fallback clear color before
+    /// the first paint.
+    pub fn new(title: impl Into<String>, background: (u8, u8, u8)) -> Self {
+        Self {
+            title: title.into(),
+            background,
+            closable: false,
+            bounds: Size::new(0, 0),
+            levels: Vec::new(),
+            grab: None,
+            pending_submenu: None,
+            chrome: None,
+        }
+    }
+
+    /// Configure the next session after closing the current one. A style
+    /// change cannot reuse the old popup geometry or row hit targets.
+    pub fn set_chrome(&mut self, chrome: Option<crate::UiChrome>) {
+        assert!(!self.is_open(), "close the menu before changing its chrome");
+        self.chrome = chrome;
+    }
+
+    pub fn chrome(&self) -> Option<&crate::UiChrome> { self.chrome.as_ref() }
+
+    fn render(&self, theme: &Theme, fonts: &mut cosmic_text::FontSystem,
+        title: &str, items: &[MenuItem], selected: Option<usize>, closable: bool) -> menu::MenuRender {
+        match &self.chrome {
+            Some(chrome) => chrome.menu(theme, fonts, title, items, selected, closable),
+            None => menu::render_menu(theme, fonts, title, items, selected, closable),
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        !self.levels.is_empty()
+    }
+
+    /// The instant a hovered submenu should open, if one is armed.
+    ///
+    /// Event loops can sleep until this deadline instead of polling the
+    /// controller at display refresh rate. Pointer input still wakes the
+    /// loop immediately; this deadline exists for the quiet case where
+    /// the pointer stops on the row and no later event arrives to open it.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.pending_submenu.as_ref().map(|pending| pending.hovered_since + SUBMENU_HOVER_DELAY)
+    }
+
+    /// Opens (replacing any existing session) a root-level popup at `at`
+    /// and grabs the pointer for the whole session. `bounds` is the
+    /// host's screen/window extent, used to keep later cascades on
+    /// screen.
+    #[allow(clippy::too_many_arguments)] // Popup geometry and rendering state form one atomic host operation.
+    pub fn open<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        items: Vec<MenuItem>,
+        at: Point,
+        bounds: Size,
+        closable: bool,
+    ) {
+        self.close(host);
+        self.closable = closable;
+        self.bounds = bounds;
+        let title = self.title.clone();
+        if let Some(level) = self.open_level(host, theme, font_system, title, items, at, None) {
+            self.levels.push(level);
+            self.grab = Some(host.grab_pointer());
+            host.grab_keyboard();
+        }
+    }
+
+    pub fn close<H: PopupHost<PopupId = Id>>(&mut self, host: &mut H) {
+        self.truncate(host, 0);
+        if let Some(grab) = self.grab.take() {
+            host.ungrab_pointer(grab);
+            host.ungrab_keyboard();
+        }
+    }
+
+    /// Drives the same highlight and activation path as pointer input.
+    /// The deepest open level owns the selection; entering a submenu
+    /// selects its first row, and moving left restores its parent.
+    pub fn key<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        key: MenuKey,
+    ) -> Option<MenuClick> {
+        let level = self.levels.len().checked_sub(1)?;
+        match key {
+            MenuKey::Up | MenuKey::Down => {
+                let len = self.levels[level].items.len();
+                if len == 0 {
+                    return None;
+                }
+                let selected = self.levels[level].highlighted.unwrap_or(0);
+                let next = if key == MenuKey::Down {
+                    (selected + 1) % len
+                } else {
+                    (selected + len - 1) % len
+                };
+                self.levels[level].highlighted = Some(next);
+                self.repaint_level(host, theme, font_system, level);
+                None
+            }
+            MenuKey::Left => {
+                if level > 0 {
+                    self.truncate(host, level);
+                    self.repaint_level(host, theme, font_system, level - 1);
+                }
+                None
+            }
+            MenuKey::Right => self.activate_selection(host, theme, font_system, level, false),
+            MenuKey::Enter | MenuKey::Space => {
+                self.activate_selection(host, theme, font_system, level, true)
+            }
+        }
+    }
+
+    fn activate_selection<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        level: usize,
+        allow_action: bool,
+    ) -> Option<MenuClick> {
+        let selected = self.levels.get(level)?.highlighted?;
+        if self.levels[level].items[selected].is_submenu() {
+            self.open_submenu(host, theme, font_system, level, selected);
+            if let Some(child) = self.levels.get_mut(level + 1) {
+                child.highlighted = (!child.items.is_empty()).then_some(0);
+                self.repaint_level(host, theme, font_system, level + 1);
+            }
+            return Some(MenuClick::OpenedSubmenu);
+        }
+        if !allow_action {
+            return None;
+        }
+        let MenuItem::Action { action, .. } = self.levels[level].items[selected] else {
+            return None;
+        };
+        self.close(host);
+        Some(MenuClick::Action(action))
+    }
+
+    /// If `window` belongs to this menu's chain, resolves a click on it:
+    /// a submenu row opens immediately (for a fast deliberate click that
+    /// beats the hover-open delay), an action row closes the whole chain
+    /// and returns the action id, and a click anywhere else in the popup
+    /// (the title strip, blank space) dismisses the whole chain with no
+    /// action. Returns `None` if `window` isn't one of this menu's own
+    /// popups.
+    pub fn click<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        window: Id,
+        local: Point,
+    ) -> Option<MenuClick> {
+        let level = self.level_for_window(window)?;
+        let hit = self.levels[level].item_rects.iter().position(|r| r.contains(local));
+
+        let Some(hit) = hit else {
+            self.close(host);
+            return Some(MenuClick::Dismissed);
+        };
+
+        if self.levels[level].items[hit].is_submenu() {
+            self.open_submenu(host, theme, font_system, level, hit);
+            return Some(MenuClick::OpenedSubmenu);
+        }
+
+        let MenuItem::Action { action, .. } = self.levels[level].items[hit] else {
+            self.close(host);
+            return Some(MenuClick::Dismissed);
+        };
+        self.close(host);
+        Some(MenuClick::Action(action))
+    }
+
+    /// If `window` belongs to this menu's chain, re-renders that level
+    /// with whichever item is now under the pointer highlighted (a no-op
+    /// if unchanged, so hovering within one row doesn't repaint on every
+    /// pixel of motion) and arms the hover-open hysteresis for a freshly
+    /// hovered submenu row (see `tick`). Deliberately never closes an
+    /// open cascade — see the comment in the body. Returns whether
+    /// `window` belonged to this menu at all.
+    pub fn hover<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        window: Id,
+        local: Point,
+    ) -> bool {
+        let Some(level) = self.level_for_window(window) else {
+            return false;
+        };
+        // While the pointer is inside a cascade, every ancestor level
+        // highlights the row its child opened from — the lit trail the
+        // classic desktop draws through an open chain. Without this, an
+        // ancestor keeps whatever row the pointer last crossed on its
+        // way through (confirmed live: "Exit" sat highlighted on the
+        // root while the pointer browsed Applications > Internet),
+        // which misreads as the selection.
+        for l in 0..level {
+            let parent_row = self.levels[l + 1].opened_from_item;
+            if self.levels[l].highlighted != parent_row {
+                self.levels[l].highlighted = parent_row;
+                self.repaint_level(host, theme, font_system, l);
+            }
+        }
+        let hovered = self.levels[level].item_rects.iter().position(|r| r.contains(local));
+        if hovered == self.levels[level].highlighted {
+            let child_belongs_to = self.levels.get(level + 1).and_then(|c| c.opened_from_item);
+            let already_pending = self.pending_submenu.as_ref().is_some_and(|pending| {
+                pending.level == level && pending.item_index == hovered.unwrap_or(usize::MAX)
+            });
+            if !already_pending {
+                self.pending_submenu = match hovered {
+                    Some(i)
+                        if self.levels[level].items[i].is_submenu()
+                            && child_belongs_to != Some(i) =>
+                    {
+                        Some(PendingSubmenu {
+                            level,
+                            item_index: i,
+                            hovered_since: Instant::now(),
+                        })
+                    }
+                    _ => None,
+                };
+            }
+            return true;
+        }
+        self.levels[level].highlighted = hovered;
+        self.repaint_level(host, theme, font_system, level);
+
+        // An open cascade STAYS open while the pointer wanders — a
+        // posted menu classically never closes on hover-away, and that
+        // is load-bearing ergonomics, not laziness: the natural
+        // diagonal path from a parent row into its cascade crosses the
+        // parent's other rows, and closing the cascade on the first
+        // crossed row (this controller's original behavior) made deep
+        // menus nearly untraversable — the user's pointer "lost the
+        // menu" on every second-level trip (reported exactly so). A
+        // cascade is replaced only by deliberately opening a sibling
+        // (hover-dwell on it, or a click), and closed only with its
+        // parent chain.
+        let child_belongs_to = self.levels.get(level + 1).and_then(|c| c.opened_from_item);
+        self.pending_submenu = match hovered {
+            Some(i) if self.levels[level].items[i].is_submenu() && child_belongs_to != Some(i) => {
+                Some(PendingSubmenu { level, item_index: i, hovered_since: Instant::now() })
+            }
+            _ => None,
+        };
+        true
+    }
+
+    fn repaint_level<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        level: usize,
+    ) {
+        let closable = self.levels[level].opened_from_item.is_none() && self.closable;
+        let render = self.render(
+            theme,
+            font_system,
+            &self.levels[level].title,
+            &self.levels[level].items,
+            self.levels[level].highlighted,
+            closable,
+        );
+        host.paint_popup(self.levels[level].window, &render.buffer);
+    }
+
+    /// Opens whatever submenu has been hovered long enough — call once
+    /// per event-loop tick (like a clock tick) so a submenu still opens
+    /// even if the pointer stops moving entirely once it lands on the
+    /// row, not just on the next motion event.
+    pub fn tick<H: PopupHost<PopupId = Id>>(&mut self, host: &mut H, theme: &Theme, font_system: &mut cosmic_text::FontSystem) {
+        let Some(pending) = &self.pending_submenu else {
+            return;
+        };
+        if pending.hovered_since.elapsed() < SUBMENU_HOVER_DELAY {
+            return;
+        }
+        let (level, item_index) = (pending.level, pending.item_index);
+        self.pending_submenu = None;
+        self.open_submenu(host, theme, font_system, level, item_index);
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors `open`; wrapping these transient values would obscure the cascade flow.
+    fn open_level<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        title: String,
+        items: Vec<MenuItem>,
+        at: Point,
+        opened_from_item: Option<usize>,
+    ) -> Option<OpenLevel<Id>> {
+        let closable = opened_from_item.is_none() && self.closable;
+        let render = self.render(theme, font_system, &title, &items, None, closable);
+        if render.buffer.width == 0 || render.buffer.height == 0 || render.item_rects.len() != items.len() {
+            return None;
+        }
+        let geom = Rect { pos: at, size: Size::new(render.buffer.width, render.buffer.height) };
+        let window = host.create_popup(geom, self.background)?;
+        host.paint_popup(window, &render.buffer);
+        let highlighted = (!items.is_empty()).then_some(0);
+        if highlighted.is_some() {
+            let render =
+                self.render(theme, font_system, &title, &items, highlighted, closable);
+            host.paint_popup(window, &render.buffer);
+        }
+        Some(OpenLevel {
+            window,
+            title,
+            items,
+            item_rects: render.item_rects,
+            highlighted,
+            geom,
+            opened_from_item,
+        })
+    }
+
+    /// Opens a submenu cascading from `item_index` in level
+    /// `parent_level`, positioned beside the parent: to its right,
+    /// flipping to the left if that would run off the screen's right
+    /// edge, row-aligned with the item it cascades from and clamped so
+    /// it doesn't run off the bottom — the classic cascade placement,
+    /// including its flip-to-the-left rule.
+    fn open_submenu<H: PopupHost<PopupId = Id>>(
+        &mut self,
+        host: &mut H,
+        theme: &Theme,
+        font_system: &mut cosmic_text::FontSystem,
+        parent_level: usize,
+        item_index: usize,
+    ) {
+        // Anything deeper than the item we're cascading from is stale —
+        // destroy it before creating the new one, or its window leaks
+        // (found via visual testing: a stale submenu window left behind
+        // after hovering back to a sibling item).
+        self.truncate(host, parent_level + 1);
+
+        let Some(parent) = self.levels.get(parent_level) else {
+            return;
+        };
+        let MenuItem::Submenu { label, items } = parent.items[item_index].clone() else {
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+
+        let menu_width = parent.geom.size.w;
+        let mut x = parent.geom.pos.x + parent.geom.size.w as i32;
+        if x + menu_width as i32 > self.bounds.w as i32 {
+            x = (parent.geom.pos.x - menu_width as i32).max(0);
+        }
+        let mut y = parent.geom.pos.y + parent.item_rects[item_index].pos.y;
+        let approx_height = parent.item_rects.first().map(|r| r.size.h).unwrap_or(20) * (items.len() as u32 + 1);
+        if y + approx_height as i32 > self.bounds.h as i32 {
+            y = (self.bounds.h as i32 - approx_height as i32).max(0);
+        }
+
+        // The cascade titles itself after the row it opened from — the
+        // classic naming for submenus.
+        if let Some(level) = self.open_level(host, theme, font_system, label, items, Point::new(x, y), Some(item_index)) {
+            self.levels.push(level);
+        }
+    }
+
+    /// Drops every level from `len` onward, destroying each one's popup
+    /// window first — dropping the tracking struct alone would leak an
+    /// orphaned popup that stays on screen forever.
+    fn truncate<H: PopupHost<PopupId = Id>>(&mut self, host: &mut H, len: usize) {
+        while self.levels.len() > len {
+            if let Some(level) = self.levels.pop() {
+                host.destroy_popup(level.window);
+            }
+        }
+        self.pending_submenu = None;
+    }
+
+    fn level_for_window(&self, window: Id) -> Option<usize> {
+        self.levels.iter().position(|level| level.window == window)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::default_theme::nextstep_classic;
+    use std::collections::HashSet;
+    use std::thread;
+    use wm_theme_api::DecorationBuffer;
+
+    #[derive(Default)]
+    struct FakeHost {
+        fail_create: bool,
+        next_id: u32,
+        open: HashSet<u32>,
+        /// Last buffer painted into each popup, keyed by popup id — lets
+        /// tests assert *what* a popup shows, not just that it exists.
+        painted: std::collections::HashMap<u32, DecorationBuffer>,
+        destroyed_total: u32,
+        grabs: u32,
+        ungrabs: u32,
+        keyboard_grabs: u32,
+        keyboard_ungrabs: u32,
+    }
+
+    impl PopupHost for FakeHost {
+        type PopupId = u32;
+
+        fn create_popup(&mut self, _geometry: Rect, _background: (u8, u8, u8)) -> Option<u32> {
+            if self.fail_create { return None; }
+            self.next_id += 1;
+            self.open.insert(self.next_id);
+            Some(self.next_id)
+        }
+
+        fn destroy_popup(&mut self, popup: u32) {
+            self.open.remove(&popup);
+            self.destroyed_total += 1;
+        }
+
+        fn paint_popup(&mut self, popup: u32, buffer: &DecorationBuffer) {
+            self.painted.insert(popup, buffer.clone());
+        }
+
+        fn grab_pointer(&mut self) -> PopupGrab {
+            self.grabs += 1;
+            PopupGrab(0)
+        }
+
+        fn ungrab_pointer(&mut self, _grab: PopupGrab) {
+            self.ungrabs += 1;
+        }
+
+        fn grab_keyboard(&mut self) {
+            self.keyboard_grabs += 1;
+        }
+
+        fn ungrab_keyboard(&mut self) {
+            self.keyboard_ungrabs += 1;
+        }
+    }
+
+    fn action(label: &str, action: u32) -> MenuItem {
+        MenuItem::Action { label: label.to_string(), action }
+    }
+
+    fn submenu(label: &str, items: Vec<MenuItem>) -> MenuItem {
+        MenuItem::Submenu { label: label.to_string(), items }
+    }
+
+    /// Inside the title strip, above every item row — a guaranteed
+    /// miss. `(2, 2)` rather than the very corner so it stays inside
+    /// the popup (and inside the title, not the border) at any scale.
+    fn title_bar_point() -> Point {
+        Point::new(2, 2)
+    }
+
+    struct Fixture {
+        theme: Theme,
+        font_system: cosmic_text::FontSystem,
+        host: FakeHost,
+        cascade: CascadeMenu<u32>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                theme: nextstep_classic(),
+                font_system: cosmic_text::FontSystem::new(),
+                host: FakeHost::default(),
+                cascade: CascadeMenu::new("chonkstep", (0, 0, 0)),
+            }
+        }
+
+        fn open(&mut self, items: Vec<MenuItem>) {
+            self.cascade.open(&mut self.host, &self.theme, &mut self.font_system, items, Point::new(0, 0), Size::new(1600, 1000), false);
+        }
+
+        /// Center of item row `index` — computed from a real render of
+        /// the same items, so these tests stay honest about where rows
+        /// actually are as the menu's layout recipe evolves (titlebar-
+        /// height title strip, frame border) instead of hardcoding it.
+        fn row_point(&mut self, items: &[MenuItem], index: usize) -> Point {
+            let render = menu::render_menu(&self.theme, &mut self.font_system, "chonkstep", items, None, false);
+            let rect = render.item_rects[index];
+            Point::new(rect.pos.x + rect.size.w as i32 / 2, rect.pos.y + rect.size.h as i32 / 2)
+        }
+
+        fn click(&mut self, window: u32, local: Point) -> Option<MenuClick> {
+            self.cascade.click(&mut self.host, &self.theme, &mut self.font_system, window, local)
+        }
+
+        fn hover(&mut self, window: u32, local: Point) -> bool {
+            self.cascade.hover(&mut self.host, &self.theme, &mut self.font_system, window, local)
+        }
+
+        fn tick(&mut self) {
+            self.cascade.tick(&mut self.host, &self.theme, &mut self.font_system);
+        }
+
+        fn key(&mut self, key: MenuKey) -> Option<MenuClick> {
+            self.cascade
+                .key(&mut self.host, &self.theme, &mut self.font_system, key)
+        }
+
+        fn only_open_window(&self) -> u32 {
+            assert_eq!(self.host.open.len(), 1, "expected exactly one open popup");
+            *self.host.open.iter().next().unwrap()
+        }
+    }
+
+    #[test]
+    fn opening_creates_exactly_one_popup_and_grabs_input() {
+        let mut f = Fixture::new();
+        f.open(vec![action("Terminal", 1)]);
+
+        assert_eq!(f.host.open.len(), 1);
+        assert_eq!(f.host.grabs, 1);
+        assert_eq!(f.host.keyboard_grabs, 1);
+        assert!(f.cascade.is_open());
+    }
+
+    #[test]
+    fn failed_or_unrepresentable_popups_never_take_invisible_input_grabs() {
+        let mut f = Fixture::new();
+        f.host.fail_create = true;
+        f.open(vec![action("Terminal", 7)]);
+        assert!(!f.cascade.is_open());
+        assert_eq!((f.host.grabs, f.host.keyboard_grabs), (0, 0));
+        assert_eq!(f.key(MenuKey::Enter), None);
+
+        f.host.fail_create = false;
+        f.cascade.set_chrome(Some(crate::UiChrome::new(&f.theme, crate::FontState::new(),
+            wm_theme_api::DecorationStyle::System7, 1.0)));
+        f.open(vec![action("Unrepresentable menu", 99); 1000]);
+        assert!(!f.cascade.is_open());
+        assert!(f.host.open.is_empty());
+        assert_eq!((f.host.grabs, f.host.keyboard_grabs), (0, 0));
+        assert_eq!(f.key(MenuKey::Enter), None, "clipped rows must not remain keyboard-activatable");
+    }
+
+    #[test]
+    fn historical_cascades_use_their_painted_rows_and_release_every_popup_and_grab() {
+        for style in [wm_theme_api::DecorationStyle::System7, wm_theme_api::DecorationStyle::BeOS, wm_theme_api::DecorationStyle::OS2Warp] {
+            for scale in [1.0, 2.0] {
+                let mut f = Fixture::new();
+                f.theme = f.theme.scaled(scale);
+                f.cascade.set_chrome(Some(crate::UiChrome::new(&f.theme, crate::FontState::new(),
+                    style, scale)));
+                f.open(vec![action("Terminal", 7), submenu("Applications", vec![action("Notes", 42)])]);
+                let row = f.cascade.levels[0].item_rects[1];
+                let parent = f.only_open_window();
+                assert_eq!(f.click(parent, Point::new(row.pos.x + 2, row.pos.y + 2)), Some(MenuClick::OpenedSubmenu));
+                assert_eq!(f.cascade.levels.len(), 2);
+                let child = f.cascade.levels[1].window;
+                let row = f.cascade.levels[1].item_rects[0];
+                assert_eq!(f.click(child, Point::new(row.pos.x + 2, row.pos.y + 2)), Some(MenuClick::Action(42)));
+                assert!(f.host.open.is_empty());
+                assert_eq!(f.host.grabs, f.host.ungrabs);
+                assert_eq!(f.host.keyboard_grabs, f.host.keyboard_ungrabs);
+                f.cascade.set_chrome(None);
+                f.open(vec![action("WindowMaker again", 9)]);
+                assert_eq!(f.key(MenuKey::Enter), Some(MenuClick::Action(9)));
+                assert!(f.host.open.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_reaches_actions_and_nested_submenus_without_a_pointer() {
+        let mut f = Fixture::new();
+        f.open(vec![
+            action("First", 1),
+            submenu(
+                "Applications",
+                vec![action("Editor", 20), action("Terminal", 21)],
+            ),
+            action("Exit", 3),
+        ]);
+
+        assert_eq!(f.key(MenuKey::Down), None);
+        assert_eq!(f.key(MenuKey::Right), Some(MenuClick::OpenedSubmenu));
+        assert_eq!(f.host.open.len(), 2);
+        assert_eq!(f.key(MenuKey::Down), None);
+        assert_eq!(f.key(MenuKey::Enter), Some(MenuClick::Action(21)));
+        assert!(!f.cascade.is_open());
+        assert_eq!(f.host.keyboard_ungrabs, 1);
+    }
+
+    #[test]
+    fn left_returns_to_the_parent_and_space_activates_its_selection() {
+        let mut f = Fixture::new();
+        f.open(vec![
+            submenu("Apps", vec![action("Editor", 7)]),
+            action("Exit", 9),
+        ]);
+        assert_eq!(f.key(MenuKey::Enter), Some(MenuClick::OpenedSubmenu));
+        assert_eq!(f.key(MenuKey::Left), None);
+        assert_eq!(f.host.open.len(), 1);
+        assert_eq!(f.key(MenuKey::Down), None);
+        assert_eq!(f.key(MenuKey::Space), Some(MenuClick::Action(9)));
+    }
+
+    #[test]
+    fn clicking_a_miss_dismisses_the_whole_chain_and_destroys_every_popup() {
+        // Regression test: clicking inside the popup but outside every
+        // item row (the close box, or blank space) previously did
+        // nothing at all instead of closing the menu.
+        let mut f = Fixture::new();
+        f.open(vec![action("Terminal", 1)]);
+        let window = f.only_open_window();
+
+        let result = f.click(window, title_bar_point());
+
+        assert_eq!(result, Some(MenuClick::Dismissed));
+        assert!(!f.cascade.is_open());
+        assert!(f.host.open.is_empty(), "dismissing must destroy the popup, not just forget it");
+        assert_eq!(f.host.ungrabs, 1, "dismissing must release the pointer grab");
+    }
+
+    #[test]
+    fn clicking_an_action_row_closes_the_menu_and_returns_its_action_id() {
+        let mut f = Fixture::new();
+        let items = vec![action("Terminal", 42)];
+        f.open(items.clone());
+        let window = f.only_open_window();
+        let row = f.row_point(&items, 0);
+
+        let result = f.click(window, row);
+
+        assert_eq!(result, Some(MenuClick::Action(42)));
+        assert!(!f.cascade.is_open());
+        assert!(f.host.open.is_empty());
+    }
+
+    #[test]
+    fn clicking_an_unrelated_window_is_ignored() {
+        let mut f = Fixture::new();
+        f.open(vec![action("Terminal", 1)]);
+
+        let result = f.click(999, Point::new(0, 0));
+
+        assert_eq!(result, None);
+        assert!(f.cascade.is_open(), "an unrelated window's click must not affect this menu");
+    }
+
+    #[test]
+    fn clicking_a_submenu_row_opens_a_second_popup_without_closing() {
+        let mut f = Fixture::new();
+        let items = vec![submenu("Applications", vec![action("About", 2)])];
+        f.open(items.clone());
+        let root = f.only_open_window();
+        let row = f.row_point(&items, 0);
+
+        let result = f.click(root, row);
+
+        assert_eq!(result, Some(MenuClick::OpenedSubmenu));
+        assert!(f.cascade.is_open());
+        assert_eq!(f.host.open.len(), 2, "root and its submenu should both be open");
+    }
+
+    #[test]
+    fn opening_a_second_submenu_destroys_the_first_before_creating_the_second() {
+        // Regression test for the leaked-popup bug: replacing an open
+        // submenu (clicking a different submenu row on the same parent)
+        // must destroy the stale one first, never leaving two cascades
+        // open from the same parent level.
+        let mut f = Fixture::new();
+        let items = vec![
+            submenu("Applications", vec![action("About", 2)]),
+            submenu("Utilities", vec![action("Terminal", 3)]),
+        ];
+        f.open(items.clone());
+        let root = f.only_open_window();
+        let row0 = f.row_point(&items, 0);
+        let row1 = f.row_point(&items, 1);
+
+        f.click(root, row0);
+        assert_eq!(f.host.open.len(), 2, "first submenu open");
+        let destroyed_before = f.host.destroyed_total;
+
+        f.click(root, row1);
+
+        assert_eq!(f.host.open.len(), 2, "still exactly root + one submenu, never three");
+        assert_eq!(f.host.destroyed_total, destroyed_before + 1, "the first submenu's popup must be destroyed");
+    }
+
+    /// Each cascade is titled after the row it opened from
+    /// ("Applications"), never the root menu's own title repeated.
+    #[test]
+    fn a_cascade_titles_itself_after_its_submenu_label() {
+        let mut f = Fixture::new();
+        let sub_items = vec![action("About", 2)];
+        let items = vec![submenu("Applications", sub_items.clone())];
+        f.open(items.clone());
+        let root = f.only_open_window();
+
+        let row = f.row_point(&items, 0);
+        f.click(root, row);
+
+        let child = *f.host.open.iter().find(|w| **w != root).expect("submenu popup open");
+        let painted = f.host.painted.get(&child).expect("submenu was painted").clone();
+        let expected = menu::render_menu(
+            &f.theme,
+            &mut f.font_system,
+            "Applications",
+            &sub_items,
+            Some(0),
+            false,
+        );
+        let wrong = menu::render_menu(&f.theme, &mut f.font_system, "chonkstep", &sub_items, None, false);
+        assert_eq!(painted, expected.buffer, "cascade must be titled by its submenu label");
+        assert_ne!(painted, wrong.buffer, "the two titles must actually render differently");
+    }
+
+    #[test]
+    fn hovering_a_submenu_row_does_not_open_it_before_the_delay_elapses() {
+        let mut f = Fixture::new();
+        let items = vec![submenu("Applications", vec![action("About", 2)])];
+        f.open(items.clone());
+        let root = f.only_open_window();
+        let row = f.row_point(&items, 0);
+
+        assert!(f.hover(root, row));
+        f.tick();
+
+        assert_eq!(f.host.open.len(), 1, "must not open before SUBMENU_HOVER_DELAY elapses");
+    }
+
+    #[test]
+    fn a_hovered_submenu_publishes_its_exact_wakeup_deadline() {
+        let mut f = Fixture::new();
+        let items = vec![submenu("Applications", vec![action("About", 2)])];
+        f.open(items.clone());
+        assert!(f.cascade.next_deadline().is_none(), "an open menu with no pending hover owns no timer");
+
+        let root = f.only_open_window();
+        let row = f.row_point(&items, 0);
+        let before = Instant::now();
+        f.hover(root, row);
+        let after = Instant::now();
+        let deadline = f.cascade.next_deadline().expect("hovering a submenu arms its dwell timer");
+
+        assert!(deadline >= before + SUBMENU_HOVER_DELAY);
+        assert!(deadline <= after + SUBMENU_HOVER_DELAY);
+    }
+
+    #[test]
+    fn hovering_a_submenu_row_opens_it_after_the_delay_elapses() {
+        let mut f = Fixture::new();
+        let items = vec![submenu("Applications", vec![action("About", 2)])];
+        f.open(items.clone());
+        let root = f.only_open_window();
+        let row = f.row_point(&items, 0);
+
+        f.hover(root, row);
+        thread::sleep(SUBMENU_HOVER_DELAY + Duration::from_millis(60));
+        f.tick();
+
+        assert_eq!(f.host.open.len(), 2, "hover-open should have cascaded the submenu");
+    }
+
+    /// The ergonomics fix the classic posted menu embodies: the natural
+    /// diagonal path from a parent row into its cascade crosses the
+    /// parent's other rows, so hovering them must NOT close the open
+    /// cascade — the original hover-away truncation made deep menus
+    /// nearly untraversable (the pointer "lost the menu" on every
+    /// second-level trip).
+    #[test]
+    fn hovering_other_rows_leaves_the_open_cascade_alone() {
+        let mut f = Fixture::new();
+        let items = vec![submenu("Applications", vec![action("About", 2)]), action("Exit", 9)];
+        f.open(items.clone());
+        let root = f.only_open_window();
+        let submenu_row = f.row_point(&items, 0);
+        let exit_row = f.row_point(&items, 1);
+
+        f.click(root, submenu_row);
+        assert_eq!(f.host.open.len(), 2);
+
+        f.hover(root, exit_row);
+        f.tick();
+
+        assert_eq!(f.host.open.len(), 2, "wandering over a plain row must not close the cascade");
+    }
+
+    /// Deliberately dwelling on a *sibling* submenu row still swaps the
+    /// cascade — persistence must not make the first-opened cascade
+    /// permanent.
+    #[test]
+    fn dwelling_on_a_sibling_submenu_row_swaps_the_cascade() {
+        let mut f = Fixture::new();
+        let items = vec![
+            submenu("Applications", vec![action("About", 2)]),
+            submenu("Utilities", vec![action("Terminal", 3)]),
+        ];
+        f.open(items.clone());
+        let root = f.only_open_window();
+        let row0 = f.row_point(&items, 0);
+        let row1 = f.row_point(&items, 1);
+
+        f.click(root, row0);
+        assert_eq!(f.host.open.len(), 2);
+        let destroyed_before = f.host.destroyed_total;
+
+        f.hover(root, row1);
+        thread::sleep(SUBMENU_HOVER_DELAY + Duration::from_millis(60));
+        f.tick();
+
+        assert_eq!(f.host.open.len(), 2, "still root + exactly one cascade");
+        assert_eq!(f.host.destroyed_total, destroyed_before + 1, "the first cascade must have been replaced");
+    }
+}

@@ -1,0 +1,1210 @@
+//! XWayland geometry and pointer coordinates against a real nested session.
+//!
+//! The compositor stores and renders in physical pixels even when an output
+//! advertises scale 2. XWayland is both a Wayland client and an X server, so
+//! this is the one boundary where an accidental physical/logical conversion
+//! can leave the picture, the X window, and delivered button coordinates
+//! describing three different rectangles. A raw x11rb client makes every
+//! side observable without depending on a toolkit's own scaling policy.
+
+use std::time::Duration;
+
+use chonk_testkit::{poll_until, profile_binary, session_dir, Session, SessionOptions, WindowInfo};
+use x11rb::connection::Connection as _;
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ClientMessageEvent, ConnectionExt as _, CreateWindowAux, EventMask,
+    WindowClass,
+};
+use x11rb::protocol::Event;
+use x11rb::wrapper::ConnectionExt as _;
+use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT};
+
+const EVENT: Duration = Duration::from_secs(10);
+const TITLE: &str = "xwayland-input-probe";
+
+#[test]
+#[ignore = "needs a nested Wayland session: scripts/e2e.sh --headless --release"]
+fn fullscreen_publishes_border_changes_before_a_settled_resize() {
+    use x11rb::protocol::xproto::PropMode;
+
+    for scale in [1.0, 1.5, 2.0] {
+        let mut session = Session::boot(&format!("x11-fullscreen-borders-{scale}"), SessionOptions {
+            scale: Some(scale),
+            ..Default::default()
+        }).unwrap();
+        let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", xwayland_display(&session)))).unwrap();
+        let root = conn.setup().roots[screen_num].root;
+        let xid = conn.generate_id().unwrap();
+        conn.create_window(COPY_DEPTH_FROM_PARENT, xid, root, 40, 30, 400, 240, 0,
+            WindowClass::INPUT_OUTPUT, COPY_FROM_PARENT,
+            &CreateWindowAux::new().background_pixel(0x406080)
+                .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE)).unwrap();
+        conn.change_property8(PropMode::REPLACE, xid, AtomEnum::WM_NAME, AtomEnum::STRING,
+            b"SDL fullscreen border handshake").unwrap();
+        conn.map_window(xid).unwrap();
+        conn.flush().unwrap();
+        let extents = intern(&conn, b"_NET_FRAME_EXTENTS");
+        let net_state = intern(&conn, b"_NET_WM_STATE");
+        let fullscreen = intern(&conn, b"_NET_WM_STATE_FULLSCREEN");
+        let original = poll_until(EVENT, "the decorated X11 window's borders", || {
+            let values = property_values(&conn, xid, extents, AtomEnum::CARDINAL.into());
+            (values.len() == 4 && values[2] > 0).then_some(values)
+        }).unwrap();
+        session.door().barrier().unwrap();
+        let world = session.world().unwrap();
+        let output = (world.output_w, world.output_h);
+
+        // SDL holds back size events until the WM announces the new borders.
+        // Assert both halves on the actual X wire, including the event order;
+        // checking the compositor's fullscreen rectangle alone missed Steam's
+        // browser staying at its old size inside a fullscreen X window.
+        for enter in [true, false, true, false] {
+            while conn.poll_for_event().unwrap().is_some() {}
+            conn.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                ClientMessageEvent::new(32, xid, net_state,
+                    [u32::from(enter), fullscreen, 0, 1, 0])).unwrap();
+            conn.flush().unwrap();
+            let expected_extents = if enter { vec![0; 4] } else { original.clone() };
+            let expected_size = if enter { output } else { (400, 240) };
+            let mut borders_announced = false;
+            poll_until(EVENT, "a resize after the fullscreen border transition", || {
+                while let Some(event) = conn.poll_for_event().ok()? {
+                    match event {
+                        Event::PropertyNotify(event) if event.atom == extents => {
+                            borders_announced = property_values(&conn, xid, extents, AtomEnum::CARDINAL.into()) == expected_extents;
+                        }
+                        Event::ConfigureNotify(event) if borders_announced
+                            && (u32::from(event.width), u32::from(event.height)) == expected_size => {
+                            let states = property_values(&conn, xid, net_state, AtomEnum::ATOM.into());
+                            if states.contains(&fullscreen) == enter { return Some(()); }
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }).unwrap_or_else(|error| panic!("{error}; enter={enter}, scale={scale}\n{}", session.log()));
+            let geometry = conn.get_geometry(xid).unwrap().reply().unwrap();
+            assert_eq!((u32::from(geometry.width), u32::from(geometry.height)), expected_size);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a nested Wayland session: scripts/e2e.sh --headless --release"]
+fn x11_autostart_connects_to_the_nested_display_before_the_first_dispatch() {
+    let probe = profile_binary("chonk-x11-autostart-probe").expect("probe is built");
+    let marker = session_dir("x11-autostart").join("inherited-display");
+    let mut session = Session::boot("x11-autostart", SessionOptions {
+        config_extra: format!("autostart = [[{:?}, {:?}, \"check-scale-env\"]]\n", probe, marker),
+        // A nested compositor must replace even a stale inherited X11
+        // display. Using an invalid number also keeps the regression
+        // incapable of opening its window on the real desktop.
+        env: vec![
+            ("DISPLAY".into(), ":65534".into()),
+            ("GDK_SCALE".into(), "2".into()),
+            ("GDK_DPI_SCALE".into(), "1.5".into()),
+        ],
+        ..Default::default()
+    }).expect("nested session boots");
+    let expected = format!("DISPLAY=:{}\n", xwayland_display(&session));
+    poll_until(EVENT, "the X11 autostart client to report its inherited display", || {
+        std::fs::read_to_string(&marker).ok().filter(|value| *value == expected)
+    }).unwrap_or_else(|error| panic!("{error}; compositor log:\n{}", session.log()));
+    // X11's map-time identity currently lives on its Smithay surface,
+    // not the test-door record. This isolated session starts one client.
+    poll_until(EVENT, "the autostart window to map inside this compositor", || {
+        session.world().ok()?.windows.into_iter().find(|window| window.mapped)
+    }).expect("the autostart window maps inside this compositor");
+}
+
+/// EWMH asks the window manager to honour `_NET_WM_STATE` when a withdrawn
+/// window is mapped. An SDL game or a player created fullscreen writes the
+/// state before its map request, so the window must open covering the
+/// output rather than at the 400x200 it was created at.
+#[test]
+#[ignore = "needs a nested Wayland session: scripts/e2e.sh --headless --release"]
+fn an_x11_window_that_wrote_fullscreen_before_mapping_opens_fullscreen() {
+    let probe = profile_binary("chonk-x11-autostart-probe").expect("probe is built");
+    let marker = session_dir("x11-premap-fullscreen").join("inherited-display");
+    let mut session = Session::boot("x11-premap-fullscreen", SessionOptions {
+        scale: Some(1.0),
+        config_extra: format!("hyprland_config = false\nautostart = [[{:?}, {:?}, \"fullscreen-before-map\"]]\n", probe, marker),
+        // An invalid inherited display keeps this incapable of opening on
+        // the real desktop, as in the autostart test above.
+        env: vec![("DISPLAY".into(), ":65534".into())],
+        ..Default::default()
+    }).expect("nested session boots");
+    poll_until(EVENT, "the X11 window to open covering the output", || {
+        let world = session.world().ok()?;
+        world
+            .windows
+            .iter()
+            .any(|window| window.mapped && (window.x, window.y, window.w, window.h) == (0, 0, world.output_w, world.output_h))
+            .then_some(())
+    })
+    .unwrap_or_else(|error| {
+        panic!("{error}\n{:?}\n{}", session.world().ok().map(|world| world.windows), session.log())
+    });
+}
+
+fn xwayland_display(session: &Session) -> u32 {
+    poll_until(EVENT, "XWayland to announce its display", || {
+        let log = session.log();
+        let line = log.lines().find(|line| line.contains("XWayland ready"))?;
+        line.split("display=").nth(1)?.trim().parse().ok()
+    })
+    .expect("the nested session starts XWayland")
+}
+
+fn ewmh_display(session: &Session) -> u32 {
+    poll_until(EVENT, "the XWayland EWMH connection to become ready", || {
+        let log = session.log();
+        let line = log
+            .lines()
+            .find(|line| line.contains("EWMH ready on the XWayland root"))?;
+        line.split("display=").nth(1)?.trim().parse().ok()
+    })
+    .expect("the nested session starts its XWayland EWMH connection")
+}
+
+fn intern(conn: &x11rb::rust_connection::RustConnection, name: &[u8]) -> Atom {
+    conn.intern_atom(false, name).unwrap().reply().unwrap().atom
+}
+
+fn property_values(
+    conn: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    property: Atom,
+    property_type: Atom,
+) -> Vec<u32> {
+    conn.get_property(false, window, property, property_type, 0, u32::MAX)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .value32()
+        .map(|values| values.collect())
+        .unwrap_or_default()
+}
+
+fn resource_manager(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: u32,
+) -> Option<Vec<u8>> {
+    let reply = conn
+        .get_property(
+            false,
+            root,
+            AtomEnum::RESOURCE_MANAGER,
+            AtomEnum::STRING,
+            0,
+            u32::MAX,
+        )
+        .ok()?
+        .reply()
+        .ok()?;
+    (reply.type_ == u32::from(AtomEnum::STRING) && reply.format == 8).then_some(reply.value)
+}
+
+fn assert_x11_rect(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: u32,
+    xid: u32,
+    drawn: &WindowInfo,
+) {
+    let expected = (
+        drawn.x as i16,
+        drawn.y as i16,
+        drawn.w as u16,
+        drawn.h as u16,
+    );
+    let observed = poll_until(
+        EVENT,
+        "XWayland to apply the compositor's content rectangle",
+        || {
+            let geometry = conn.get_geometry(xid).ok()?.reply().ok()?;
+            let translated = conn
+                .translate_coordinates(xid, root, 0, 0)
+                .ok()?
+                .reply()
+                .ok()?;
+            let observed = (
+                translated.dst_x,
+                translated.dst_y,
+                geometry.width,
+                geometry.height,
+            );
+            (observed == expected).then_some(observed)
+        },
+    )
+    .unwrap_or_else(|timeout| panic!("{timeout}; expected {expected:?}"));
+    assert_eq!(
+        observed, expected,
+        "the X server and compositor must describe one content rectangle"
+    );
+}
+
+fn next_button_press(conn: &x11rb::rust_connection::RustConnection) -> (i16, i16, i16, i16) {
+    poll_until(EVENT, "the X client to receive a button press", || loop {
+        match conn.poll_for_event() {
+            Ok(Some(Event::ButtonPress(event))) => {
+                return Some((event.event_x, event.event_y, event.root_x, event.root_y));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    })
+    .expect("the compositor delivers the click to XWayland")
+}
+
+fn assert_clicks_match(
+    session: &mut Session,
+    conn: &x11rb::rust_connection::RustConnection,
+    window: &WindowInfo,
+) {
+    let right = window.w.saturating_sub(9) as i32;
+    let bottom = window.h.saturating_sub(9) as i32;
+    let samples = [
+        (8, 8),
+        (window.w as i32 / 2, window.h as i32 / 2),
+        (right, 8),
+        (8, bottom),
+        (right, bottom),
+    ];
+    for (local_x, local_y) in samples {
+        let root_x = window.x + local_x;
+        let root_y = window.y + local_y;
+        session
+            .door()
+            .click(root_x as f64, root_y as f64)
+            .expect("inject click");
+        let delivered = next_button_press(conn);
+        assert_eq!(
+            delivered,
+            (local_x as i16, local_y as i16, root_x as i16, root_y as i16),
+            "XWayland button coordinates must match the cursor at local ({local_x}, {local_y})"
+        );
+    }
+}
+
+fn xwayland_child_pid(session: &Session) -> u32 {
+    poll_until(EVENT, "the compositor's Xwayland child process", || {
+        let children = std::fs::read_to_string(format!(
+            "/proc/{}/task/{}/children",
+            session.compositor_pid(),
+            session.compositor_pid()
+        ))
+        .ok()?;
+        children.split_whitespace().find_map(|pid| {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            comm.trim()
+                .eq_ignore_ascii_case("xwayland")
+                .then(|| pid.parse().ok())
+                .flatten()
+        })
+    })
+    .expect("Xwayland is a child of the nested compositor")
+}
+
+fn map_plain_x11_window(display: u32, title: &str) -> x11rb::rust_connection::RustConnection {
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let screen = &conn.setup().roots[screen_num];
+    let xid = conn.generate_id().unwrap();
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        xid,
+        screen.root,
+        0,
+        0,
+        320,
+        200,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        COPY_FROM_PARENT,
+        &CreateWindowAux::new().background_pixel(screen.black_pixel),
+    )
+    .unwrap();
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        title.as_bytes(),
+    )
+    .unwrap();
+    conn.map_window(xid).unwrap();
+    conn.flush().unwrap();
+    conn
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn xwayland_geometry_and_clicks_match_at_scale_two_from_first_map() {
+    let mut session = Session::boot(
+        "xwayland-input-scale-two",
+        SessionOptions {
+            scale: Some(2.0),
+            ..SessionOptions::default()
+        },
+    )
+    .expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let world = session.world().expect("read the compositor output");
+    let root_geometry = conn.get_geometry(root).unwrap().reply().unwrap();
+    assert_eq!(
+        (root_geometry.width, root_geometry.height),
+        (world.output_w as u16, world.output_h as u16),
+        "XWayland's root must use the compositor's physical-pixel coordinate space"
+    );
+    let xid = conn.generate_id().unwrap();
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        xid,
+        root,
+        0,
+        0,
+        720,
+        440,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        COPY_FROM_PARENT,
+        &CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::STRUCTURE_NOTIFY
+                    | EventMask::POINTER_MOTION
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE,
+            ),
+    )
+    .unwrap();
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        TITLE.as_bytes(),
+    )
+    .unwrap();
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        b"xwayland-input-probe\0xwayland-input-probe\0",
+    )
+    .unwrap();
+    conn.map_window(xid).unwrap();
+    conn.flush().unwrap();
+
+    // `map_window_request` creates the backend record before wm-core
+    // has placed and decorated it. Waiting for any ledger entry can
+    // therefore capture the pre-manage `(0, 0)` geometry and compare
+    // XWayland against a stale snapshot after the real configure lands.
+    // This isolated session has one application window. Its cached
+    // X11 identity is not part of the test-door record, so the useful
+    // observable is the record's mapped bit rather than a title match.
+    let mapped = poll_until(EVENT, "the X11 window to finish mapping", || {
+        session
+            .world()
+            .ok()?
+            .windows
+            .into_iter()
+            .find(|window| window.mapped)
+    })
+    .expect("the X11 window maps");
+    session.door().barrier().expect("initial configure settles");
+    assert_x11_rect(&conn, root, xid, &mapped);
+    while conn.poll_for_event().unwrap().is_some() {}
+    assert_clicks_match(&mut session, &conn, &mapped);
+
+    let world = session.world().expect("read the frame");
+    let frame = world
+        .frame_of(mapped.id)
+        .expect("X11 client receives a server frame");
+    let titlebar = (frame.x as f64 + frame.w as f64 / 2.0, frame.y as f64 + 8.0);
+    session
+        .door()
+        .drag_to(titlebar, (titlebar.0 + 96.0, titlebar.1 + 64.0))
+        .expect("move the X11 window");
+    session
+        .door()
+        .button("left", false)
+        .expect("release the move");
+    session.door().barrier().expect("move settles");
+    let moved = session
+        .world()
+        .expect("read the moved X11 window")
+        .windows
+        .into_iter()
+        .next()
+        .expect("it remains mapped");
+    assert_x11_rect(&conn, root, xid, &moved);
+    while conn.poll_for_event().unwrap().is_some() {}
+    assert_clicks_match(&mut session, &conn, &moved);
+}
+
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn an_xwayland_crash_retires_ghosts_and_restarts_exactly_once() {
+    let mut session = Session::boot("xwayland-restart", SessionOptions::default())
+        .expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let first_client = map_plain_x11_window(display, "before-xwayland-crash");
+    poll_until(EVENT, "the first X11 window to map", || {
+        session
+            .world()
+            .ok()?
+            .windows
+            .iter()
+            .any(|window| window.mapped)
+            .then_some(())
+    })
+    .expect("first X11 generation is usable");
+
+    let first_pid = xwayland_child_pid(&session);
+    // This is the failure the compositor must survive: Xwayland gets no
+    // teardown opportunity and its XWM channel simply closes.
+    // SAFETY: the pid was resolved from this live session's direct child
+    // list and is used only to deliver a signal; no Rust memory is touched.
+    unsafe { libc::kill(first_pid as i32, libc::SIGKILL) };
+    drop(first_client);
+
+    poll_until(
+        EVENT,
+        "the dead generation's X11 records to disappear",
+        || session.world().ok()?.windows.is_empty().then_some(()),
+    )
+    .expect("no X11 ghost frames survive the disconnect");
+    let restarted_display = poll_until(EVENT, "one replacement XWayland generation", || {
+        let displays: Vec<u32> = session
+            .log()
+            .lines()
+            .filter(|line| line.contains("XWayland ready"))
+            .filter_map(|line| line.split("display=").nth(1)?.trim().parse().ok())
+            .collect();
+        (displays.len() == 2).then(|| *displays.last().unwrap())
+    })
+    .expect("the bounded restart becomes ready");
+    assert_ne!(xwayland_child_pid(&session), first_pid);
+
+    let _second_client = map_plain_x11_window(restarted_display, "after-xwayland-crash");
+    poll_until(
+        EVENT,
+        "an X11 window to map through the replacement",
+        || {
+            session
+                .world()
+                .ok()?
+                .windows
+                .iter()
+                .any(|window| window.mapped)
+                .then_some(())
+        },
+    )
+    .expect("the replacement XWayland accepts applications");
+    assert!(
+        session.compositor_alive(),
+        "the Wayland session survives the X server crash"
+    );
+}
+
+/// XSETTINGS does not reach Java, Electron's X11 backend or Xcursor.
+/// Those clients read the root resource database, so exercise the real
+/// XWayland property at startup and after a live scale change. Seed a
+/// user resource between the two to prove the compositor merges rather
+/// than replacing the shared database.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn xwayland_resource_manager_publishes_scale_and_preserves_user_resources() {
+    let session = Session::boot(
+        "xwayland-resource-manager",
+        SessionOptions { scale: Some(2.0), ..SessionOptions::default() },
+    )
+    .expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let root = conn.setup().roots[screen_num].root;
+
+    let initial = poll_until(EVENT, "the scale-2 X resource database", || {
+        let bytes = resource_manager(&conn, root)?;
+        let text = String::from_utf8(bytes).ok()?;
+        (text.contains("Xft.dpi:\t192\n") && text.contains("Xcursor.size:\t48\n"))
+            .then_some(text)
+    })
+    .expect("XWayland clients receive scale resources at startup");
+    assert_eq!(initial.matches("Xft.dpi:").count(), 1);
+    assert_eq!(initial.matches("Xcursor.size:").count(), 1);
+
+    // Simulate `xrdb -merge`: preserve both the compositor's current
+    // declarations and a user's unrelated one. The next scale change
+    // must re-read this property, replace only its own keys and leave
+    // the addition byte-for-byte intact.
+    let mut seeded = initial.into_bytes();
+    seeded.extend_from_slice(b"ChonkstepTest.keep:\tuser-value\n");
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        root,
+        AtomEnum::RESOURCE_MANAGER,
+        AtomEnum::STRING,
+        &seeded,
+    )
+    .unwrap();
+    conn.flush().unwrap();
+
+    session.rewrite_config("scale = 1.5\n").unwrap();
+    session.request_reload().unwrap();
+    let reloaded = poll_until(EVENT, "the live scale change to reach X resources", || {
+        let bytes = resource_manager(&conn, root)?;
+        let text = String::from_utf8(bytes).ok()?;
+        (text.contains("Xft.dpi:\t144\n")
+            && text.contains("Xcursor.size:\t36\n")
+            && text.contains("ChonkstepTest.keep:\tuser-value\n"))
+        .then_some(text)
+    })
+    .expect("live scale changes merge into RESOURCE_MANAGER");
+    assert_eq!(reloaded.matches("Xft.dpi:").count(), 1);
+    assert_eq!(reloaded.matches("Xcursor.size:").count(), 1);
+    assert!(!reloaded.contains("Xft.dpi:\t192\n"));
+    assert!(!reloaded.contains("Xcursor.size:\t48\n"));
+}
+
+/// A toolkit's own minimize button calls XIconifyWindow, which sends
+/// `WM_CHANGE_STATE(IconicState)` to the root. Exercise that exact
+/// client message against a real XWayland server, then send
+/// `NormalState` back: the window must remain managed while hidden,
+/// publish both EWMH and ICCCM state, and restore without its own
+/// property publications feeding back into another transition.
+#[test]
+#[ignore = "needs a Wayland session to nest inside"]
+fn xwayland_wm_change_state_minimizes_and_restores() {
+    let mut session = Session::boot("xwayland-wm-change-state", SessionOptions::default())
+        .expect("nested compositor boots");
+    let display = ewmh_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let xid = conn.generate_id().unwrap();
+    let motif_wm_hints = intern(&conn, b"_MOTIF_WM_HINTS");
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        xid,
+        root,
+        0,
+        0,
+        640,
+        400,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        COPY_FROM_PARENT,
+        &CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
+    )
+    .unwrap();
+    // flags = MWM_HINTS_DECORATIONS, decorations = 0: this client
+    // draws its own titlebar, so its own XIconifyWindow request is the
+    // only minimize button involved in the test.
+    conn.change_property32(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        motif_wm_hints,
+        motif_wm_hints,
+        &[2, 0, 0, 0, 0],
+    )
+    .unwrap();
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        b"xwayland-minimize-probe",
+    )
+    .unwrap();
+    conn.map_window(xid).unwrap();
+    conn.flush().unwrap();
+
+    let managed = poll_until(EVENT, "the X11 window to finish mapping", || {
+        let world = session.world().ok()?;
+        let window = world.windows.iter().find(|window| window.mapped)?;
+        world.frame_of(window.id).is_none().then(|| window.clone())
+    })
+    .expect("the client-decorated X11 window maps without a compositor frame");
+    session.door().barrier().expect("initial map settles");
+
+    let wm_change_state = intern(&conn, b"WM_CHANGE_STATE");
+    let wm_state = intern(&conn, b"WM_STATE");
+    let net_wm_state = intern(&conn, b"_NET_WM_STATE");
+    let net_wm_state_hidden = intern(&conn, b"_NET_WM_STATE_HIDDEN");
+    let send_state = |state| {
+        let message = ClientMessageEvent::new(32, xid, wm_change_state, [state, 0, 0, 0, 0]);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            message,
+        )
+        .unwrap();
+        conn.flush().unwrap();
+    };
+
+    send_state(3); // ICCCM IconicState, exactly what XIconifyWindow sends.
+    poll_until(EVENT, "the X11 window to become iconic", || {
+        let world = session.world().ok()?;
+        let window = world.windows.iter().find(|window| window.id == managed.id)?;
+        let state = property_values(&conn, xid, wm_state, wm_state);
+        let net_state = property_values(&conn, xid, net_wm_state, AtomEnum::ATOM.into());
+        (!window.mapped && state.first() == Some(&3) && net_state.contains(&net_wm_state_hidden))
+            .then_some(())
+    })
+    .expect("IconicState minimizes without withdrawing the managed window");
+
+    // Let another full dispatch pass run after both property writes.
+    // Smithay deliberately does not translate its own HIDDEN update
+    // into a minimize callback; if that ever changes into a loop, the
+    // window will fail this stable-hidden assertion.
+    session.door().barrier().expect("hidden state settles");
+    let hidden = session.world().expect("read hidden state");
+    assert!(
+        hidden.windows.iter().any(|window| window.id == managed.id),
+        "miniaturizing must not withdraw the X11 client"
+    );
+    assert!(hidden.windows.iter().any(|window| window.id == managed.id && !window.mapped));
+
+    send_state(1); // ICCCM NormalState.
+    let mut last_restore_state = None;
+    poll_until(EVENT, "the X11 window to return to NormalState", || {
+        let world = session.world().ok()?;
+        let window = world.windows.iter().find(|window| window.id == managed.id)?;
+        let state = property_values(&conn, xid, wm_state, wm_state);
+        let net_state = property_values(&conn, xid, net_wm_state, AtomEnum::ATOM.into());
+        last_restore_state = Some((window.mapped, state.clone(), net_state.clone()));
+        (window.mapped && state.first() == Some(&1) && !net_state.contains(&net_wm_state_hidden))
+            .then_some(())
+    })
+    .unwrap_or_else(|error| {
+        panic!(
+            "NormalState restore failed: {error}; last observed mapped/WM_STATE/_NET_WM_STATE = {last_restore_state:?}; compositor log:\n{}",
+            session.log()
+        )
+    });
+}
+
+// ---------------------------------------------------------------------
+// EWMH/ICCCM requests an X11 client sends and a scripted desktop relies
+// on. Root client messages reach the compositor's own `xewmh`
+// connection; `WM_HINTS` reaches it through smithay's `X11Surface`.
+
+/// Maps a raw X11 window with a title and class, and waits for the
+/// compositor to have managed it.
+fn map_probe_window(
+    session: &mut Session,
+    conn: &x11rb::rust_connection::RustConnection,
+    screen_num: usize,
+    title: &str,
+    hints: Option<&[u32; 9]>,
+) -> (u32, u64) {
+    let existing = mapped_ids(session);
+    let screen = &conn.setup().roots[screen_num];
+    let xid = conn.generate_id().unwrap();
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        xid,
+        screen.root,
+        0,
+        0,
+        400,
+        300,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        COPY_FROM_PARENT,
+        &CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(EventMask::STRUCTURE_NOTIFY),
+    )
+    .unwrap();
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        title.as_bytes(),
+    )
+    .unwrap();
+    // `_NET_WM_NAME` as well as `WM_NAME`: the EWMH property is what
+    // smithay reads for `X11Surface::title`, and therefore what the
+    // ledger matches on.
+    let net_wm_name = intern(conn, b"_NET_WM_NAME");
+    let utf8 = intern(conn, b"UTF8_STRING");
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        net_wm_name,
+        utf8,
+        title.as_bytes(),
+    )
+    .unwrap();
+    // The ledger matches on app id or title, and an X11 window's title
+    // reaches the record only through a later `TitleChanged`; the class
+    // is read at map time. Naming the class after the window is what
+    // makes `wait_for_window` deterministic here.
+    let class = format!("{title}\0{title}\0");
+    conn.change_property8(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        xid,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        class.as_bytes(),
+    )
+    .unwrap();
+    if let Some(hints) = hints {
+        // Written *before* the map, which is the ordinary case and the
+        // one that produces no PropertyNotify for a change handler to
+        // catch.
+        conn.change_property32(
+            x11rb::protocol::xproto::PropMode::REPLACE,
+            xid,
+            AtomEnum::WM_HINTS,
+            AtomEnum::WM_HINTS,
+            hints,
+        )
+        .unwrap();
+    }
+    conn.map_window(xid).unwrap();
+    conn.flush().unwrap();
+    // An X11 window's identity is not part of the test-door record (see
+    // the scale-two test's note), so the observable is a *new* mapped
+    // entry rather than a title match.
+    let id = poll_until(EVENT, "the probe window to finish mapping", || {
+        session
+            .world()
+            .ok()?
+            .windows
+            .into_iter()
+            .find(|window| window.mapped && !existing.contains(&window.id))
+            .map(|window| window.id)
+    })
+    .expect("the probe window maps");
+    (xid, id)
+}
+
+/// The ledger ids already mapped, so a later map can be told apart.
+fn mapped_ids(session: &mut Session) -> Vec<u64> {
+    session
+        .world()
+        .map(|world| world.windows.into_iter().filter(|w| w.mapped).map(|w| w.id).collect())
+        .unwrap_or_default()
+}
+
+
+/// `WM_HINTS` with only the urgency bit set. Flags is element 0; the
+/// urgency bit is `1 << 8`.
+const WM_HINTS_URGENT: [u32; 9] = [1 << 8, 0, 0, 0, 0, 0, 0, 0, 0];
+const WM_HINTS_CALM: [u32; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// `wmctrl -c` and `xdotool windowclose` send this and nothing else.
+/// Under the Wayland session it used to land on the floor: the message
+/// reached the compositor's connection and `drain_inbound` dropped it,
+/// so the tool exited zero having done nothing at all.
+#[test]
+#[ignore = "needs a live Wayland session to nest in"]
+fn a_net_close_window_message_closes_an_xwayland_window() {
+    let mut session =
+        Session::boot("xwayland-ewmh-close", SessionOptions::default()).expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let _ = ewmh_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let root = conn.setup().roots[screen_num].root;
+    let (xid, id) = map_probe_window(&mut session, &conn, screen_num, "ewmh-close-me", None);
+
+    let close = intern(&conn, b"_NET_CLOSE_WINDOW");
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+        ClientMessageEvent::new(32, xid, close, [0u32, 2, 0, 0, 0]),
+    )
+    .unwrap();
+    conn.flush().unwrap();
+
+    // The backend's record outlives `wm-core`'s until the X11 surface
+    // is destroyed, so the observable is the mapped bit — "gone from
+    // the desktop", which is what the message asked for.
+    poll_until(EVENT, "the window named by _NET_CLOSE_WINDOW to go", || {
+        session
+            .world()
+            .ok()?
+            .windows
+            .iter()
+            .all(|window| window.id != id || !window.mapped)
+            .then_some(())
+    })
+    .expect("_NET_CLOSE_WINDOW must close the window it names");
+}
+
+/// The ICCCM half of the attention story — how IRC clients, terminal
+/// bells and mail notifiers actually ask, and the half smithay's XWM
+/// drops on the floor because `_NET_WM_STATE` is the only route it
+/// decodes.
+///
+/// The urgency is raised on a window that is *not* focused, which is
+/// both the realistic shape and the only one that can be observed: a
+/// window that asks for attention while the user is already in it has
+/// its request answered immediately, by the same dismissal this change
+/// adds.
+#[test]
+#[ignore = "needs a live Wayland session to nest in"]
+fn wm_hints_urgency_is_read_at_map_and_cleared_by_focus() {
+    let mut options = SessionOptions::default();
+    options.env.push(("CHONKSTEP_HYPRLAND_IPC".to_string(), "1".to_string()));
+    let mut session =
+        Session::boot("xwayland-ewmh-urgency", options).expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let _ = ewmh_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    // A second window mapped after the noisy one, so the noisy one is
+    // genuinely in the background when it asks for attention.
+    let (noisy, _) = map_probe_window(&mut session, &conn, screen_num, "ewmh-noisy", Some(&WM_HINTS_CALM));
+    // Mapped second, so it holds focus and the noisy one is genuinely
+    // in the background when it rings.
+    let _calm = map_probe_window(&mut session, &conn, screen_num, "ewmh-calm", Some(&WM_HINTS_CALM));
+
+    // Observed through the compositor's own log rather than the IPC
+    // event stream. The stream is edge-triggered and carries no
+    // history, so a listener that connects a moment late has already
+    // missed the transition and waits ten seconds for a second one that
+    // never comes — which is exactly how this test flaked in CI
+    // (`never saw urgent; events seen: []`). The log is level-triggered:
+    // the transition is still there whenever the assertion gets around
+    // to reading it. It also records the *dismissal*, which the event
+    // stream cannot express at all, since `urgent` is emitted on the
+    // false→true edge alone.
+    fn urgency_transitions(session: &Session, urgent: bool) -> usize {
+        let wanted = format!("urgent={urgent}");
+        session
+            .log()
+            .lines()
+            .filter(|line| line.contains("window urgency changed") && line.contains(&wanted))
+            .count()
+    }
+
+    // The bell: the client raises the ICCCM urgency bit on a window the
+    // user is not looking at. Smithay parses `WM_HINTS` and reports the
+    // change; before this, `property_notify` discarded it.
+    conn.change_property32(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        noisy,
+        AtomEnum::WM_HINTS,
+        AtomEnum::WM_HINTS,
+        &WM_HINTS_URGENT,
+    )
+    .unwrap();
+    conn.flush().unwrap();
+
+    poll_until(EVENT, "the urgency bit to reach the compositor", || {
+        (urgency_transitions(&session, true) >= 1).then_some(())
+    })
+    .expect("a WM_HINTS urgency bit must raise the same flag xdg_system_bell does");
+
+    // And it must be dismissible. Nothing in the tree cleared this
+    // before, so a window that rang once stayed urgent forever.
+    let activate = intern(&conn, b"_NET_ACTIVE_WINDOW");
+    let root = conn.setup().roots[screen_num].root;
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+        ClientMessageEvent::new(32, noisy, activate, [2u32, 0, 0, 0, 0]),
+    )
+    .unwrap();
+    conn.flush().unwrap();
+
+    // Wait for the focus to actually land before ringing again. The
+    // differ compares successive snapshots, so the dismissal and the
+    // re-ring have to fall in different passes or there is no edge
+    // between them to see.
+    // The dismissal itself — the piece this change adds, and the one
+    // the event stream could never show.
+    poll_until(EVENT, "focus to dismiss the urgency", || {
+        (urgency_transitions(&session, false) >= 1).then_some(())
+    })
+    .expect("focusing an urgent window must clear the flag");
+
+    // And the dismissal, observed the same way: the flag has to be
+    // *clearable*, so ringing again after the focus must produce a
+    // second `urgent` event rather than nothing. Before this change
+    // nothing ever cleared it, so the second edge could never happen.
+    conn.change_property32(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        noisy,
+        AtomEnum::WM_HINTS,
+        AtomEnum::WM_HINTS,
+        &WM_HINTS_CALM,
+    )
+    .unwrap();
+    conn.flush().unwrap();
+    conn.change_property32(
+        x11rb::protocol::xproto::PropMode::REPLACE,
+        noisy,
+        AtomEnum::WM_HINTS,
+        AtomEnum::WM_HINTS,
+        &WM_HINTS_URGENT,
+    )
+    .unwrap();
+    conn.flush().unwrap();
+    poll_until(EVENT, "the second ring to raise the flag again", || {
+        (urgency_transitions(&session, true) >= 2).then_some(())
+    })
+    .expect("urgency must be clearable, or a window that rings once can never ring again");
+}
+
+/// `XRaiseWindow` — what Java AWT's `Window.toFront`, Tk's `raise` and
+/// any raw-Xlib application compile to. It arrives as a
+/// `ConfigureRequest` carrying only a stack mode, which used to resolve
+/// to the window's current rectangle and therefore to nothing at all.
+///
+/// Asserted against the X server's own stacking rather than the
+/// compositor's, because the two are what this connects: `QueryTree`
+/// returns the server's children bottom-to-top, and the compositor now
+/// publishes its order into exactly that list. The first poll is a real
+/// assertion in its own right — it is the outbound half, which no call
+/// in this repository made before.
+#[test]
+#[ignore = "needs a live Wayland session to nest in"]
+fn an_x_raise_window_request_reaches_the_x_servers_stacking_order() {
+    let mut session =
+        Session::boot("xwayland-raise", SessionOptions::default()).expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let _ = ewmh_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let root = conn.setup().roots[screen_num].root;
+
+    let (lower, _) = map_probe_window(&mut session, &conn, screen_num, "raise-lower", None);
+    let (upper, _) = map_probe_window(&mut session, &conn, screen_num, "raise-upper", None);
+
+    // Where each window sits in the server's bottom-to-top child list. A
+    // managed X11 window is reparented into a frame, so the entry to
+    // look for is whichever ancestor is a child of root.
+    let depth_of = |target: u32| -> usize {
+        let children = conn.query_tree(root).unwrap().reply().unwrap().children;
+        let mut ancestors = vec![target];
+        let mut node = target;
+        while let Ok(reply) = conn.query_tree(node).unwrap().reply() {
+            if reply.parent == root || reply.parent == 0 {
+                ancestors.push(node);
+                break;
+            }
+            node = reply.parent;
+            ancestors.push(node);
+        }
+        children
+            .iter()
+            .position(|child| ancestors.contains(child))
+            .unwrap_or_else(|| panic!("window {target:#x} is not in the server's tree"))
+    };
+
+    poll_until(EVENT, "the compositor to publish its order to the server", || {
+        (depth_of(upper) > depth_of(lower)).then_some(())
+    })
+    .expect("the window mapped last must be on top on the server too");
+
+    // The bare Xlib raise: a ConfigureRequest with a stack mode and no
+    // geometry.
+    conn.configure_window(
+        lower,
+        &x11rb::protocol::xproto::ConfigureWindowAux::new()
+            .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+    )
+    .unwrap();
+    conn.flush().unwrap();
+
+    poll_until(EVENT, "XRaiseWindow to move the server's stacking order", || {
+        (depth_of(lower) > depth_of(upper)).then_some(())
+    })
+    .unwrap_or_else(|e| {
+        let children = conn.query_tree(root).unwrap().reply().unwrap().children;
+        panic!(
+            "{e}\nlower={lower:#x} at {} upper={upper:#x} at {}\nroot children: {children:#x?}",
+            depth_of(lower),
+            depth_of(upper)
+        )
+    });
+}
+
+/// Unmapping is not destruction: applications reuse an XID when hiding and
+/// showing a window. Destruction must, however, collect its compositor record.
+#[test]
+#[ignore = "needs a nested Wayland session: scripts/e2e.sh --headless --release"]
+fn an_x11_window_keeps_its_identity_across_withdrawal_but_retires_on_destroy() {
+    let mut session = Session::boot("x11-withdraw-remap", SessionOptions::default()).unwrap();
+    let (conn, screen) = session.connect_x11().unwrap();
+    let (xid, id) = map_probe_window(&mut session, &conn, screen, "remap-probe", None);
+    for cycle in 0..10 {
+        conn.unmap_window(xid).unwrap();
+        conn.flush().unwrap();
+        poll_until(EVENT, "withdrawn X11 record retained but hidden", || {
+            let world = session.world().ok()?;
+            let record = world.windows.iter().find(|window| window.id == id)?;
+            (!record.mapped && world.frames.is_empty()).then_some(())
+        })
+        .unwrap_or_else(|error| panic!("cycle {cycle}: {error}\n{:?}", session.world()));
+        conn.map_window(xid).unwrap();
+        conn.flush().unwrap();
+        poll_until(EVENT, "remapped X11 window retains identity and regains focus", || {
+            let world = session.world().ok()?;
+            let record = world.windows.iter().find(|window| window.id == id)?;
+            (record.mapped && world.windows.len() == 1
+                && conn.get_input_focus().ok()?.reply().ok()?.focus == xid)
+                .then_some(())
+        })
+        .unwrap_or_else(|error| panic!("cycle {cycle}: {error}\n{:?}\n{}", session.world(), session.log()));
+    }
+    conn.destroy_window(xid).unwrap();
+    conn.flush().unwrap();
+    poll_until(EVENT, "destroyed X11 window and frame are both collected", || {
+        let world = session.world().ok()?;
+        (world.windows.is_empty() && world.frames.is_empty()).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{:?}\n{}", session.world(), session.log()));
+}
+
+#[test]
+#[ignore = "needs a nested Wayland session: scripts/e2e.sh --headless --release"]
+fn an_x11_client_exit_collects_all_of_its_window_records() {
+    let mut session = Session::boot("x11-client-exit", SessionOptions::default()).unwrap();
+    let (conn, screen) = session.connect_x11().unwrap();
+    for index in 0..12 {
+        map_probe_window(&mut session, &conn, screen, &format!("exit-probe-{index}"), None);
+    }
+    assert_eq!(session.world().unwrap().windows.len(), 12);
+    // Closing the connection destroys its resources on the server. This is
+    // the same lifecycle boundary as a crashing client, without a real crash.
+    drop(conn);
+    poll_until(EVENT, "all disconnected client's windows and frames are collected", || {
+        let world = session.world().ok()?;
+        (world.windows.is_empty() && world.frames.is_empty()).then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}\n{:?}\n{}", session.world(), session.log()));
+}
+
+// ---------------------------------------------------------------------
+// zwp_xwayland_keyboard_grab_v1: an X11 client that grabbed the keyboard
+// keeps its combos.
+
+/// A remote-desktop viewer, a VM console, a nested X server: an X client
+/// calls `XGrabKeyboard` because every key belongs to the session it is
+/// showing. XWayland asks the compositor for the same thing through
+/// `zwp_xwayland_keyboard_grab_v1` — a protocol this compositor did not
+/// serve, so a bound combo was swallowed by the desktop and the guest
+/// could never be sent it.
+///
+/// Two halves, and the first is what makes the second mean anything: the
+/// binding is proven to work *before* the grab, so "the command did not
+/// run" afterwards is the grab and not a broken fixture.
+#[test]
+#[ignore = "needs a live Wayland session to nest in"]
+fn an_x11_keyboard_grab_keeps_the_combos_the_desktop_binds() {
+    let dir = chonk_testkit::session_dir("xwayland-keyboard-grab");
+    let marker = dir.join("pressed");
+    let config = format!(
+        // `omarchy_menu = false`: this test needs a keybinding and an
+        // X11 client, not Omarchy's menu, and loading it makes the
+        // shell evaluate a few hundred shell conditions on the
+        // compositor thread before it can answer the first barrier.
+        "omarchy_menu = false\n[commands]\nmark = [\"sh\", \"-c\", \"echo ran >> {}\"]\n\n[keybindings]\n\"super+space\" = \"run mark\"\n",
+        marker.display()
+    );
+    let mut session = Session::boot(
+        "xwayland-keyboard-grab",
+        SessionOptions { config_extra: config, ..SessionOptions::default() },
+    )
+    .expect("nested compositor boots");
+    let display = xwayland_display(&session);
+    let (conn, screen_num) =
+        x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}")))
+            .expect("connect to nested XWayland");
+    let (xid, _) = map_probe_window(&mut session, &conn, screen_num, "grab-probe", None);
+
+    let ran = |wanted: usize| -> Option<()> {
+        let text = std::fs::read_to_string(&marker).ok()?;
+        (text.lines().count() >= wanted).then_some(())
+    };
+
+    // Control: with no grab, the desktop owns the combo.
+    session.door().chord(chonk_testkit::keys::LEFTMETA, chonk_testkit::keys::SPACE).expect("chord injects");
+    poll_until(Duration::from_secs(8), "the bound command to run", || ran(1))
+        .expect("without a grab the compositor must still own its own binding");
+
+    // The grab. XWayland turns an X client's `XGrabKeyboard` into the
+    // Wayland request; the compositor says so in its log.
+    conn.grab_keyboard(
+        true,
+        xid,
+        x11rb::CURRENT_TIME,
+        x11rb::protocol::xproto::GrabMode::ASYNC,
+        x11rb::protocol::xproto::GrabMode::ASYNC,
+    )
+    .unwrap()
+    .reply()
+    .expect("the X server grants the keyboard grab");
+    conn.flush().unwrap();
+
+    poll_until(EVENT, "the compositor to accept the XWayland keyboard grab", || {
+        session.log().contains("an XWayland client took the keyboard grab").then_some(())
+    })
+    .expect("XWayland must forward XGrabKeyboard as zwp_xwayland_keyboard_grab_v1");
+
+    // And now the same combo belongs to the guest, not the desktop.
+    session.door().chord(chonk_testkit::keys::LEFTMETA, chonk_testkit::keys::SPACE).expect("chord injects");
+    session.door().barrier().expect("the compositor settles");
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        ran(2).is_none(),
+        "a grabbing X11 client must receive the combo instead of the desktop running its binding"
+    );
+}
+
+#[test]
+#[ignore = "needs a nested session: scripts/e2e.sh --headless --release"]
+fn x11_pointer_grab_suspends_typing_suppression_until_ungrab() {
+    use x11rb::protocol::xproto::{GrabMode, GrabStatus};
+    let mut session = Session::boot("xwayland-pointer-typing", SessionOptions::default()).unwrap();
+    let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", xwayland_display(&session)))).unwrap();
+    let (xid, id) = map_probe_window(&mut session, &conn, screen_num, "game-grab-probe", None);
+    let window = session.world().unwrap().windows.into_iter().find(|w| w.id == id).unwrap();
+    session.door().click(f64::from(window.x + window.w as i32 / 2), f64::from(window.y + window.h as i32 / 2)).unwrap();
+    session.door().barrier().unwrap();
+    assert!(!session.door().touchpad_captured().unwrap());
+    let grab = conn.grab_pointer(false, xid, EventMask::POINTER_MOTION | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
+        GrabMode::ASYNC, GrabMode::ASYNC, xid, x11rb::NONE, x11rb::CURRENT_TIME).unwrap().reply().unwrap();
+    assert_eq!(grab.status, GrabStatus::SUCCESS);
+    conn.flush().unwrap();
+    poll_until(EVENT, "XWayland confinement to suspend typing suppression", || {
+        session.door().touchpad_captured().ok()?.then_some(())
+    }).unwrap();
+    session.door().key(17, true).unwrap();
+    for _ in 0..8 { session.door().motion_relative(3.0, 2.0).unwrap(); }
+    session.door().key(17, false).unwrap();
+    conn.ungrab_pointer(x11rb::CURRENT_TIME).unwrap();
+    conn.flush().unwrap();
+    poll_until(EVENT, "XWayland ungrab to restore typing suppression", || {
+        (!session.door().touchpad_captured().ok()?).then_some(())
+    }).unwrap();
+}
