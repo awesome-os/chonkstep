@@ -68,7 +68,6 @@ pub struct LibsectiumDisplaySurfaceV1 {
     pub z_order: i32,
     pub surface_flags: u32,
     pub frame_seq: u64,
-    pub damage_gen: u64,
 }
 
 impl LibsectiumDisplaySurfaceV1 {
@@ -88,7 +87,6 @@ impl LibsectiumDisplaySurfaceV1 {
             z_order: 0,
             surface_flags: 0,
             frame_seq: 0,
-            damage_gen: 0,
         }
     }
 }
