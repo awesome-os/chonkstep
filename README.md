@@ -192,3 +192,13 @@ for the measurement harness and [the changelog](CHANGELOG.md) for earlier releas
 ## License
 
 GPL-3.0-only. Bundled fonts and artwork retain their individual licenses.
+
+## Quick Install & Run (Windows / Linux / macOS)
+
+```sh
+# Install / hydrate from v11 CAS via holo-pm
+holo-pm install repository://github.com/awesome-os/chonkstep@main
+
+# Or project & run directly via holo-project (0-byte hardlink)
+holo-project "project://rust/chonkstep?from=repository://github.com/awesome-os/chonkstep@main"
+```
